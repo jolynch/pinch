@@ -18,9 +18,14 @@ RUN mkdir /build_xxh  && cd /xxh_src  && make -j 8 && make DESTDIR=/build_xxh  i
 # Step 2. Minimal image to only keep the built binaries, this should be about 9MiB
 FROM alpine:3.10.1
 
+RUN apk --no-cache add man
+
 COPY --from=builder /build_lz4  /
 COPY --from=builder /build_zstd /
 COPY --from=builder /build_xxh  /
+
+# For some reason man pages don't work unless in the global setup
+RUN ln -sf /usr/local/share/man/man1 /usr/share/man/man1
 
 # Make sure to include the licenses
 RUN mkdir -p /usr/local/share/licenses/lz4
