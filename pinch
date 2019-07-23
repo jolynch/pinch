@@ -1,0 +1,29 @@
+#!/bin/bash
+set -euf -o pipefail
+
+MUID=$(id -u)
+MGUID=$(id -g)
+DEBUG="${DEBUG:-no}"
+MODE="${MODE:-i}"
+
+if [[ "$(docker images -q pinch:latest 2> /dev/null)" == "" ]]; then
+    BIN=$(readlink -f "$0")
+    DIR=$(dirname $BIN)
+    echo "Building in ${DIR}"
+    cd $DIR
+    docker build -t pinch .
+    cd -
+fi
+
+# If a terminal, tell docker to run as that as well
+if [[ -t 1 ]]; then
+    MODE="${MODE}t"
+fi
+
+DOCKER_RUN="docker run --rm -${MODE} -u ${MUID}:${MGUID} -v ${PWD}:${PWD}:rw -w ${PWD} pinch"
+
+if [[ ${DEBUG} != "no" ]]; then
+    echo "Running ${DOCKER_RUN}"
+fi
+
+exec $DOCKER_RUN $@
