@@ -15,14 +15,23 @@ RUN mkdir /build_lz4  && cd /lz4_src  && make -j 8 && make DESTDIR=/build_lz4  i
 RUN mkdir /build_zstd && cd /zstd_src && make -j 8 && make DESTDIR=/build_zstd install
 RUN mkdir /build_xxh  && cd /xxh_src  && make -j 8 && make DESTDIR=/build_xxh  install
 
+RUN strip /build_lz4/usr/local/bin/lz4
+RUN strip /build_zstd/usr/local/bin/zstd
+RUN strip /build_xxh/usr/local/bin/xxhsum
+
 # Step 2. Minimal image to only keep the built binaries, this should be about 9MiB
 FROM alpine:3.10.1
 
 RUN apk --no-cache add man
+RUN apk --no-cache del openssl
 
 COPY --from=builder /build_lz4  /
 COPY --from=builder /build_zstd /
 COPY --from=builder /build_xxh  /
+
+# We don't need libraries or headers
+RUN rm -rf /usr/local/include/*
+RUN rm -rf /usr/local/lib/*
 
 # For some reason man pages don't work unless in the global setup
 RUN ln -sf /usr/local/share/man/man1 /usr/share/man/man1

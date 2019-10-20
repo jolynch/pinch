@@ -16,14 +16,14 @@ if [[ "$(docker images -q pinch:latest 2> /dev/null)" == "" ]]; then
 fi
 
 # If a terminal, tell docker to run as that as well
-if [[ -t 1 ]]; then
+if [[ -t 0 ]]; then
     MODE="${MODE}t"
 fi
 
 DOCKER_RUN="docker run --rm -${MODE} -u ${MUID}:${MGUID} -v ${PWD}:${PWD}:rw -w ${PWD} pinch"
 
 if [[ ${DEBUG} != "no" ]]; then
-    echo "Running ${DOCKER_RUN}"
+    1>&2 echo "Running ${DOCKER_RUN}"
 fi
 
 exec $DOCKER_RUN $@

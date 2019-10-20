@@ -13,16 +13,18 @@ utilities from [Yann Collet](https://github.com/Cyan4973):
 Note that licenses of these tools are included in the
 `/usr/local/share/licenses` folder within the container.
 
-1. Build the docker image (or grab it from the hub)
-```
-docker build -t pinch .
-```
-
 
 Installation
 ------------
 
-You can manually copy the `pinch` script into place or you can use `make`:
+You can build the docker image (or grab it from the hub) with
+```
+docker build -t pinch .
+```
+At this point you can run the included `pinch` script.
+
+Or you can have the makefile built the container and install the `pinch` wrapper
+locally:
 
 ```
 $ make
@@ -69,3 +71,13 @@ Hashing (xxHash)
 
 For data verification, there isn't usually a faster choice than taking the
 `xxHash` of your data
+
+Advanced Examples
+-----------------
+Assuming that you have the pinch wrapper installed:
+
+You can upload a large file to S3 as fast as possible
+
+```
+cat large_file | pinch zstd -c --adapt | aws s3 cp - s3://<path>
+```
