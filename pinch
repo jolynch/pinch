@@ -20,7 +20,7 @@ if [[ -t 0 ]]; then
     MODE="${MODE}t"
 fi
 
-DOCKER_RUN="docker run --rm -${MODE} -u ${MUID}:${MGUID} -v ${PWD}:${PWD}:rw -w ${PWD} --name pinchcmd pinch"
+DOCKER_RUN="docker run --rm -${MODE} -u ${MUID}:${MGUID} -v ${PWD}:${PWD}:rw -w ${PWD} --log-driver none --name pinchcmd pinch"
 
 if [[ ${DEBUG} != "no" ]]; then
     1>&2 echo "Running ${DOCKER_RUN}"
