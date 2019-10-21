@@ -4,7 +4,7 @@ DESTDIR ?=
 PREFIX  ?= /usr/local
 
 image:
-	docker build -t pinch .
+	docker build -t jolynch/pinch .
 
 install: image
 	@install -v -d -m 755 $(DESTDIR)$(PREFIX)/bin

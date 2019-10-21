@@ -6,13 +6,11 @@ MGUID=$(id -g)
 DEBUG="${DEBUG:-no}"
 MODE="${MODE:-i}"
 
-if [[ "$(docker images -q pinch:latest 2> /dev/null)" == "" ]]; then
+if [[ "$(docker images -q jolynch/pinch:latest 2> /dev/null)" == "" ]]; then
     BIN=$(readlink -f "$0")
     DIR=$(dirname $BIN)
-    echo "Building in ${DIR}"
-    cd $DIR
-    docker build -t pinch .
-    cd -
+    echo "Pulling pinch docker image"
+    docker pull jolynch/pinch
 fi
 
 # If a terminal, tell docker to run as that as well
@@ -20,7 +18,7 @@ if [[ -t 0 ]]; then
     MODE="${MODE}t"
 fi
 
-DOCKER_RUN="docker run --rm -${MODE} -u ${MUID}:${MGUID} -v ${PWD}:${PWD}:rw -w ${PWD} --log-driver none --name pinchcmd pinch"
+DOCKER_RUN="docker run --rm -${MODE} -u ${MUID}:${MGUID} -v ${PWD}:${PWD}:rw -w ${PWD} --log-driver none --name pinchcmd jolynch/pinch"
 
 if [[ ${DEBUG} != "no" ]]; then
     1>&2 echo "Running ${DOCKER_RUN}"
