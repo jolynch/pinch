@@ -46,5 +46,7 @@ COPY --from=builder /zstd_src/LICENSE /usr/local/share/licenses/zstd/
 RUN mkdir -p /usr/local/share/licenses/xxhash
 COPY --from=builder /xxh_src/LICENSE /usr/local/share/licenses/xxhash/
 
+ENV PAGER less
+
 # Zstd is probably the right default choice
 CMD ["/usr/local/bin/zstd"]

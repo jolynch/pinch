@@ -74,10 +74,23 @@ For data verification, there isn't usually a faster choice than taking the
 
 Advanced Examples
 -----------------
-Assuming that you have the pinch wrapper installed:
+Some of the things you can do:
 
 You can upload a large file to S3 as fast as possible
 
 ```
-cat large_file | pinch zstd -c --adapt | aws s3 cp - s3://<path>
+$ cat large_file | pinch zstd -c --adapt | aws s3 cp - s3://<path>
+```
+
+See what kind of awesome compression ratio you'll get at level 10
+```
+wc -c large_file | pinch zstd -c -10 | wc -c
+cat large_file | pinch zstd -c -10 | wc -c
+```
+
+Read a man page of one of the tools
+```
+$ pinch man zstd
+$ pinch man xxh64sum
+$ pinch man lz4
 ```
