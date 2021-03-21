@@ -17,6 +17,9 @@ import (
 	"time"
 )
 
+// Pipes are 64k usually, we might bump them in the future ...
+const BUF_SIZE = 4096 * 16
+
 var inputDir = "/var/run/pinch/in"
 var outputDir = "/var/run/pinch/out"
 var checksums sync.Map
@@ -68,6 +71,18 @@ func compress(
 	maxLevel int,
 ) {
 	syscall.Mkfifo(output, 0666)
+	fd, ferr := os.OpenFile(output, syscall.O_NONBLOCK, 0666)
+	if ferr != nil {
+		log.Printf("Trying to like do FCNTL")
+		defer fd.Close()
+		syscall.RawSyscall(
+			syscall.SYS_FCNTL,
+			fd.Fd(),
+			syscall.F_SETPIPE_SZ,
+			BUF_SIZE*2,
+		)
+	}
+
 	start := time.Now()
 
 	compressorCmd := "zstd -v --adapt=max=%d - -o %s"
@@ -158,6 +173,17 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		// Make the input pipe first so that when this function returns
 		// the input stages are ready
 		syscall.Mkfifo(path.Join(inputDir, s), 0666)
+		fd, err := os.OpenFile(path.Join(inputDir, s), syscall.O_NONBLOCK, 0666)
+		if err != nil {
+			log.Printf("Trying to like do FCNTL")
+			defer fd.Close()
+			syscall.RawSyscall(
+				syscall.SYS_FCNTL,
+				fd.Fd(),
+				syscall.F_SETPIPE_SZ,
+				BUF_SIZE*2,
+			)
+		}
 		go compress(
 			s,
 			path.Join(inputDir, s),
@@ -221,7 +247,8 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 	fd = value.(write).fd
 
 	log.Printf("[%s]: write copying to pipe", name)
-	written, err := io.Copy(fd, req.Body)
+	buf := make([]byte, BUF_SIZE)
+	written, err := io.CopyBuffer(fd, req.Body, buf)
 	if err != nil {
 		http.Error(w, "Could not copy", http.StatusInternalServerError)
 		return
@@ -267,7 +294,9 @@ func readChunk(w http.ResponseWriter, req *http.Request) {
 
 	log.Printf("[%s]: read copying from pipe [%s]", name, path.Join(outputDir, name+".zst"))
 	w.Header().Set("Content-Type", "application/octet-stream")
-	bytesRead, err := io.Copy(w, fd)
+
+	buf := make([]byte, BUF_SIZE)
+	bytesRead, err := io.CopyBuffer(w, fd, buf)
 	if err != nil {
 		log.Printf("ERROR %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
