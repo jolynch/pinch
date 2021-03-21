@@ -2,7 +2,7 @@
 # Based off of https://github.com/facebook/zstd/issues/880
 
 # Step 1. Image used to build the binary
-FROM alpine:3.10.1 as builder
+FROM alpine:3.13.2 as builder
 
 RUN apk --no-cache add make gcc libc-dev git
 
@@ -51,7 +51,6 @@ RUN mkdir -p /usr/local/share/licenses/lz4 /usr/local/share/licenses/zstd /usr/l
 COPY --from=builder /lz4_src/LICENSE /usr/local/share/licenses/lz4/
 COPY --from=builder /zstd_src/LICENSE /usr/local/share/licenses/zstd/
 COPY --from=builder /xxh_src/LICENSE /usr/local/share/licenses/xxhash/
-
 
 ENV PAGER less
 

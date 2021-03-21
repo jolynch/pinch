@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -17,13 +20,18 @@ import (
 	"time"
 )
 
-// Pipes are 64k usually, we might bump them in the future ...
-const BUF_SIZE = 4096 * 16
+const (
+	// Pipes are 64k usually, we might bump them in the future ...
+	BUF_SIZE = 4096 * 16
+)
 
-var inputDir = "/var/run/pinch/in"
-var outputDir = "/var/run/pinch/out"
-var checksums sync.Map
-var writers sync.Map
+var (
+	inputDir    = "/run/pinch/in"
+	outputDir   = "/run/pinch/out"
+	tokenLength = 32
+	checksums   sync.Map
+	writers     sync.Map
+)
 
 type write struct {
 	fd *os.File
@@ -128,7 +136,6 @@ func compress(
 }
 
 func pinch(w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Content-Type", "text/plain")
 	m, ok := req.URL.Query()["m"]
 
 	var (
@@ -170,11 +177,10 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		)
 		fmt.Fprintf(w, s)
 	}
+	w.Header().Set("Content-Type", "application/json")
 }
 
 func readChecksum(w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
 	paths, ok := req.URL.Query()["f"]
 	if !ok || len(paths) < 1 {
 		http.Error(w, "Must supply f parameter", http.StatusBadRequest)
@@ -192,6 +198,8 @@ func readChecksum(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 	}
+
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
@@ -286,6 +294,12 @@ func readChunk(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func token(length int) string {
+	b := make([]byte, length)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 func main() {
 	dir, _ := ioutil.ReadDir(inputDir)
 	for _, d := range dir {
@@ -296,10 +310,17 @@ func main() {
 		os.RemoveAll(path.Join(inputDir, d.Name()))
 	}
 
+	listen := flag.String("listen", ":8080", "The address to listen on")
+	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
+	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
+	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
+
+	flag.Parse()
+
 	http.HandleFunc("/pinch", pinch)
 	http.HandleFunc("/check", readChecksum)
 	http.HandleFunc("/write", writeChunk)
 	http.HandleFunc("/read", readChunk)
-	log.Printf("Listening at 0.0.0.0:8080/pinch")
-	http.ListenAndServe(":8080", nil)
+	log.Printf("Listening at %s/pinch", *listen)
+	http.ListenAndServe(*listen, nil)
 }

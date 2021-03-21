@@ -45,6 +45,9 @@ $ pinzh lz4 --help
 
 # For data hashing/validation
 $ pinch xxhsum --help
+
+# For crypto data hashing/validation
+$ pinch b3sum --help
 ```
 
 Compression (zstd and lz4)

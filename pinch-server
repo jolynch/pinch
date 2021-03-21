@@ -1,0 +1,31 @@
+#!/bin/bash
+set -euf -o pipefail
+
+MUID=$(id -u)
+DEBUG="${DEBUG:-no}"
+MODE="${MODE:-i}"
+PORT="${PORT:2355}"
+
+if [[ "$(docker images -q jolynch/pinch-server:latest 2> /dev/null)" == "" ]]; then
+    echo "Pulling pinch server docker image"
+    docker pull jolynch/pinch-server
+fi
+
+if [ ! -d "/run/pinch" ]; then
+    echo "Creating /run/pinch"
+    sudo mkdir "/run/pinch"
+    echo "Chowning /run/pinch to $(whoami)"
+    sudo chown -R $MUID /run/pinch
+fi
+
+mkdir -p "/run/pinch/in"
+mkdir -p "/run/pinch/keys"
+mkdir -p "/run/pinch/out"
+
+DOCKER_RUN="docker run --rm -v /run/pinch/:/run/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server"
+
+if [[ ${DEBUG} != "no" ]]; then
+    1>&2 echo "Running ${DOCKER_RUN}"
+fi
+
+exec $DOCKER_RUN $@
