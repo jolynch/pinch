@@ -71,18 +71,6 @@ func compress(
 	maxLevel int,
 ) {
 	syscall.Mkfifo(output, 0666)
-	fd, ferr := os.OpenFile(output, syscall.O_NONBLOCK, 0666)
-	if ferr != nil {
-		log.Printf("Trying to like do FCNTL")
-		defer fd.Close()
-		syscall.RawSyscall(
-			syscall.SYS_FCNTL,
-			fd.Fd(),
-			syscall.F_SETPIPE_SZ,
-			BUF_SIZE*2,
-		)
-	}
-
 	start := time.Now()
 
 	compressorCmd := "zstd -v --adapt=max=%d - -o %s"
@@ -173,17 +161,6 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		// Make the input pipe first so that when this function returns
 		// the input stages are ready
 		syscall.Mkfifo(path.Join(inputDir, s), 0666)
-		fd, err := os.OpenFile(path.Join(inputDir, s), syscall.O_NONBLOCK, 0666)
-		if err != nil {
-			log.Printf("Trying to like do FCNTL")
-			defer fd.Close()
-			syscall.RawSyscall(
-				syscall.SYS_FCNTL,
-				fd.Fd(),
-				syscall.F_SETPIPE_SZ,
-				BUF_SIZE*2,
-			)
-		}
 		go compress(
 			s,
 			path.Join(inputDir, s),
