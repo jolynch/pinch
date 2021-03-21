@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -28,7 +29,7 @@ const (
 var (
 	inputDir    = "/run/pinch/in"
 	outputDir   = "/run/pinch/out"
-	tokenLength = 32
+	tokenLength = 8
 	checksums   sync.Map
 	writers     sync.Map
 )
@@ -91,7 +92,7 @@ func compress(
 		compressor,
 	)
 
-	log.Printf("[%s]: Prepping pinch pipeling with timeout [%ds] -> [%s]", name, timeout, pipeline)
+	log.Printf("[%s]: Spawning pipeline with timeout [%ds] -> [%s]", name, timeout, pipeline)
 	log.Printf("[%s]: Produce data to   [%s]", name, input)
 	log.Printf("[%s]: Consume data from [%s]", name, output)
 
@@ -136,7 +137,7 @@ func compress(
 }
 
 func pinch(w http.ResponseWriter, req *http.Request) {
-	m, ok := req.URL.Query()["m"]
+	m, ok := req.URL.Query()["max_level"]
 
 	var (
 		maxLevel int = 10
@@ -145,12 +146,12 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	if ok && len(m[0]) >= 0 {
 		maxLevel, err = strconv.Atoi(m[0])
 		if err != nil {
-			http.Error(w, "Invalid max level", http.StatusBadRequest)
+			http.Error(w, "Invalid max_level", http.StatusBadRequest)
 			return
 		}
 	}
 
-	t, ok := req.URL.Query()["t"]
+	t, ok := req.URL.Query()["timeout"]
 	timeout := 60
 	if ok && len(t[0]) >= 0 {
 		timeout, err = strconv.Atoi(t[0])
@@ -160,42 +161,75 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	paths, ok := req.URL.Query()["f"]
-	if !ok || len(paths[0]) < 1 {
-		http.Error(w, "Must supply at least one file", http.StatusPreconditionFailed)
+	n, ok := req.URL.Query()["num_handles"]
+	numPaths := 1
+	if ok && len(n[0]) >= 0 {
+		numPaths, err = strconv.Atoi(n[0])
+		if err != nil {
+			http.Error(w, "Invalid num_handles", http.StatusBadRequest)
+		}
 	}
-	for _, s := range paths {
+
+	type compparams struct {
+		Algorithm string `json:"algorithm"`
+		MaxLevel  int    `json:"max_level"`
+	}
+	type resp struct {
+		Handles []string   `json:"handles"`
+		Params  compparams `json:"params"`
+		Ttl     int        `json:"ttl"`
+	}
+
+	response := resp{
+		Handles: make([]string, numPaths),
+		Params: compparams{
+			Algorithm: "zstd_adapt",
+			MaxLevel:  maxLevel,
+		},
+		Ttl: timeout,
+	}
+
+	var handle string
+	for i := 0; i < numPaths; i++ {
+		handle = token(tokenLength)
 		// Make the input pipe first so that when this function returns
 		// the input stages are ready
-		syscall.Mkfifo(path.Join(inputDir, s), 0666)
+		syscall.Mkfifo(path.Join(inputDir, handle), 0666)
+
 		go compress(
-			s,
-			path.Join(inputDir, s),
-			path.Join(outputDir, s+".zst"),
+			handle,
+			path.Join(inputDir, handle),
+			path.Join(outputDir, handle+".zst"),
 			timeout,
 			maxLevel,
 		)
-		fmt.Fprintf(w, s)
+
+		response.Handles[i] = handle
 	}
+
 	w.Header().Set("Content-Type", "application/json")
+	err = json.NewEncoder(w).Encode(response)
+	if err != nil {
+		log.Printf("ERROR %s", err)
+	}
 }
 
 func readChecksum(w http.ResponseWriter, req *http.Request) {
-	paths, ok := req.URL.Query()["f"]
-	if !ok || len(paths) < 1 {
-		http.Error(w, "Must supply f parameter", http.StatusBadRequest)
+	var name string
+	name = strings.TrimPrefix(req.URL.Path, "/checksums/")
+
+	if len(name) < 1 {
+		http.Error(w, "Must supply handle as /checksums/{handle} suffix", http.StatusBadRequest)
 		return
 	}
 
 	response := make(map[string]map[string]string)
 
-	for _, s := range paths {
-		value, ok := checksums.Load(s)
-		if ok {
-			response[s] = map[string]string{
-				"xxh128": value.(checksum).xxh128,
-				"blake3": value.(checksum).blake3,
-			}
+	value, ok := checksums.Load(name)
+	if ok {
+		response[name] = map[string]string{
+			"xxh128": value.(checksum).xxh128,
+			"blake3": value.(checksum).blake3,
 		}
 	}
 
@@ -205,12 +239,11 @@ func readChecksum(w http.ResponseWriter, req *http.Request) {
 
 func writeChunk(w http.ResponseWriter, req *http.Request) {
 	var name string
-	paths, ok := req.URL.Query()["f"]
-	if !ok || len(paths[0]) < 1 {
-		http.Error(w, "Must supply f parameter", http.StatusBadRequest)
+	name = strings.TrimPrefix(req.URL.Path, "/write/")
+
+	if len(name) < 1 {
+		http.Error(w, "Must supply handle as /write/{handle} suffix", http.StatusBadRequest)
 		return
-	} else {
-		name = paths[0]
 	}
 
 	var fd *os.File
@@ -218,7 +251,7 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 	if !ok {
 		fd, err := os.OpenFile(path.Join(inputDir, name), os.O_RDWR, 0666)
 		if err != nil {
-			http.Error(w, "No such name: "+name, http.StatusNotFound)
+			http.Error(w, "No such handle: "+name, http.StatusNotFound)
 			return
 		}
 		value, ok = writers.LoadOrStore(name, write{
@@ -239,14 +272,14 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 		return
 	} else {
 		if written > 0 {
-			log.Printf("[%s] Copied %d bytes to pipe", name, written)
+			log.Printf("[%s]: write copied %d bytes to pipe", name, written)
 			w.Header().Set("X-Pinch-Copied", strconv.FormatInt(written, 10))
 		}
 	}
 
 	_, ok = req.URL.Query()["c"]
 	if ok {
-		log.Printf("[%s] Closing pipe", name)
+		log.Printf("[%s]: write asked to close ... closing", name)
 		writers.Delete(name)
 		fd.Close()
 	}
@@ -259,19 +292,18 @@ func readChunk(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	var name string
-	paths, ok := req.URL.Query()["f"]
-	if !ok || len(paths[0]) < 1 {
-		http.Error(w, "Must supply f parameter", http.StatusBadRequest)
+	name = strings.TrimPrefix(req.URL.Path, "/read/")
+
+	if len(name) < 1 {
+		http.Error(w, "Must supply handle as /read/{handle} suffix", http.StatusBadRequest)
 		return
-	} else {
-		name = paths[0]
 	}
 	log.Printf("[%s]: read start", name)
 
 	fd, err := os.Open(path.Join(outputDir, name+".zst"))
 	if err != nil {
 		log.Printf("[%s]: read error: %s", name, err)
-		http.Error(w, "No such name: "+name+".zst", http.StatusNotFound)
+		http.Error(w, "No such handle: "+name+".zst", http.StatusNotFound)
 		return
 	} else {
 		log.Printf("[%s]: read opened [%s]", name, path.Join(outputDir, name+".zst"))
@@ -301,15 +333,6 @@ func token(length int) string {
 }
 
 func main() {
-	dir, _ := ioutil.ReadDir(inputDir)
-	for _, d := range dir {
-		os.RemoveAll(path.Join(inputDir, d.Name()))
-	}
-	dir, _ = ioutil.ReadDir(outputDir)
-	for _, d := range dir {
-		os.RemoveAll(path.Join(inputDir, d.Name()))
-	}
-
 	listen := flag.String("listen", ":8080", "The address to listen on")
 	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
 	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
@@ -317,10 +340,23 @@ func main() {
 
 	flag.Parse()
 
+	log.Printf("Scanning input directory [%s] to clean up.", inputDir)
+	dir, _ := ioutil.ReadDir(inputDir)
+	for _, d := range dir {
+		log.Printf("Cleaning up %s", path.Join(inputDir, d.Name()))
+		os.RemoveAll(path.Join(inputDir, d.Name()))
+	}
+	log.Printf("Scanning output directory [%s] to clean up", outputDir)
+	dir, _ = ioutil.ReadDir(outputDir)
+	for _, d := range dir {
+		log.Printf("Cleaning up %s", path.Join(outputDir, d.Name()))
+		os.RemoveAll(path.Join(outputDir, d.Name()))
+	}
+
 	http.HandleFunc("/pinch", pinch)
-	http.HandleFunc("/check", readChecksum)
-	http.HandleFunc("/write", writeChunk)
-	http.HandleFunc("/read", readChunk)
+	http.HandleFunc("/checksums/", readChecksum)
+	http.HandleFunc("/write/", writeChunk)
+	http.HandleFunc("/read/", readChunk)
 	log.Printf("Listening at %s/pinch", *listen)
 	http.ListenAndServe(*listen, nil)
 }
