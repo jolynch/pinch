@@ -35,7 +35,7 @@ RUN strip /usr/local/bin/b3sum
 # Step 2. Minimal image to only keep the built binaries, this should be about 11MiB
 FROM alpine:3.10.1
 
-RUN apk --no-cache add man bash
+RUN apk --no-cache add man bash pv
 RUN apk --no-cache del openssl
 
 COPY --from=builder /build_lz4  /
