@@ -45,18 +45,18 @@ type checksum struct {
 }
 
 func cleanupChecksum(name string, start time.Time, expire time.Duration, output string) {
-	log.Printf("[%s] Keeping digests available for %s", name, expire)
+	log.Printf("[%s]: Keeping digests available for %s", name, expire)
 	time.Sleep(expire)
 
 	value, ok := checksums.Load(name)
 	if ok {
 		if value.(checksum).loaded == start {
-			log.Printf("[%s] Cleaned up for [%s]", name, start.Format(time.RFC3339))
+			log.Printf("[%s]: Cleaned up for [%s]", name, start.Format(time.RFC3339))
 			checksums.Delete(name)
 			os.Remove(output + ".xxh128")
 			os.Remove(output + ".blake3")
 		} else {
-			log.Printf("[%s] Detected re-use, skipping clean-up", name)
+			log.Printf("[%s]: Detected re-use, skipping clean-up", name)
 		}
 	} else {
 		os.Remove(output + ".xxh128")
@@ -65,7 +65,7 @@ func cleanupChecksum(name string, start time.Time, expire time.Duration, output 
 
 	writer, hasWriter := writers.Load(name)
 	if hasWriter && !ok {
-		log.Printf("[%s] Cleaning up open writer due to timeout", name)
+		log.Printf("[%s]: Cleaning up open writer due to timeout", name)
 		writers.Delete(name)
 		writer.(write).fd.Close()
 	}
@@ -77,13 +77,22 @@ func compress(
 	input string,
 	output string,
 	timeout int,
+	minLevel int,
 	maxLevel int,
 ) {
 	syscall.Mkfifo(output, 0666)
 	start := time.Now()
 
-	compressorCmd := "zstd -v --adapt=max=%d - -o %s"
-	compressor := fmt.Sprintf(compressorCmd, maxLevel, output)
+	var compressorCmd string
+	var compressor string
+	if minLevel == 0 {
+		compressorCmd = "zstd -v --adapt=max=%d - -o %s"
+		compressor = fmt.Sprintf(compressorCmd, maxLevel, output)
+	} else {
+		compressorCmd = "zstd -v --adapt=min=%d,max=%d - -o %s"
+		compressor = fmt.Sprintf(compressorCmd, minLevel, maxLevel, output)
+	}
+
 	pipeline := fmt.Sprintf(
 		"pv %s | tee >(xxh128sum - > %s) | tee >(b3sum - > %s) | %s",
 		input,
@@ -102,11 +111,11 @@ func compress(
 
 	err := cmd.Run()
 	if err != nil {
-		log.Printf("[%s] FAILED to pinch: %s", name, err)
+		log.Printf("[%s]: FAILED to pinch: %s", name, err)
 		// Try to remove the hash files
 		cleanupChecksum(name, start, time.Duration(0), output)
 	} else {
-		log.Printf("[%s] SUCCESS pinched after waiting %s", name, time.Since(start))
+		log.Printf("[%s]: SUCCESS pinched after waiting %s", name, time.Since(start))
 		log.Print("[" + name + "]\n" + stderr.String())
 		var xxhash string = "UNKNOWN"
 		var blake3 string = "UNKNOWN"
@@ -133,16 +142,18 @@ func compress(
 
 	os.Remove(input)
 	os.Remove(output)
-	log.Printf("[%s] DONE", name)
+	log.Printf("[%s]: finished pinch", name)
 }
 
 func pinch(w http.ResponseWriter, req *http.Request) {
-	m, ok := req.URL.Query()["max_level"]
-
 	var (
 		maxLevel int = 10
+		minLevel int = 0
+		timeout  int = 60
 		err      error
 	)
+
+	m, ok := req.URL.Query()["max_level"]
 	if ok && len(m[0]) >= 0 {
 		maxLevel, err = strconv.Atoi(m[0])
 		if err != nil {
@@ -151,8 +162,16 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	m, ok = req.URL.Query()["min_level"]
+	if ok && len(m[0]) >= 0 {
+		minLevel, err = strconv.Atoi(m[0])
+		if err != nil {
+			http.Error(w, "Invalid min_level", http.StatusBadRequest)
+			return
+		}
+	}
+
 	t, ok := req.URL.Query()["timeout"]
-	timeout := 60
 	if ok && len(t[0]) >= 0 {
 		timeout, err = strconv.Atoi(t[0])
 		if err != nil {
@@ -173,6 +192,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	type compparams struct {
 		Algorithm string `json:"algorithm"`
 		MaxLevel  int    `json:"max_level"`
+		MinLevel  int    `json:"min_level"`
 	}
 	type resp struct {
 		Handles []string   `json:"handles"`
@@ -189,6 +209,10 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		Ttl: timeout,
 	}
 
+	if minLevel != 0 {
+		response.Params.MinLevel = minLevel
+	}
+
 	var handle string
 	for i := 0; i < numPaths; i++ {
 		handle = token(tokenLength)
@@ -201,6 +225,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 			path.Join(inputDir, handle),
 			path.Join(outputDir, handle+".zst"),
 			timeout,
+			minLevel,
 			maxLevel,
 		)
 
@@ -268,7 +293,8 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 	buf := make([]byte, BUF_SIZE)
 	written, err := io.CopyBuffer(fd, req.Body, buf)
 	if err != nil {
-		http.Error(w, "Could not copy", http.StatusInternalServerError)
+		log.Printf("[%s]: write failed due to %s", name, err)
+		http.Error(w, fmt.Sprintf("%s", err), http.StatusInternalServerError)
 		return
 	} else {
 		if written > 0 {
@@ -298,11 +324,10 @@ func readChunk(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Must supply handle as /read/{handle} suffix", http.StatusBadRequest)
 		return
 	}
-	log.Printf("[%s]: read start", name)
 
 	fd, err := os.Open(path.Join(outputDir, name+".zst"))
 	if err != nil {
-		log.Printf("[%s]: read error: %s", name, err)
+		log.Printf("[%s]: read error, no such handle: %s", name, err)
 		http.Error(w, "No such handle: "+name+".zst", http.StatusNotFound)
 		return
 	} else {
@@ -320,7 +345,7 @@ func readChunk(w http.ResponseWriter, req *http.Request) {
 		return
 	} else {
 		if bytesRead > 0 {
-			log.Printf("[%s] Copied %d bytes from pipe", name, bytesRead)
+			log.Printf("[%s]: read copied %d bytes from pipe", name, bytesRead)
 			w.Header().Set("X-Pinch-Copied", strconv.FormatInt(bytesRead, 10))
 		}
 	}
