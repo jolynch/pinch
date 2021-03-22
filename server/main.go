@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	// Pipes are 64k usually, we might bump them in the future ...
-	BUF_SIZE = 4096 * 16
+	// Pipes are 64k usually, we might bump this in the future ...
+	BUF_SIZE = 64 * 1024
 )
 
 var (
@@ -80,7 +80,6 @@ func compress(
 	minLevel int,
 	maxLevel int,
 ) {
-	syscall.Mkfifo(output, 0666)
 	start := time.Now()
 
 	var compressorCmd string
@@ -94,7 +93,7 @@ func compress(
 	}
 
 	pipeline := fmt.Sprintf(
-		"pv %s | tee >(xxh128sum - > %s) | tee >(b3sum - > %s) | %s",
+		"tee < %s >(xxh128sum - > %s) | tee >(b3sum - > %s) | %s",
 		input,
 		output+".xxh128",
 		output+".blake3",
@@ -216,9 +215,11 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	var handle string
 	for i := 0; i < numPaths; i++ {
 		handle = token(tokenLength)
-		// Make the input pipe first so that when this function returns
-		// the input stages are ready
+		// Make the pipes first so that when this function returns
+		// the input stages and output stages are ready to start
+		// consuming (even if we haven't wired them up yet)
 		syscall.Mkfifo(path.Join(inputDir, handle), 0666)
+		syscall.Mkfifo(path.Join(outputDir, handle+".zst"), 0666)
 
 		go compress(
 			handle,
@@ -378,10 +379,12 @@ func main() {
 		os.RemoveAll(path.Join(outputDir, d.Name()))
 	}
 
+	// Pinch API
 	http.HandleFunc("/pinch", pinch)
-	http.HandleFunc("/checksums/", readChecksum)
 	http.HandleFunc("/write/", writeChunk)
 	http.HandleFunc("/read/", readChunk)
+	http.HandleFunc("/checksums/", readChecksum)
+
 	log.Printf("Listening at %s/pinch", *listen)
 	http.ListenAndServe(*listen, nil)
 }
