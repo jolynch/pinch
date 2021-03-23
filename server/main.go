@@ -93,7 +93,7 @@ func compress(
 	}
 
 	pipeline := fmt.Sprintf(
-		"tee < %s >(xxh128sum - > %s) | tee >(b3sum - > %s) | %s",
+		"tee < %s >(xxh128sum - > %s) >(b3sum - > %s) | %s",
 		input,
 		output+".xxh128",
 		output+".blake3",
@@ -142,6 +142,67 @@ func compress(
 	os.Remove(input)
 	os.Remove(output)
 	log.Printf("[%s]: finished pinch", name)
+}
+
+func decompress(
+	name string,
+	input string,
+	output string,
+	timeout int,
+) {
+	start := time.Now()
+	decompressor := fmt.Sprintf("zstd -d %s -c", input)
+
+	pipeline := fmt.Sprintf(
+		"%s | tee >(xxh128sum - > %s) >(b3sum - > %s) > %s",
+		decompressor,
+		output+".xxh128",
+		output+".blake3",
+		output,
+	)
+
+	log.Printf("[%s]: Spawning pipeline with timeout [%ds] -> [%s]", name, timeout, pipeline)
+	log.Printf("[%s]: Produce data to   [%s]", name, input)
+	log.Printf("[%s]: Consume data from [%s]", name, output)
+
+	cmd := exec.Command("timeout", strconv.Itoa(timeout), "bash", "-c", pipeline)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("[%s]: FAILED to unpinch: %s", name, err)
+		// Try to remove the hash files
+		cleanupChecksum(name, start, time.Duration(0), output)
+	} else {
+		log.Printf("[%s]: SUCCESS unpinched after waiting %s", name, time.Since(start))
+		log.Print("[" + name + "]\n" + stderr.String())
+		var xxhash string = "UNKNOWN"
+		var blake3 string = "UNKNOWN"
+		xfd, err := os.Open(output + ".xxh128")
+		if err == nil {
+			defer xfd.Close()
+			fmt.Fscanf(xfd, "%s", &xxhash)
+		}
+		bfd, err := os.Open(output + ".blake3")
+		if err == nil {
+			defer bfd.Close()
+			fmt.Fscanf(bfd, "%s", &blake3)
+		}
+
+		ttl := time.Duration(timeout * 1e9)
+		checksums.Store(name, checksum{
+			loaded: start,
+			xxh128: xxhash,
+			blake3: blake3,
+		})
+
+		go cleanupChecksum(name, start, ttl, output)
+	}
+
+	os.Remove(input)
+	os.Remove(output)
+	log.Printf("[%s]: finished unpinch", name)
 }
 
 func pinch(w http.ResponseWriter, req *http.Request) {
@@ -219,18 +280,86 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		// the input stages and output stages are ready to start
 		// consuming (even if we haven't wired them up yet)
 		syscall.Mkfifo(path.Join(inputDir, handle), 0666)
-		syscall.Mkfifo(path.Join(outputDir, handle+".zst"), 0666)
+		syscall.Mkfifo(path.Join(outputDir, handle), 0666)
 
 		go compress(
 			handle,
 			path.Join(inputDir, handle),
-			path.Join(outputDir, handle+".zst"),
+			path.Join(outputDir, handle),
 			timeout,
 			minLevel,
 			maxLevel,
 		)
 
 		response.Handles[i] = handle
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	err = json.NewEncoder(w).Encode(response)
+	if err != nil {
+		log.Printf("ERROR %s", err)
+	}
+}
+
+func unpinch(w http.ResponseWriter, req *http.Request) {
+	var (
+		timeout int = 60
+		err     error
+	)
+
+	t, ok := req.URL.Query()["timeout"]
+	if ok && len(t[0]) >= 0 {
+		timeout, err = strconv.Atoi(t[0])
+		if err != nil {
+			http.Error(w, "Invalid timeout", http.StatusBadRequest)
+			return
+		}
+	}
+
+	n, ok := req.URL.Query()["num_handles"]
+	numPaths := 1
+	if ok && len(n[0]) >= 0 {
+		numPaths, err = strconv.Atoi(n[0])
+		if err != nil {
+			http.Error(w, "Invalid num_handles", http.StatusBadRequest)
+		}
+	}
+
+	type decompparams struct {
+		Algorithm string `json:"algorithm"`
+	}
+	type resp struct {
+		Handles []string     `json:"handles"`
+		Params  decompparams `json:"params"`
+		Ttl     int          `json:"ttl"`
+	}
+
+	response := resp{
+		Handles: make([]string, numPaths),
+		Params: decompparams{
+			Algorithm: "zstd",
+		},
+		Ttl: timeout,
+	}
+
+	var handle string
+	for i := 0; i < numPaths; i++ {
+		handle = token(tokenLength)
+		response.Handles[i] = handle
+
+		// Make the pipes first so that when this function returns
+		// the input stages and output stages are ready to start
+		// consuming (even if we haven't wired them up yet)
+		syscall.Mkfifo(path.Join(inputDir, handle), 0666)
+		syscall.Mkfifo(path.Join(outputDir, handle), 0666)
+
+		go decompress(
+			handle,
+			path.Join(inputDir, handle),
+			path.Join(outputDir, handle),
+			timeout,
+		)
+
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -326,16 +455,16 @@ func readChunk(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	fd, err := os.Open(path.Join(outputDir, name+".zst"))
+	fd, err := os.Open(path.Join(outputDir, name))
 	if err != nil {
 		log.Printf("[%s]: read error, no such handle: %s", name, err)
-		http.Error(w, "No such handle: "+name+".zst", http.StatusNotFound)
+		http.Error(w, "No such handle: "+name, http.StatusNotFound)
 		return
 	} else {
-		log.Printf("[%s]: read opened [%s]", name, path.Join(outputDir, name+".zst"))
+		log.Printf("[%s]: read opened [%s]", name, path.Join(outputDir, name))
 	}
 
-	log.Printf("[%s]: read copying from pipe [%s]", name, path.Join(outputDir, name+".zst"))
+	log.Printf("[%s]: read copying from pipe [%s]", name, path.Join(outputDir, name))
 	w.Header().Set("Content-Type", "application/octet-stream")
 
 	buf := make([]byte, BUF_SIZE)
@@ -381,6 +510,7 @@ func main() {
 
 	// Pinch API
 	http.HandleFunc("/pinch", pinch)
+	http.HandleFunc("/unpinch", unpinch)
 	http.HandleFunc("/write/", writeChunk)
 	http.HandleFunc("/read/", readChunk)
 	http.HandleFunc("/checksums/", readChecksum)
