@@ -95,7 +95,7 @@ $ cat large_file | pinch zstd -c --adapt | aws s3 cp - s3://<path>
 
 See what kind of awesome compression ratio you'll get at level 10
 ```
-wc -c large_file | pinch zstd -c -10 | wc -c
+wc -c large_file
 cat large_file | pinch zstd -c -10 | wc -c
 ```
 

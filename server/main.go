@@ -412,6 +412,14 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 	}
 	fd = value.(write).fd
 
+	_, readWrite := req.URL.Query()["rw"]
+	readFinished := make(chan bool)
+	if readWrite {
+		go doReadChunk(w, name, readFinished)
+	} else {
+		readFinished <- true
+	}
+
 	log.Printf("[%s]: write copying to pipe", name)
 	buf := make([]byte, BUF_SIZE)
 	written, err := io.CopyBuffer(fd, req.Body, buf)
@@ -422,7 +430,7 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 	} else {
 		if written > 0 {
 			log.Printf("[%s]: write copied %d bytes to pipe", name, written)
-			w.Header().Set("X-Pinch-Copied", strconv.FormatInt(written, 10))
+			w.Header().Set("X-Pinch-Written", strconv.FormatInt(written, 10))
 		}
 	}
 
@@ -432,26 +440,25 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 		writers.Delete(name)
 		fd.Close()
 	}
-	w.WriteHeader(http.StatusNoContent)
+
+	<-readFinished
+	if readWrite {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
-func readChunk(w http.ResponseWriter, req *http.Request) {
+func doReadChunk(w http.ResponseWriter, name string, finished chan bool) {
 	w.Header().Set("Connection", "Keep-Alive")
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-
-	var name string
-	name = strings.TrimPrefix(req.URL.Path, "/read/")
-
-	if len(name) < 1 {
-		http.Error(w, "Must supply handle as /read/{handle} suffix", http.StatusBadRequest)
-		return
-	}
 
 	fd, err := os.Open(path.Join(outputDir, name))
 	if err != nil {
 		log.Printf("[%s]: read error, no such handle: %s", name, err)
 		http.Error(w, "No such handle: "+name, http.StatusNotFound)
+		finished <- false
 		return
 	} else {
 		log.Printf("[%s]: read opened [%s]", name, path.Join(outputDir, name))
@@ -464,14 +471,29 @@ func readChunk(w http.ResponseWriter, req *http.Request) {
 	bytesRead, err := io.CopyBuffer(w, fd, buf)
 	if err != nil {
 		log.Printf("ERROR %s", err)
-		w.WriteHeader(http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Error reading from %s: %s", name, err), http.StatusInternalServerError)
+		finished <- false
 		return
 	} else {
 		if bytesRead > 0 {
 			log.Printf("[%s]: read copied %d bytes from pipe", name, bytesRead)
-			w.Header().Set("X-Pinch-Copied", strconv.FormatInt(bytesRead, 10))
 		}
 	}
+
+	finished <- true
+}
+
+func readChunk(w http.ResponseWriter, req *http.Request) {
+	name := strings.TrimPrefix(req.URL.Path, "/read/")
+
+	if len(name) < 1 {
+		http.Error(w, "Must supply handle as /read/{handle} suffix", http.StatusBadRequest)
+		return
+	}
+
+	readFinished := make(chan bool)
+	doReadChunk(w, name, readFinished)
+	<-readFinished
 }
 
 func token(length int) string {
