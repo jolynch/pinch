@@ -1,17 +1,23 @@
 Pinch
 =====
+Associated blog post: [Use Fast Data Algorithms](https://jolynch.github.io/posts/use_fast_data_algorithms/).
+
 A toolkit for rapidly compressing, hashing and otherwise making data smaller
 when you can't neccesarily install software (e.g. CI/CD envionments) but you
 can run docker containers. The resulting `pinch` container container takes up
-about `9MiB` of disk space and contains three excellent compression/hashing
-utilities from [Yann Collet](https://github.com/Cyan4973):
+about `15MiB` of disk space and contains multiple excellent compression/hashing
+utilities from [Yann Collet](https://github.com/Cyan4973) in addition to a few
+other tools.
 
-* [zstd](https://github.com/facebook/zstd) v1.4.0 for great compression
-* [lz4](https://github.com/lz4/lz4) v1.9.1 for very fast compression
-* [xxHash](https://github.com/facebook/zstd) v0.7.0 for ridculously fast hashing
+* [zstd](https://github.com/facebook/zstd) v1.4.9 for great compression
+* [lz4](https://github.com/lz4/lz4) v1.9.3 for very fast compression
+* [xxHash](https://github.com/facebook/zstd) v0.8.0 for ridculously fast hashing
+* [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) v0.3.7 for ridculously fast cryptographic hashing
+* [age](https://github.com/FiloSottile/age) v0.3.7 for reasonably fast encryption/decryption
 
 Note that licenses of these tools are included in the
-`/usr/local/share/licenses` folder within the container.
+`/usr/local/share/licenses` folder within the container except for blake3 which
+is released to the [public domain](https://github.com/BLAKE3-team/BLAKE3/blob/master/LICENSE).
 
 
 Installation
@@ -48,6 +54,9 @@ $ pinch xxhsum --help
 
 # For crypto data hashing/validation
 $ pinch b3sum --help
+
+# For enc/dec files
+$ pinch age --help
 ```
 
 Compression (zstd and lz4)
@@ -63,7 +72,6 @@ notes](https://github.com/facebook/zstd/releases/tag/v1.3.6)). This means that
 you can do streaming uploads and downloads of massive datasets while your
 compression algorithm adaptively adjusts to the bandwidth and CPU environment
 for maximum performance.
-
 
 `lz4` is almost always the correct choice for _fast_ compression. In my
 experience it achieves similar ratios as other "fast" algorithms like `snappy`

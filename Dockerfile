@@ -32,16 +32,23 @@ RUN wget https://github.com/BLAKE3-team/BLAKE3/releases/download/0.3.7/b3sum_lin
 RUN chmod +x /usr/local/bin/b3sum
 RUN strip /usr/local/bin/b3sum
 
-# Step 2. Minimal image to only keep the built binaries, this should be about 11MiB
-FROM alpine:3.10.1
+RUN wget https://github.com/FiloSottile/age/releases/download/v1.0.0-rc.1/age-v1.0.0-rc.1-linux-amd64.tar.gz
+RUN tar -xvvzf age-v1.0.0-rc.1-linux-amd64.tar.gz
+RUN strip /age/age-keygen
+RUN strip /age/age
 
-RUN apk --no-cache add man bash pv
+# Step 2. Minimal image to only keep the built binaries, this should be about 15MiB
+FROM alpine:3.13.2
+
+RUN apk --no-cache add mandoc bash
 RUN apk --no-cache del openssl
 
 COPY --from=builder /build_lz4  /
 COPY --from=builder /build_zstd /
 COPY --from=builder /build_xxh  /
 COPY --from=builder /usr/local/bin/b3sum /usr/local/bin/b3sum
+COPY --from=builder /age/age-keygen /usr/local/bin/age-keygen
+COPY --from=builder /age/age /usr/local/bin/age
 
 # For some reason man pages don't work unless in the global setup
 RUN ln -sf /usr/local/share/man/man1 /usr/share/man/man1
@@ -51,6 +58,7 @@ RUN mkdir -p /usr/local/share/licenses/lz4 /usr/local/share/licenses/zstd /usr/l
 COPY --from=builder /lz4_src/LICENSE /usr/local/share/licenses/lz4/
 COPY --from=builder /zstd_src/LICENSE /usr/local/share/licenses/zstd/
 COPY --from=builder /xxh_src/LICENSE /usr/local/share/licenses/xxhash/
+COPY --from=builder /age/LICENSE /usr/local/share/licenses/age/
 
 ENV PAGER less
 

@@ -210,6 +210,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		maxLevel int = 10
 		minLevel int = 0
 		timeout  int = 60
+		numPaths int = 1
 		err      error
 	)
 
@@ -241,7 +242,6 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	}
 
 	n, ok := req.URL.Query()["num_handles"]
-	numPaths := 1
 	if ok && len(n[0]) >= 0 {
 		numPaths, err = strconv.Atoi(n[0])
 		if err != nil {
@@ -303,8 +303,9 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 
 func unpinch(w http.ResponseWriter, req *http.Request) {
 	var (
-		timeout int = 60
-		err     error
+		timeout  int = 60
+		numPaths int = 1
+		err      error
 	)
 
 	t, ok := req.URL.Query()["timeout"]
@@ -317,7 +318,6 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 	}
 
 	n, ok := req.URL.Query()["num_handles"]
-	numPaths := 1
 	if ok && len(n[0]) >= 0 {
 		numPaths, err = strconv.Atoi(n[0])
 		if err != nil {
@@ -325,21 +325,14 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	type decompparams struct {
-		Algorithm string `json:"algorithm"`
-	}
 	type resp struct {
-		Handles []string     `json:"handles"`
-		Params  decompparams `json:"params"`
-		Ttl     int          `json:"ttl"`
+		Handles []string `json:"handles"`
+		Ttl     int      `json:"ttl"`
 	}
 
 	response := resp{
 		Handles: make([]string, numPaths),
-		Params: decompparams{
-			Algorithm: "zstd",
-		},
-		Ttl: timeout,
+		Ttl:     timeout,
 	}
 
 	var handle string
