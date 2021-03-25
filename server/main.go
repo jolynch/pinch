@@ -27,8 +27,10 @@ const (
 )
 
 var (
+	listen      = "127.0.0.1:8080"
 	inputDir    = "/run/pinch/in"
 	outputDir   = "/run/pinch/out"
+	keysDir     = "/run/pinch/keys"
 	tokenLength = 8
 	checksums   sync.Map
 	writers     sync.Map
@@ -79,17 +81,28 @@ func compress(
 	timeout int,
 	minLevel int,
 	maxLevel int,
+	encKey interface{},
 ) {
 	start := time.Now()
 
 	var compressorCmd string
 	var compressor string
 	if minLevel == 0 {
-		compressorCmd = "zstd -v --adapt=max=%d - -o %s"
-		compressor = fmt.Sprintf(compressorCmd, maxLevel, output)
+		if encKey == nil {
+			compressorCmd = "zstd -v --adapt=max=%d - -o %s"
+			compressor = fmt.Sprintf(compressorCmd, maxLevel, output)
+		} else {
+			compressorCmd = "zstd -v --adapt=max=%d - | age -r %s -o %s"
+			compressor = fmt.Sprintf(compressorCmd, maxLevel, encKey.(string), output)
+		}
 	} else {
-		compressorCmd = "zstd -v --adapt=min=%d,max=%d - -o %s"
-		compressor = fmt.Sprintf(compressorCmd, minLevel, maxLevel, output)
+		if encKey == nil {
+			compressorCmd = "zstd -v --adapt=min=%d,max=%d - -o %s"
+			compressor = fmt.Sprintf(compressorCmd, minLevel, maxLevel, output)
+		} else {
+			compressorCmd = "zstd -v --adapt=min=%d,max=%d - | age -r %s -o %s"
+			compressor = fmt.Sprintf(compressorCmd, minLevel, maxLevel, encKey.(string), output)
+		}
 	}
 
 	pipeline := fmt.Sprintf(
@@ -149,9 +162,19 @@ func decompress(
 	input string,
 	output string,
 	timeout int,
+	encKey interface{},
 ) {
 	start := time.Now()
-	decompressor := fmt.Sprintf("zstd -d %s -c", input)
+	var decompressor string
+
+	if encKey == nil {
+		decompressor = fmt.Sprintf("zstd -d %s -c", input)
+	} else {
+		decompressor = fmt.Sprintf(
+			"age -d -i %s/%s %s | zstd -d -c",
+			keysDir, encKey.(string), input,
+		)
+	}
 
 	pipeline := fmt.Sprintf(
 		"%s | tee >(xxh128sum - > %s) >(b3sum - > %s) > %s",
@@ -211,23 +234,24 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		minLevel int = 0
 		timeout  int = 60
 		numPaths int = 1
+		encKey   interface{}
 		err      error
 	)
 
-	m, ok := req.URL.Query()["max_level"]
+	m, ok := req.URL.Query()["max-level"]
 	if ok && len(m[0]) >= 0 {
 		maxLevel, err = strconv.Atoi(m[0])
 		if err != nil {
-			http.Error(w, "Invalid max_level", http.StatusBadRequest)
+			http.Error(w, "Invalid max-level", http.StatusBadRequest)
 			return
 		}
 	}
 
-	m, ok = req.URL.Query()["min_level"]
+	m, ok = req.URL.Query()["max-level"]
 	if ok && len(m[0]) >= 0 {
 		minLevel, err = strconv.Atoi(m[0])
 		if err != nil {
-			http.Error(w, "Invalid min_level", http.StatusBadRequest)
+			http.Error(w, "Invalid max-level", http.StatusBadRequest)
 			return
 		}
 	}
@@ -241,36 +265,68 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	n, ok := req.URL.Query()["num_handles"]
+	k, ok := req.URL.Query()["age-public-key"]
+	if ok && len(k[0]) >= 0 {
+		encKey = k[0]
+	}
+
+	n, ok := req.URL.Query()["num-handles"]
 	if ok && len(n[0]) >= 0 {
 		numPaths, err = strconv.Atoi(n[0])
 		if err != nil {
-			http.Error(w, "Invalid num_handles", http.StatusBadRequest)
+			http.Error(w, "Invalid num-handles", http.StatusBadRequest)
 		}
 	}
 
 	type compparams struct {
-		Algorithm string `json:"algorithm"`
-		MaxLevel  int    `json:"max_level"`
-		MinLevel  int    `json:"min_level"`
+		Algorithm string `json:"algorithm,omitempty"`
+		Extension string `json:"extension,omitempty"`
+		MaxLevel  int    `json:"max-level,omitempty"`
+		MinLevel  int    `json:"min-level,omitempty"`
+	}
+	type encparams struct {
+		Algorithm string `json:"algorithm,omitempty"`
+		Extension string `json:"extension,omitempty"`
+		PublicKey string `json:"public-key,omitempty"`
+	}
+	type io struct {
+		Http    string `json:"io-http"`
+		InPipe  string `json:"in-pipe"`
+		OutPipe string `json:"out-pipe"`
 	}
 	type resp struct {
-		Handles []string   `json:"handles"`
-		Params  compparams `json:"params"`
-		Ttl     int        `json:"ttl"`
+		Handles           map[string]io `json:"handles"`
+		CompressionParams compparams    `json:"compression,omitempty"`
+		EncryptionParams  encparams     `json:"encryption,omitempty"`
+		Ttl               int           `json:"ttl"`
 	}
 
 	response := resp{
-		Handles: make([]string, numPaths),
-		Params: compparams{
-			Algorithm: "zstd_adapt",
+		Handles: make(map[string]io),
+		CompressionParams: compparams{
+			Algorithm: "zstd:adapt",
+			Extension: "zst",
 			MaxLevel:  maxLevel,
+		},
+		EncryptionParams: encparams{
+			Algorithm: "plaintext",
 		},
 		Ttl: timeout,
 	}
 
 	if minLevel != 0 {
-		response.Params.MinLevel = minLevel
+		log.Printf("Setting minlevel to %d", minLevel)
+		response.CompressionParams.MinLevel = minLevel
+	} else {
+		log.Printf("NOT setting minlevel to %d", minLevel)
+	}
+
+	if encKey != nil {
+		response.EncryptionParams = encparams{
+			Algorithm: "age:chacha20poly1305",
+			Extension: "age",
+			PublicKey: encKey.(string),
+		}
 	}
 
 	var handle string
@@ -282,6 +338,12 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		syscall.Mkfifo(path.Join(inputDir, handle), 0666)
 		syscall.Mkfifo(path.Join(outputDir, handle), 0666)
 
+		response.Handles[handle] = io{
+			Http:    "http://" + listen + "/write/" + handle,
+			InPipe:  path.Join(inputDir, handle),
+			OutPipe: path.Join(outputDir, handle),
+		}
+
 		go compress(
 			handle,
 			path.Join(inputDir, handle),
@@ -289,9 +351,8 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 			timeout,
 			minLevel,
 			maxLevel,
+			encKey,
 		)
-
-		response.Handles[i] = handle
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -305,6 +366,7 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 	var (
 		timeout  int = 60
 		numPaths int = 1
+		encKey   interface{}
 		err      error
 	)
 
@@ -317,28 +379,38 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	n, ok := req.URL.Query()["num_handles"]
+	n, ok := req.URL.Query()["num-handles"]
 	if ok && len(n[0]) >= 0 {
 		numPaths, err = strconv.Atoi(n[0])
 		if err != nil {
-			http.Error(w, "Invalid num_handles", http.StatusBadRequest)
+			http.Error(w, "Invalid num-handles", http.StatusBadRequest)
 		}
 	}
 
+	k, ok := req.URL.Query()["age-key-path"]
+	if ok && len(k[0]) >= 0 {
+		encKey = k[0]
+	}
+
+	type io struct {
+		Http    string `json:"io-http"`
+		InPipe  string `json:"in-pipe"`
+		OutPipe string `json:"out-pipe"`
+	}
+
 	type resp struct {
-		Handles []string `json:"handles"`
-		Ttl     int      `json:"ttl"`
+		Handles map[string]io `json:"handles"`
+		Ttl     int           `json:"ttl"`
 	}
 
 	response := resp{
-		Handles: make([]string, numPaths),
+		Handles: make(map[string]io),
 		Ttl:     timeout,
 	}
 
 	var handle string
 	for i := 0; i < numPaths; i++ {
 		handle = token(tokenLength)
-		response.Handles[i] = handle
 
 		// Make the pipes first so that when this function returns
 		// the input stages and output stages are ready to start
@@ -346,11 +418,18 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 		syscall.Mkfifo(path.Join(inputDir, handle), 0666)
 		syscall.Mkfifo(path.Join(outputDir, handle), 0666)
 
+		response.Handles[handle] = io{
+			Http:    "http://" + listen + "/write/" + handle,
+			InPipe:  path.Join(inputDir, handle),
+			OutPipe: path.Join(outputDir, handle),
+		}
+
 		go decompress(
 			handle,
 			path.Join(inputDir, handle),
 			path.Join(outputDir, handle),
 			timeout,
+			encKey,
 		)
 
 	}
@@ -442,9 +521,7 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 	}
 
 	<-readFinished
-	if readWrite {
-		w.WriteHeader(http.StatusOK)
-	} else {
+	if !readWrite {
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -503,7 +580,7 @@ func token(length int) string {
 }
 
 func main() {
-	listen := flag.String("listen", ":8080", "The address to listen on")
+	flag.StringVar(&listen, "listen", listen, "The address to listen on")
 	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
 	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
 	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
@@ -530,6 +607,6 @@ func main() {
 	http.HandleFunc("/read/", readChunk)
 	http.HandleFunc("/checksums/", readChecksum)
 
-	log.Printf("Listening at %s/pinch", *listen)
-	http.ListenAndServe(*listen, nil)
+	log.Printf("Listening at %s/pinch", listen)
+	http.ListenAndServe(listen, nil)
 }
