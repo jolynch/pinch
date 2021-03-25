@@ -117,7 +117,7 @@ func compress(
 	log.Printf("[%s]: Produce data to   [%s]", name, input)
 	log.Printf("[%s]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command("timeout", strconv.Itoa(timeout), "bash", "-c", pipeline)
+	cmd := exec.Command("time", "timeout", strconv.Itoa(timeout), "bash", "-c", pipeline)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
@@ -188,7 +188,7 @@ func decompress(
 	log.Printf("[%s]: Produce data to   [%s]", name, input)
 	log.Printf("[%s]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command("timeout", strconv.Itoa(timeout), "bash", "-c", pipeline)
+	cmd := exec.Command("time", "timeout", strconv.Itoa(timeout), "bash", "-c", pipeline)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
