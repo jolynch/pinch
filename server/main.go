@@ -106,7 +106,7 @@ func compress(
 	}
 
 	pipeline := fmt.Sprintf(
-		"tee < %s >(xxh128sum - > %s) >(b3sum - > %s) | %s",
+		"tee < %s >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) | %s",
 		input,
 		output+".xxh128",
 		output+".blake3",
@@ -177,7 +177,7 @@ func decompress(
 	}
 
 	pipeline := fmt.Sprintf(
-		"%s | tee >(xxh128sum - > %s) >(b3sum - > %s) > %s",
+		"%s | tee >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) > %s",
 		decompressor,
 		output+".xxh128",
 		output+".blake3",
