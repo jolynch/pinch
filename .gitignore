@@ -1,3 +1,4 @@
 server/pinch
+server/pinch-server
 s3/
 *.swp
