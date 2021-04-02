@@ -8,10 +8,23 @@ import (
 	"time"
 )
 
-type Checksum struct {
-	Start  time.Time
-	Xxh128 string
-	Blake3 string
+type Checksums struct {
+	Xxh128 string `json:"xxh128,omitempty"`
+	Blake3 string `json:"blake3,omitempty"`
+}
+
+type PipelineResult struct {
+	Start     time.Time     `json:"started_at"`
+	Duration  time.Duration `json:"duration"`
+	Success   bool          `json:"success"`
+	Stderr    string        `json:"error,omitempty"`
+	Checksums Checksums     `json:"checksums",omitempty`
+}
+
+type processResult struct {
+	result PipelineResult
+	waiter *sync.WaitGroup
+	done   bool
 }
 
 type write struct {
@@ -19,43 +32,91 @@ type write struct {
 }
 
 var (
-	checksums sync.Map
+	processes sync.Map
 	writers   sync.Map
 )
 
-func StoreChecksum(name string, checksum Checksum) {
-	checksums.Store(name, checksum)
+func PreparePipeline(name string) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	processes.LoadOrStore(name, processResult{waiter: &wg, done: false})
 }
 
-func LoadChecksum(name string) (value Checksum, ok bool) {
-	val, ok := checksums.Load(name)
+func FinishPipeline(name string, pipeline PipelineResult, stateTTL time.Duration, output string) {
+	PreparePipeline(name)
+
+	val, ok := processes.Load(name)
 	if ok {
-		return val.(Checksum), true
-	} else {
-		return Checksum{}, false
+		pr := val.(processResult)
+		pr.result = pipeline
+		pr.waiter.Done()
+		pr.done = true
+		// Why do I need this store ...
+		processes.Store(name, pr)
+		go cleanupPipeline(name, pipeline.Start, stateTTL, output)
 	}
 }
 
-func CleanupChecksum(name string, start time.Time, expire time.Duration, output string) {
-	log.Printf("[%s]: Keeping digests available for %s", name, expire)
+func WaitForPipeline(name string, waitFor time.Duration) (value PipelineResult, ok bool) {
+	val, ok := processes.Load(name)
+	if !ok {
+		return PipelineResult{}, false
+	}
+
+	pr := val.(processResult)
+	// Check if we have a result for this pipeline, if so just return it
+	if pr.done {
+		return pr.result, true
+	}
+	if waitFor == 0 {
+		return PipelineResult{}, false
+	}
+
+	// Otherwise wait for it to exist
+	t := make(chan bool)
+	defer close(t)
+	go func() {
+		pr.waiter.Wait()
+		t <- true
+	}()
+
+	select {
+	case <-t:
+		val, ok := processes.Load(name)
+		if ok {
+			return val.(processResult).result, true
+		} else {
+			return PipelineResult{}, false
+		}
+	case <-time.After(waitFor):
+		return PipelineResult{}, false
+	}
+}
+
+func cleanupPipeline(name string, start time.Time, expire time.Duration, output string) {
+	log.Printf("[%s][cleanup]: Waiting %s before cleaning up state", name, expire)
 	time.Sleep(expire)
 
-	value, ok := LoadChecksum(name)
+	val, ok := processes.Load(name)
 	if ok {
-		if value.Start == start {
-			log.Printf("[%s]: Cleaned up for [%s]", name, start.Format(time.RFC3339))
-			checksums.Delete(name)
-			os.Remove(output + ".xxh128")
-			os.Remove(output + ".blake3")
+		pr := val.(processResult)
+		if pr.result.Start == start {
+			log.Printf("[%s][cleanup]: Cleaned up for [%s]", name, start.Format(time.RFC3339))
+			processes.Delete(name)
+			CleanupDigests(output)
 		} else {
-			log.Printf("[%s]: Detected re-use, skipping clean-up", name)
+			log.Printf("[%s][cleanup]: Detected handle re-use")
 		}
 	} else {
-		log.Printf("[%s]: No digests found, command failed", name)
-		os.Remove(output + ".xxh128")
-		os.Remove(output + ".blake3")
-		ReleaseWriter(name)
+		log.Printf("[%s][cleanup]: No process state found ...", name)
+		CleanupDigests(output)
 	}
+	MaybeReleaseWriter(name)
+}
+
+func CleanupDigests(output string) {
+	os.Remove(output + ".xxh128")
+	os.Remove(output + ".blake3")
 }
 
 func AcquireWriter(writeDir string, name string) *os.File {
@@ -78,10 +139,10 @@ func AcquireWriter(writeDir string, name string) *os.File {
 	return value.(write).fd
 }
 
-func ReleaseWriter(name string) {
+func MaybeReleaseWriter(name string) {
 	value, hasWriter := writers.Load(name)
 	if hasWriter {
-		log.Printf("[%s]: Cleaning up open writer", name)
+		log.Printf("[%s][cleanup]: Cleaning up open writer", name)
 		writers.Delete(name)
 		value.(write).fd.Close()
 	}

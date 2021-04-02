@@ -13,6 +13,8 @@ RUN mkdir -p /go/src/
 
 COPY go.mod /go/src/go.mod
 COPY main.go /go/src/main.go
+COPY state /go/src/state
+COPY utils /go/src/utils
 
 WORKDIR /go/src/
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -tags netgo -ldflags='-s -w -extldflags "-static"' -o pinch-server

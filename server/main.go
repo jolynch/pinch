@@ -16,6 +16,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jolynch/pinch/state"
@@ -70,22 +71,33 @@ func compress(
 		compressor,
 	)
 
-	log.Printf("[%s]: Spawning pipeline with timeout [%ds] -> [%s]", name, timeout, pipeline)
-	log.Printf("[%s]: Produce data to   [%s]", name, input)
-	log.Printf("[%s]: Consume data from [%s]", name, output)
+	log.Printf("[%s][pinch]: Spawning pipeline with timeout [%ds] -> [%s]", name, timeout, pipeline)
+	log.Printf("[%s][pinch]: Produce data to   [%s]", name, input)
+	log.Printf("[%s][pinch]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command("time", "timeout", strconv.Itoa(timeout), "bash", "-c", pipeline)
+	cmd := exec.Command("time", "timeout", strconv.Itoa(timeout), "bash", "-o", "pipefail", "-c", pipeline)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
+	state.PreparePipeline(name)
 	err := cmd.Run()
 	if err != nil {
-		log.Printf("[%s]: FAILED to pinch: %s", name, err)
+		log.Printf("[%s][pinch]: Failed! with error %s", name, err)
 		// Try to remove the hash files
-		state.CleanupChecksum(name, start, time.Duration(0), output)
-
+		state.CleanupDigests(output)
+		state.FinishPipeline(
+			name,
+			state.PipelineResult{
+				Start:    start,
+				Duration: time.Since(start),
+				Success:  false,
+				Stderr:   stderr.String(),
+			},
+			time.Duration(timeout*1e9),
+			output,
+		)
 	} else {
-		log.Printf("[%s]: SUCCESS pinched after waiting %s", name, time.Since(start))
+		log.Printf("[%s][pinch]: Succeeded after waiting [%s]", name, time.Since(start))
 		log.Print("[" + name + "]\n" + stderr.String())
 		var xxhash string = "UNKNOWN"
 		var blake3 string = "UNKNOWN"
@@ -100,16 +112,23 @@ func compress(
 			fmt.Fscanf(bfd, "%s", &blake3)
 		}
 
-		ttl := time.Duration(timeout * 1e9)
-		state.StoreChecksum(
-			name, state.Checksum{Start: start, Xxh128: xxhash, Blake3: blake3},
+		state.FinishPipeline(
+			name,
+			state.PipelineResult{
+				Start:     start,
+				Duration:  time.Since(start),
+				Success:   true,
+				Stderr:    stderr.String(),
+				Checksums: state.Checksums{Xxh128: xxhash, Blake3: blake3},
+			},
+			time.Duration(timeout*1e9),
+			output,
 		)
-		go state.CleanupChecksum(name, start, ttl, output)
 	}
 
 	os.Remove(input)
 	os.Remove(output)
-	log.Printf("[%s]: finished pinch", name)
+	log.Printf("[%s][pinch]: Done", name)
 }
 
 func decompress(
@@ -139,21 +158,33 @@ func decompress(
 		output,
 	)
 
-	log.Printf("[%s]: Spawning pipeline with timeout [%ds] -> [%s]", name, timeout, pipeline)
-	log.Printf("[%s]: Produce data to   [%s]", name, input)
-	log.Printf("[%s]: Consume data from [%s]", name, output)
+	log.Printf("[%s][unpinch]: Spawning pipeline with timeout [%ds] -> [%s]", name, timeout, pipeline)
+	log.Printf("[%s][unpinch]: Produce data to   [%s]", name, input)
+	log.Printf("[%s][unpinch]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command("time", "timeout", strconv.Itoa(timeout), "bash", "-c", pipeline)
+	cmd := exec.Command("time", "timeout", strconv.Itoa(timeout), "bash", "-o", "pipefail", "-c", pipeline)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
+	state.PreparePipeline(name)
 	err := cmd.Run()
 	if err != nil {
-		log.Printf("[%s]: FAILED to unpinch: %s", name, err)
-		// Try to remove the hash files
-		state.CleanupChecksum(name, start, time.Duration(0), output)
+		log.Printf("[%s][unpinch]: Failed! with error %s", name, err)
+		// Try to remove the hash files and record a failure
+		state.CleanupDigests(output)
+		state.FinishPipeline(
+			name,
+			state.PipelineResult{
+				Start:    start,
+				Duration: time.Since(start),
+				Success:  false,
+				Stderr:   stderr.String(),
+			},
+			time.Duration(1e9*timeout),
+			output,
+		)
 	} else {
-		log.Printf("[%s]: SUCCESS unpinched after waiting %s", name, time.Since(start))
+		log.Printf("[%s][unpinch]: Succeeded after waiting %s", name, time.Since(start))
 		log.Print("[" + name + "]\n" + stderr.String())
 		var xxhash string = "UNKNOWN"
 		var blake3 string = "UNKNOWN"
@@ -168,18 +199,23 @@ func decompress(
 			fmt.Fscanf(bfd, "%s", &blake3)
 		}
 
-		ttl := time.Duration(timeout * 1e9)
-		state.StoreChecksum(
+		state.FinishPipeline(
 			name,
-			state.Checksum{Start: start, Xxh128: xxhash, Blake3: blake3},
+			state.PipelineResult{
+				Start:     start,
+				Duration:  time.Since(start),
+				Success:   true,
+				Stderr:    stderr.String(),
+				Checksums: state.Checksums{Xxh128: xxhash, Blake3: blake3},
+			},
+			time.Duration(1e9*timeout),
+			output,
 		)
-
-		go state.CleanupChecksum(name, start, ttl, output)
 	}
 
 	os.Remove(input)
 	os.Remove(output)
-	log.Printf("[%s]: finished unpinch", name)
+	log.Printf("[%s][unpinch]: Done", name)
 }
 
 func pinch(w http.ResponseWriter, req *http.Request) {
@@ -272,7 +308,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		log.Printf("Setting minlevel to %d", minLevel)
 		response.CompressionParams.MinLevel = minLevel
 	} else {
-		log.Printf("NOT setting minlevel to %d", minLevel)
+		log.Printf("Not setting minlevel")
 	}
 
 	if encKey != nil {
@@ -395,22 +431,35 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func readChecksum(w http.ResponseWriter, req *http.Request) {
-	var name string
-	name = strings.TrimPrefix(req.URL.Path, "/checksums/")
+func getStatus(w http.ResponseWriter, req *http.Request) {
+	var (
+		names   string        = strings.TrimPrefix(req.URL.Path, "/status/")
+		waitFor time.Duration = time.Duration(1e9)
+		err     error
+	)
 
-	if len(name) < 1 {
-		http.Error(w, "Must supply handle as /checksums/{handle} suffix", http.StatusBadRequest)
+	if len(names) < 1 {
+		http.Error(w, "Must supply handle as /status/{handle} suffix", http.StatusBadRequest)
 		return
 	}
 
-	response := make(map[string]map[string]string)
+	wf, ok := req.URL.Query()["wait-for"]
+	if ok && len(wf[0]) >= 0 {
+		waitFor, err = time.ParseDuration(wf[0])
+		if err != nil {
+			http.Error(w, "Invalid wait-for", http.StatusBadRequest)
+			return
+		}
+	}
 
-	value, ok := state.LoadChecksum(name)
-	if ok {
-		response[name] = map[string]string{
-			"xxh128": value.Xxh128,
-			"blake3": value.Blake3,
+	response := make(map[string]state.PipelineResult)
+
+	for _, name := range strings.Split(names, ",") {
+		start := time.Now()
+		value, ok := state.WaitForPipeline(name, waitFor)
+		log.Printf("[%s][status] Waited for %s", name, time.Since(start))
+		if ok {
+			response[name] = value
 		}
 	}
 
@@ -418,15 +467,23 @@ func readChecksum(w http.ResponseWriter, req *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func writeChunk(w http.ResponseWriter, req *http.Request) {
+func handleIO(w http.ResponseWriter, req *http.Request) {
 	var name string
-	name = strings.TrimPrefix(req.URL.Path, "/write/")
+	name = strings.TrimPrefix(req.URL.Path, "/io/")
 
 	if len(name) < 1 {
-		http.Error(w, "Must supply handle as /write/{handle} suffix", http.StatusBadRequest)
+		http.Error(w, "Must supply handle as /io/{handle} suffix", http.StatusBadRequest)
 		return
 	}
 
+	if req.Method == http.MethodPut {
+		writeChunk(name, w, req)
+	} else {
+		readChunk(name, w, req)
+	}
+}
+
+func writeChunk(name string, w http.ResponseWriter, req *http.Request) {
 	var fd *os.File = state.AcquireWriter(inputDir, name)
 	if fd == nil {
 		http.Error(w, "No such handle: "+name, http.StatusNotFound)
@@ -436,29 +493,31 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 	_, readWrite := req.URL.Query()["rw"]
 	readFinished := make(chan bool)
 	if readWrite {
+		// In ReadWrite mode we
+		w.Header().Set("Trailer", "X-Pinch-Written")
 		go doReadChunk(w, name, readFinished)
 	} else {
 		readFinished <- true
 	}
 
-	log.Printf("[%s]: write copying to pipe", name)
+	log.Printf("[%s][write]: Copying to pipe", name)
 	buf := make([]byte, bufSizeBytes)
 	written, err := io.CopyBuffer(fd, req.Body, buf)
 	if err != nil {
-		log.Printf("[%s]: write failed due to %s", name, err)
+		log.Printf("[%s][write]: Failed due to %s", name, err)
 		http.Error(w, fmt.Sprintf("%s", err), http.StatusInternalServerError)
 		return
 	} else {
 		if written > 0 {
-			log.Printf("[%s]: write copied %d bytes to pipe", name, written)
+			log.Printf("[%s][write]: Copied %d bytes to pipe", name, written)
 			w.Header().Set("X-Pinch-Written", strconv.FormatInt(written, 10))
 		}
 	}
 
 	_, ok := req.URL.Query()["c"]
 	if ok {
-		log.Printf("[%s]: write asked to close ... closing", name)
-		state.ReleaseWriter(name)
+		log.Printf("[%s][write]: Closing due to close flag", name)
+		state.MaybeReleaseWriter(name)
 	}
 
 	<-readFinished
@@ -468,47 +527,40 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 }
 
 func doReadChunk(w http.ResponseWriter, name string, finished chan bool) {
-	w.Header().Set("Connection", "Keep-Alive")
-	w.Header().Set("Transfer-Encoding", "chunked")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-
 	fd, err := os.Open(path.Join(outputDir, name))
 	if err != nil {
-		log.Printf("[%s]: read error, no such handle: %s", name, err)
+		log.Printf("[%s][read]: ERROR: no such handle: %s", name, err)
 		http.Error(w, "No such handle: "+name, http.StatusNotFound)
 		finished <- false
 		return
 	} else {
-		log.Printf("[%s]: read opened [%s]", name, path.Join(outputDir, name))
+		log.Printf("[%s][read]: Opened [%s]", name, path.Join(outputDir, name))
 	}
 
-	log.Printf("[%s]: read copying from pipe [%s]", name, path.Join(outputDir, name))
+	w.Header().Set("Connection", "Keep-Alive")
+	w.Header().Set("Transfer-Encoding", "chunked")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	log.Printf("[%s][read]: Copying from pipe [%s]", name, path.Join(outputDir, name))
 	w.Header().Set("Content-Type", "application/octet-stream")
 
 	buf := make([]byte, bufSizeBytes)
 	bytesRead, err := io.CopyBuffer(w, fd, buf)
 	if err != nil {
-		log.Printf("ERROR %s", err)
+		log.Printf("[%s] [read] ERROR: %s", name, err)
 		http.Error(w, fmt.Sprintf("Error reading from %s: %s", name, err), http.StatusInternalServerError)
 		finished <- false
 		return
 	} else {
 		if bytesRead > 0 {
-			log.Printf("[%s]: read copied %d bytes from pipe", name, bytesRead)
+			log.Printf("[%s][read]: Copied %d bytes from pipe", name, bytesRead)
 		}
 	}
 
 	finished <- true
 }
 
-func readChunk(w http.ResponseWriter, req *http.Request) {
-	name := strings.TrimPrefix(req.URL.Path, "/read/")
-
-	if len(name) < 1 {
-		http.Error(w, "Must supply handle as /read/{handle} suffix", http.StatusBadRequest)
-		return
-	}
-
+func readChunk(name string, w http.ResponseWriter, req *http.Request) {
 	readFinished := make(chan bool)
 	doReadChunk(w, name, readFinished)
 	<-readFinished
@@ -520,34 +572,45 @@ func token(length int) string {
 	return hex.EncodeToString(b)
 }
 
+func die(duration time.Duration) {
+	log.Printf("Will die after %s", duration)
+	time.Sleep(duration)
+	log.Printf("Goodbye dying now ...")
+	syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
+}
+
 func main() {
 	flag.StringVar(&listen, "listen", listen, "The address to listen on")
 	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
 	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
 	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
 	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should buffers be")
+	dieAfter := flag.Duration("die-after", time.Duration(0), "Die after this duration. Zero seconds indicates live forever")
 
 	flag.Parse()
 
 	log.Printf("Scanning input directory [%s] to clean up.", inputDir)
 	dir, _ := ioutil.ReadDir(inputDir)
 	for _, d := range dir {
-		log.Printf("Cleaning up %s", path.Join(inputDir, d.Name()))
+		log.Printf("[cleanup] Cleaning up %s", path.Join(inputDir, d.Name()))
 		os.RemoveAll(path.Join(inputDir, d.Name()))
 	}
 	log.Printf("Scanning output directory [%s] to clean up", outputDir)
 	dir, _ = ioutil.ReadDir(outputDir)
 	for _, d := range dir {
-		log.Printf("Cleaning up %s", path.Join(outputDir, d.Name()))
+		log.Printf("[cleanup] Cleaning up %s", path.Join(outputDir, d.Name()))
 		os.RemoveAll(path.Join(outputDir, d.Name()))
 	}
 
 	// Pinch API
 	http.HandleFunc("/pinch", pinch)
 	http.HandleFunc("/unpinch", unpinch)
-	http.HandleFunc("/write/", writeChunk)
-	http.HandleFunc("/read/", readChunk)
-	http.HandleFunc("/checksums/", readChecksum)
+	http.HandleFunc("/io/", handleIO)
+	http.HandleFunc("/status/", getStatus)
+
+	if *dieAfter > 0 {
+		go die(*dieAfter)
+	}
 
 	log.Printf("Listening at %s/pinch", listen)
 	http.ListenAndServe(listen, nil)

@@ -1,4 +1,5 @@
 server/pinch
 server/pinch-server
 s3/
+tests/state
 *.swp
