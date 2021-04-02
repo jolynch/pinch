@@ -16,63 +16,20 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
-)
 
-const (
-	// Pipes are 64k usually, we might bump this in the future ...
-	BUF_SIZE = 64 * 1024
+	"github.com/jolynch/pinch/state"
+	"github.com/jolynch/pinch/utils"
 )
 
 var (
-	listen      = "127.0.0.1:8080"
-	inputDir    = "/run/pinch/in"
-	outputDir   = "/run/pinch/out"
-	keysDir     = "/run/pinch/keys"
-	tokenLength = 8
-	checksums   sync.Map
-	writers     sync.Map
+	listen       = "127.0.0.1:8080"
+	inputDir     = "/run/pinch/in"
+	outputDir    = "/run/pinch/out"
+	keysDir      = "/run/pinch/keys"
+	tokenLength  = 8
+	bufSizeBytes = 128 * 1024 // Usually pipes are 64KiB, we bump it slightly
 )
-
-type write struct {
-	fd *os.File
-}
-
-type checksum struct {
-	loaded time.Time
-	xxh128 string
-	blake3 string
-}
-
-func cleanupChecksum(name string, start time.Time, expire time.Duration, output string) {
-	log.Printf("[%s]: Keeping digests available for %s", name, expire)
-	time.Sleep(expire)
-
-	value, ok := checksums.Load(name)
-	if ok {
-		if value.(checksum).loaded == start {
-			log.Printf("[%s]: Cleaned up for [%s]", name, start.Format(time.RFC3339))
-			checksums.Delete(name)
-			os.Remove(output + ".xxh128")
-			os.Remove(output + ".blake3")
-		} else {
-			log.Printf("[%s]: Detected re-use, skipping clean-up", name)
-		}
-	} else {
-		os.Remove(output + ".xxh128")
-		os.Remove(output + ".blake3")
-	}
-
-	writer, hasWriter := writers.Load(name)
-	if hasWriter && !ok {
-		log.Printf("[%s]: Cleaning up open writer due to timeout", name)
-		writers.Delete(name)
-		writer.(write).fd.Close()
-	}
-
-}
 
 func compress(
 	name string,
@@ -125,7 +82,8 @@ func compress(
 	if err != nil {
 		log.Printf("[%s]: FAILED to pinch: %s", name, err)
 		// Try to remove the hash files
-		cleanupChecksum(name, start, time.Duration(0), output)
+		state.CleanupChecksum(name, start, time.Duration(0), output)
+
 	} else {
 		log.Printf("[%s]: SUCCESS pinched after waiting %s", name, time.Since(start))
 		log.Print("[" + name + "]\n" + stderr.String())
@@ -143,13 +101,10 @@ func compress(
 		}
 
 		ttl := time.Duration(timeout * 1e9)
-		checksums.Store(name, checksum{
-			loaded: start,
-			xxh128: xxhash,
-			blake3: blake3,
-		})
-
-		go cleanupChecksum(name, start, ttl, output)
+		state.StoreChecksum(
+			name, state.Checksum{Start: start, Xxh128: xxhash, Blake3: blake3},
+		)
+		go state.CleanupChecksum(name, start, ttl, output)
 	}
 
 	os.Remove(input)
@@ -196,7 +151,7 @@ func decompress(
 	if err != nil {
 		log.Printf("[%s]: FAILED to unpinch: %s", name, err)
 		// Try to remove the hash files
-		cleanupChecksum(name, start, time.Duration(0), output)
+		state.CleanupChecksum(name, start, time.Duration(0), output)
 	} else {
 		log.Printf("[%s]: SUCCESS unpinched after waiting %s", name, time.Since(start))
 		log.Print("[" + name + "]\n" + stderr.String())
@@ -214,13 +169,12 @@ func decompress(
 		}
 
 		ttl := time.Duration(timeout * 1e9)
-		checksums.Store(name, checksum{
-			loaded: start,
-			xxh128: xxhash,
-			blake3: blake3,
-		})
+		state.StoreChecksum(
+			name,
+			state.Checksum{Start: start, Xxh128: xxhash, Blake3: blake3},
+		)
 
-		go cleanupChecksum(name, start, ttl, output)
+		go state.CleanupChecksum(name, start, ttl, output)
 	}
 
 	os.Remove(input)
@@ -335,8 +289,8 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		// Make the pipes first so that when this function returns
 		// the input stages and output stages are ready to start
 		// consuming (even if we haven't wired them up yet)
-		syscall.Mkfifo(path.Join(inputDir, handle), 0666)
-		syscall.Mkfifo(path.Join(outputDir, handle), 0666)
+		utils.MakeFifo(path.Join(inputDir, handle), bufSizeBytes)
+		utils.MakeFifo(path.Join(outputDir, handle), bufSizeBytes)
 
 		response.Handles[handle] = io{
 			Http:    "http://" + listen + "/write/" + handle,
@@ -415,8 +369,8 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 		// Make the pipes first so that when this function returns
 		// the input stages and output stages are ready to start
 		// consuming (even if we haven't wired them up yet)
-		syscall.Mkfifo(path.Join(inputDir, handle), 0666)
-		syscall.Mkfifo(path.Join(outputDir, handle), 0666)
+		utils.MakeFifo(path.Join(inputDir, handle), bufSizeBytes)
+		utils.MakeFifo(path.Join(outputDir, handle), bufSizeBytes)
 
 		response.Handles[handle] = io{
 			Http:    "http://" + listen + "/write/" + handle,
@@ -452,11 +406,11 @@ func readChecksum(w http.ResponseWriter, req *http.Request) {
 
 	response := make(map[string]map[string]string)
 
-	value, ok := checksums.Load(name)
+	value, ok := state.LoadChecksum(name)
 	if ok {
 		response[name] = map[string]string{
-			"xxh128": value.(checksum).xxh128,
-			"blake3": value.(checksum).blake3,
+			"xxh128": value.Xxh128,
+			"blake3": value.Blake3,
 		}
 	}
 
@@ -473,23 +427,11 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var fd *os.File
-	value, ok := writers.Load(name)
-	if !ok {
-		fd, err := os.OpenFile(path.Join(inputDir, name), os.O_RDWR, 0666)
-		if err != nil {
-			http.Error(w, "No such handle: "+name, http.StatusNotFound)
-			return
-		}
-		value, ok = writers.LoadOrStore(name, write{
-			fd: fd,
-		})
-		// Race, someone else made a FD
-		if ok {
-			fd.Close()
-		}
+	var fd *os.File = state.AcquireWriter(inputDir, name)
+	if fd == nil {
+		http.Error(w, "No such handle: "+name, http.StatusNotFound)
+		return
 	}
-	fd = value.(write).fd
 
 	_, readWrite := req.URL.Query()["rw"]
 	readFinished := make(chan bool)
@@ -500,7 +442,7 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 	}
 
 	log.Printf("[%s]: write copying to pipe", name)
-	buf := make([]byte, BUF_SIZE)
+	buf := make([]byte, bufSizeBytes)
 	written, err := io.CopyBuffer(fd, req.Body, buf)
 	if err != nil {
 		log.Printf("[%s]: write failed due to %s", name, err)
@@ -513,11 +455,10 @@ func writeChunk(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	_, ok = req.URL.Query()["c"]
+	_, ok := req.URL.Query()["c"]
 	if ok {
 		log.Printf("[%s]: write asked to close ... closing", name)
-		writers.Delete(name)
-		fd.Close()
+		state.ReleaseWriter(name)
 	}
 
 	<-readFinished
@@ -544,7 +485,7 @@ func doReadChunk(w http.ResponseWriter, name string, finished chan bool) {
 	log.Printf("[%s]: read copying from pipe [%s]", name, path.Join(outputDir, name))
 	w.Header().Set("Content-Type", "application/octet-stream")
 
-	buf := make([]byte, BUF_SIZE)
+	buf := make([]byte, bufSizeBytes)
 	bytesRead, err := io.CopyBuffer(w, fd, buf)
 	if err != nil {
 		log.Printf("ERROR %s", err)
@@ -584,6 +525,7 @@ func main() {
 	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
 	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
 	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
+	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should buffers be")
 
 	flag.Parse()
 
