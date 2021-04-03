@@ -10,7 +10,7 @@ image:
 acceptance: image test
 
 test:
-	tests/fetch_data.sh
+	tests/test_tools.sh
 	tests/test_server.sh
 
 install: image
