@@ -17,7 +17,7 @@ type PipelineResult struct {
 	Start     time.Time     `json:"started_at"`
 	Duration  time.Duration `json:"duration"`
 	Success   bool          `json:"success"`
-	Stderr    string        `json:"error,omitempty"`
+	Stderr    string        `json:"stderr,omitempty"`
 	Checksums Checksums     `json:"checksums",omitempty`
 }
 

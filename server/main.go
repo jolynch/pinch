@@ -36,7 +36,7 @@ func compress(
 	name string,
 	input string,
 	output string,
-	timeout int,
+	timeout time.Duration,
 	minLevel int,
 	maxLevel int,
 	encKey interface{},
@@ -71,11 +71,15 @@ func compress(
 		compressor,
 	)
 
-	log.Printf("[%s][pinch]: Spawning pipeline with timeout [%ds] -> [%s]", name, timeout, pipeline)
+	log.Printf("[%s][pinch]: Spawning pipeline with timeout [%s] -> [%s]", name, timeout, pipeline)
 	log.Printf("[%s][pinch]: Produce data to   [%s]", name, input)
 	log.Printf("[%s][pinch]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command("time", "timeout", strconv.Itoa(timeout), "bash", "-o", "pipefail", "-c", pipeline)
+	cmd := exec.Command(
+		"time",
+		"timeout", strconv.FormatInt(int64(timeout/time.Second), 10),
+		"bash", "-o", "pipefail", "-c", pipeline,
+	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
@@ -93,7 +97,7 @@ func compress(
 				Success:  false,
 				Stderr:   stderr.String(),
 			},
-			time.Duration(timeout*1e9),
+			timeout,
 			output,
 		)
 	} else {
@@ -123,7 +127,7 @@ func compress(
 				Stderr:    msg,
 				Checksums: state.Checksums{Xxh128: xxhash, Blake3: blake3},
 			},
-			time.Duration(timeout*1e9),
+			timeout,
 			output,
 		)
 	}
@@ -137,7 +141,7 @@ func decompress(
 	name string,
 	input string,
 	output string,
-	timeout int,
+	timeout time.Duration,
 	encKey interface{},
 ) {
 	start := time.Now()
@@ -160,11 +164,15 @@ func decompress(
 		output,
 	)
 
-	log.Printf("[%s][unpinch]: Spawning pipeline with timeout [%ds] -> [%s]", name, timeout, pipeline)
+	log.Printf("[%s][unpinch]: Spawning pipeline with timeout [%s] -> [%s]", name, timeout, pipeline)
 	log.Printf("[%s][unpinch]: Produce data to   [%s]", name, input)
 	log.Printf("[%s][unpinch]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command("time", "timeout", strconv.Itoa(timeout), "bash", "-o", "pipefail", "-c", pipeline)
+	cmd := exec.Command(
+		"time",
+		"timeout", strconv.FormatInt(int64(timeout/time.Second), 10),
+		"bash", "-o", "pipefail", "-c", pipeline,
+	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
@@ -182,7 +190,7 @@ func decompress(
 				Success:  false,
 				Stderr:   stderr.String(),
 			},
-			time.Duration(1e9*timeout),
+			timeout,
 			output,
 		)
 	} else {
@@ -210,7 +218,7 @@ func decompress(
 				Stderr:    stderr.String(),
 				Checksums: state.Checksums{Xxh128: xxhash, Blake3: blake3},
 			},
-			time.Duration(1e9*timeout),
+			timeout,
 			output,
 		)
 	}
@@ -222,10 +230,10 @@ func decompress(
 
 func pinch(w http.ResponseWriter, req *http.Request) {
 	var (
-		maxLevel int = 10
-		minLevel int = 0
-		timeout  int = 60
-		numPaths int = 1
+		maxLevel int           = 10
+		minLevel int           = 0
+		timeout  time.Duration = time.Duration(60 * time.Second)
+		numPaths int           = 1
 		encKey   interface{}
 		err      error
 	)
@@ -250,9 +258,9 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 
 	t, ok := req.URL.Query()["timeout"]
 	if ok && len(t[0]) >= 0 {
-		timeout, err = strconv.Atoi(t[0])
-		if err != nil {
-			http.Error(w, "Invalid timeout", http.StatusBadRequest)
+		timeout, err = time.ParseDuration(t[0])
+		if err != nil || timeout < time.Second {
+			http.Error(w, "Invalid timeout, try something larger than 1s like 60s or 1m", http.StatusBadRequest)
 			return
 		}
 	}
@@ -290,7 +298,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		Handles           map[string]io `json:"handles"`
 		CompressionParams compparams    `json:"compression,omitempty"`
 		EncryptionParams  encparams     `json:"encryption,omitempty"`
-		Ttl               int           `json:"ttl"`
+		Ttl               time.Duration `json:"time-to-live"`
 	}
 
 	response := resp{
@@ -356,17 +364,17 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 
 func unpinch(w http.ResponseWriter, req *http.Request) {
 	var (
-		timeout  int = 60
-		numPaths int = 1
+		timeout  time.Duration = time.Duration(60 * time.Second)
+		numPaths int           = 1
 		encKey   interface{}
 		err      error
 	)
 
 	t, ok := req.URL.Query()["timeout"]
 	if ok && len(t[0]) >= 0 {
-		timeout, err = strconv.Atoi(t[0])
-		if err != nil {
-			http.Error(w, "Invalid timeout", http.StatusBadRequest)
+		timeout, err = time.ParseDuration(t[0])
+		if err != nil || timeout < time.Second {
+			http.Error(w, "Invalid timeout, try something larger than 1s like 60s or 1m", http.StatusBadRequest)
 			return
 		}
 	}
@@ -392,7 +400,7 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 
 	type resp struct {
 		Handles map[string]io `json:"handles"`
-		Ttl     int           `json:"ttl"`
+		Ttl     time.Duration `json:"time-to-live"`
 	}
 
 	response := resp{
@@ -436,7 +444,7 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 func getStatus(w http.ResponseWriter, req *http.Request) {
 	var (
 		names   string        = strings.TrimPrefix(req.URL.Path, "/status/")
-		waitFor time.Duration = time.Duration(1e9)
+		waitFor time.Duration = time.Duration(1 * time.Second)
 		err     error
 	)
 
@@ -492,11 +500,14 @@ func writeChunk(name string, w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	_, readWrite := req.URL.Query()["rw"]
+	_, partial := req.URL.Query()["partial"]
+	_, writeOnly := req.URL.Query()["writeonly"]
+
 	readFinished := make(chan bool)
-	if readWrite {
-		// In ReadWrite mode we
-		w.Header().Set("Trailer", "X-Pinch-Written")
+	if !writeOnly {
+		// In ReadWrite mode we send back a response with the processed
+		// data, so headers become trailers after we have processed the data
+		w.Header().Set("Trailer", "X-Pinch-Bytes-Written")
 		go doReadChunk(w, name, readFinished)
 	} else {
 		readFinished <- true
@@ -504,26 +515,25 @@ func writeChunk(name string, w http.ResponseWriter, req *http.Request) {
 
 	log.Printf("[%s][write]: Copying to pipe", name)
 	buf := make([]byte, bufSizeBytes)
-	written, err := io.CopyBuffer(fd, req.Body, buf)
+	bytesWritten, err := io.CopyBuffer(fd, req.Body, buf)
 	if err != nil {
 		log.Printf("[%s][write]: Failed due to %s", name, err)
 		http.Error(w, fmt.Sprintf("%s", err), http.StatusInternalServerError)
 		return
 	} else {
-		if written > 0 {
-			log.Printf("[%s][write]: Copied %d bytes to pipe", name, written)
-			w.Header().Set("X-Pinch-Written", strconv.FormatInt(written, 10))
+		if bytesWritten > 0 {
+			log.Printf("[%s][write]: Copied %d bytes to pipe", name, bytesWritten)
+			w.Header().Set("X-Pinch-Bytes-Written", strconv.FormatInt(bytesWritten, 10))
 		}
 	}
 
-	_, ok := req.URL.Query()["c"]
-	if ok {
-		log.Printf("[%s][write]: Closing due to close flag", name)
+	if !partial {
+		log.Printf("[%s][write]: Closing due to lack of partial flag", name)
 		state.MaybeReleaseWriter(name)
 	}
 
 	<-readFinished
-	if !readWrite {
+	if writeOnly {
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -543,6 +553,10 @@ func doReadChunk(w http.ResponseWriter, name string, finished chan bool) {
 	w.Header().Set("Connection", "Keep-Alive")
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// When completing a pinch/unpinch we will have checksums attached
+	w.Header().Add("Trailer", "X-Pinch-Bytes-Read")
+	w.Header().Add("Trailer", "X-Pinch-XXH128")
+	w.Header().Add("Trailer", "X-Pinch-BLAKE3")
 
 	log.Printf("[%s][read]: Copying from pipe [%s]", name, path.Join(outputDir, name))
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -558,6 +572,8 @@ func doReadChunk(w http.ResponseWriter, name string, finished chan bool) {
 		if bytesRead > 0 {
 			log.Printf("[%s][read]: Copied %d bytes from pipe", name, bytesRead)
 		}
+		w.Header().Set("X-Pinch-Bytes-Read", strconv.FormatInt(bytesRead, 10))
+
 	}
 
 	finished <- true

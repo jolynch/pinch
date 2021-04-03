@@ -4,7 +4,7 @@ set -euf -o pipefail
 MUID=$(id -u)
 DEBUG="${DEBUG:-no}"
 PORT="${PORT:-2355}"
-TIMEOUT="${TIMEOUT:-0s}"
+DIEAFTER="${DIEAFTER:-0s}"
 ONESHOT="${ONESHOT:-false}"
 PIPEDIR="${PIPEDIR:-/run/pinch}"
 DETACH="${DETACH:-true}"
@@ -26,9 +26,9 @@ mkdir -p "/run/pinch/keys"
 mkdir -p "/run/pinch/out"
 
 if [[ "${DETACH}" == "true" ]]; then
-    DOCKER_RUN="docker run --rm -d -v /run/pinch/:/run/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${TIMEOUT}"
+    DOCKER_RUN="docker run --rm -d -v /run/pinch/:/run/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
 else
-    DOCKER_RUN="docker run --rm -v /run/pinch/:/run/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${TIMEOUT}"
+    DOCKER_RUN="docker run --rm -v /run/pinch/:/run/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
 fi
 
 
