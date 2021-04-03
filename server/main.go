@@ -97,8 +97,10 @@ func compress(
 			output,
 		)
 	} else {
+		// Hack to make carriage returns into newlines
+		msg := strings.ReplaceAll(stderr.String(), "\r", "\r\n")
 		log.Printf("[%s][pinch]: Succeeded after waiting [%s]", name, time.Since(start))
-		log.Print("[" + name + "]\n" + stderr.String())
+		log.Print("[" + name + "]\n" + msg)
 		var xxhash string = "UNKNOWN"
 		var blake3 string = "UNKNOWN"
 		xfd, err := os.Open(output + ".xxh128")
@@ -118,7 +120,7 @@ func compress(
 				Start:     start,
 				Duration:  time.Since(start),
 				Success:   true,
-				Stderr:    stderr.String(),
+				Stderr:    msg,
 				Checksums: state.Checksums{Xxh128: xxhash, Blake3: blake3},
 			},
 			time.Duration(timeout*1e9),
@@ -329,7 +331,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		utils.MakeFifo(path.Join(outputDir, handle), bufSizeBytes)
 
 		response.Handles[handle] = io{
-			Http:    "http://" + listen + "/write/" + handle,
+			Http:    "http://" + listen + "/io/" + handle,
 			InPipe:  path.Join(inputDir, handle),
 			OutPipe: path.Join(outputDir, handle),
 		}
@@ -534,6 +536,7 @@ func doReadChunk(w http.ResponseWriter, name string, finished chan bool) {
 		finished <- false
 		return
 	} else {
+		defer fd.Close()
 		log.Printf("[%s][read]: Opened [%s]", name, path.Join(outputDir, name))
 	}
 

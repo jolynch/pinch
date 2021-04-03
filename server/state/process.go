@@ -22,9 +22,9 @@ type PipelineResult struct {
 }
 
 type processResult struct {
-	result PipelineResult
-	waiter *sync.WaitGroup
-	done   bool
+	result   PipelineResult
+	finished chan bool
+	done     bool
 }
 
 type write struct {
@@ -37,9 +37,8 @@ var (
 )
 
 func PreparePipeline(name string) {
-	var wg sync.WaitGroup
-	wg.Add(1)
-	processes.LoadOrStore(name, processResult{waiter: &wg, done: false})
+	finished := make(chan bool)
+	processes.LoadOrStore(name, processResult{finished: finished, done: false})
 }
 
 func FinishPipeline(name string, pipeline PipelineResult, stateTTL time.Duration, output string) {
@@ -49,7 +48,7 @@ func FinishPipeline(name string, pipeline PipelineResult, stateTTL time.Duration
 	if ok {
 		pr := val.(processResult)
 		pr.result = pipeline
-		pr.waiter.Done()
+		close(pr.finished)
 		pr.done = true
 		// Why do I need this store ...
 		processes.Store(name, pr)
@@ -73,15 +72,8 @@ func WaitForPipeline(name string, waitFor time.Duration) (value PipelineResult, 
 	}
 
 	// Otherwise wait for it to exist
-	t := make(chan bool)
-	defer close(t)
-	go func() {
-		pr.waiter.Wait()
-		t <- true
-	}()
-
 	select {
-	case <-t:
+	case <-pr.finished:
 		val, ok := processes.Load(name)
 		if ok {
 			return val.(processResult).result, true
