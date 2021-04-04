@@ -64,7 +64,7 @@ func compress(
 	}
 
 	pipeline := fmt.Sprintf(
-		"tee < %s >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) | %s",
+		"pipetee < %s >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) | %s",
 		input,
 		output+".xxh128",
 		output+".blake3",
@@ -157,7 +157,7 @@ func decompress(
 	}
 
 	pipeline := fmt.Sprintf(
-		"%s | tee >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) > %s",
+		"%s | pipetee >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) > %s",
 		decompressor,
 		output+".xxh128",
 		output+".blake3",
@@ -443,12 +443,12 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 
 func getStatus(w http.ResponseWriter, req *http.Request) {
 	var (
-		names   string        = strings.TrimPrefix(req.URL.Path, "/status/")
+		name    string        = strings.TrimPrefix(req.URL.Path, "/status/")
 		waitFor time.Duration = time.Duration(1 * time.Second)
 		err     error
 	)
 
-	if len(names) < 1 {
+	if len(name) < 1 {
 		http.Error(w, "Must supply handle as /status/{handle} suffix", http.StatusBadRequest)
 		return
 	}
@@ -462,19 +462,15 @@ func getStatus(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	response := make(map[string]state.PipelineResult)
-
-	for _, name := range strings.Split(names, ",") {
-		start := time.Now()
-		value, ok := state.WaitForPipeline(name, waitFor)
-		log.Printf("[%s][status] Waited for %s", name, time.Since(start))
-		if ok {
-			response[name] = value
-		}
+	start := time.Now()
+	value, ok := state.WaitForPipeline(name, waitFor)
+	log.Printf("[%s][status] Waited for %s", name, time.Since(start))
+	if ok {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(value)
+	} else {
+		http.Error(w, "Could not find handle: "+name, http.StatusNotFound)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
 }
 
 func handleIO(w http.ResponseWriter, req *http.Request) {

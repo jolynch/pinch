@@ -8,6 +8,8 @@ cleanup() {
     docker kill pinch-server || echo "server already dead"
 }
 
+cleanup
+
 export PORT=2355
 export DIEAFTER="100s"
 DATA="${DATA:-tests/state/webster.txt}"
@@ -26,4 +28,14 @@ echo $AFTER
 
 test "${BEFORE}" -eq "${AFTER}"
 
-curl -s "$URL/status/$FD"
+echo "Compress output"
+curl -s "${URL}/status/${FD}" | jq ".stderr" -r
+COMP_BLAKE3=$(curl -s "${URL}/status/${FD}" | jq ".checksums.blake3" -r)
+COMP_XXH128=$(curl -s "${URL}/status/${FD}" | jq ".checksums.xxh128" -r)
+echo "Decompress output"
+curl -s "${URL}/status/${RFD}" | jq ".stderr" -r
+DECOMP_BLAKE3=$(curl -s "${URL}/status/${RFD}" | jq ".checksums.blake3" -r)
+DECOMP_XXH128=$(curl -s "${URL}/status/${RFD}" | jq ".checksums.xxh128" -r)
+
+test "${COMP_BLAKE3}" = "${DECOMP_BLAKE3}"
+test "${COMP_XXH128}" = "${DECOMP_XXH128}"
