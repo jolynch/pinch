@@ -241,17 +241,19 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	m, ok := req.URL.Query()["max-level"]
 	if ok && len(m[0]) >= 0 {
 		maxLevel, err = strconv.Atoi(m[0])
-		if err != nil {
+		// Zstd needs a lot more memory above 19
+		if err != nil || maxLevel > 19 {
 			http.Error(w, "Invalid max-level", http.StatusBadRequest)
 			return
 		}
 	}
 
-	m, ok = req.URL.Query()["max-level"]
+	m, ok = req.URL.Query()["min-level"]
 	if ok && len(m[0]) >= 0 {
 		minLevel, err = strconv.Atoi(m[0])
-		if err != nil {
-			http.Error(w, "Invalid max-level", http.StatusBadRequest)
+		// Zstd adapt doesn't accept negative levels as min-level
+		if err != nil || minLevel < 0 {
+			http.Error(w, "Invalid min-level", http.StatusBadRequest)
 			return
 		}
 	}
@@ -419,7 +421,7 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 		utils.MakeFifo(path.Join(outputDir, handle), bufSizeBytes)
 
 		response.Handles[handle] = io{
-			Http:    "http://" + listen + "/write/" + handle,
+			Http:    "http://" + listen + "/io/" + handle,
 			InPipe:  path.Join(inputDir, handle),
 			OutPipe: path.Join(outputDir, handle),
 		}
