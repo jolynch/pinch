@@ -37,6 +37,11 @@ RUN tar -xvvzf age-v1.0.0-rc.1-linux-amd64.tar.gz
 RUN strip /age/age-keygen
 RUN strip /age/age
 
+# Build our pipetee utilitiy
+COPY pipetee/pipetee.c pipetee.c
+RUN gcc pipetee.c -o pipetee
+RUN strip pipetee
+
 # Step 2. Minimal image to only keep the built binaries, this should be about 15MiB
 FROM alpine:3.13.2
 
@@ -49,6 +54,7 @@ COPY --from=builder /build_xxh  /
 COPY --from=builder /usr/local/bin/b3sum /usr/local/bin/b3sum
 COPY --from=builder /age/age-keygen /usr/local/bin/age-keygen
 COPY --from=builder /age/age /usr/local/bin/age
+COPY --from=builder /pipetee /usr/local/bin/pipetee
 
 # For some reason man pages don't work unless in the global setup
 RUN ln -sf /usr/local/share/man/man1 /usr/share/man/man1

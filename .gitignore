@@ -1,5 +1,6 @@
 server/pinch
 server/pinch-server
+pipetee/pipetee
 s3/
 tests/state
 *.swp
