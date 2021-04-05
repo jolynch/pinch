@@ -75,16 +75,25 @@ func compress(
 	log.Printf("[%s][pinch]: Produce data to   [%s]", name, input)
 	log.Printf("[%s][pinch]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command(
-		"time",
-		"timeout", strconv.FormatInt(int64(timeout/time.Second), 10),
-		"bash", "-o", "pipefail", "-c", pipeline,
-	)
+	cmd := exec.Command("bash", "-o", "pipefail", "-c", pipeline)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	// Since busybox timeout doesn't really work (it doesn't put all children
+	// into a process group), implement it ourself
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	timer := time.AfterFunc(timeout, func() {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	})
+	killTimer := time.AfterFunc(timeout+10*time.Second, func() {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	})
 
 	state.PreparePipeline(name)
 	err := cmd.Run()
+
+	timer.Stop()
+	killTimer.Stop()
+
 	if err != nil {
 		log.Printf("[%s][pinch]: Failed! with error %s", name, err)
 		// Try to remove the hash files
@@ -93,7 +102,7 @@ func compress(
 			name,
 			state.PipelineResult{
 				Start:    start,
-				Duration: time.Since(start),
+				Duration: fmt.Sprintf("%s", time.Since(start)),
 				Success:  false,
 				Stderr:   stderr.String(),
 			},
@@ -122,7 +131,7 @@ func compress(
 			name,
 			state.PipelineResult{
 				Start:     start,
-				Duration:  time.Since(start),
+				Duration:  fmt.Sprintf("%s", time.Since(start)),
 				Success:   true,
 				Stderr:    msg,
 				Checksums: state.Checksums{Xxh128: xxhash, Blake3: blake3},
@@ -168,16 +177,26 @@ func decompress(
 	log.Printf("[%s][unpinch]: Produce data to   [%s]", name, input)
 	log.Printf("[%s][unpinch]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command(
-		"time",
-		"timeout", strconv.FormatInt(int64(timeout/time.Second), 10),
-		"bash", "-o", "pipefail", "-c", pipeline,
-	)
+	cmd := exec.Command("bash", "-o", "pipefail", "-c", pipeline)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
+	// Since busybox timeout doesn't really work (it doesn't put all children
+	// into a process group), implement it ourself
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	timer := time.AfterFunc(timeout, func() {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	})
+	killTimer := time.AfterFunc(timeout+10*time.Second, func() {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	})
+
 	state.PreparePipeline(name)
 	err := cmd.Run()
+
+	timer.Stop()
+	killTimer.Stop()
+
 	if err != nil {
 		log.Printf("[%s][unpinch]: Failed! with error %s", name, err)
 		// Try to remove the hash files and record a failure
@@ -186,7 +205,7 @@ func decompress(
 			name,
 			state.PipelineResult{
 				Start:    start,
-				Duration: time.Since(start),
+				Duration: fmt.Sprintf("%s", time.Since(start)),
 				Success:  false,
 				Stderr:   stderr.String(),
 			},
@@ -213,7 +232,7 @@ func decompress(
 			name,
 			state.PipelineResult{
 				Start:     start,
-				Duration:  time.Since(start),
+				Duration:  fmt.Sprintf("%s", time.Since(start)),
 				Success:   true,
 				Stderr:    stderr.String(),
 				Checksums: state.Checksums{Xxh128: xxhash, Blake3: blake3},

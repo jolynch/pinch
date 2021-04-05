@@ -14,11 +14,11 @@ type Checksums struct {
 }
 
 type PipelineResult struct {
-	Start     time.Time     `json:"started_at"`
-	Duration  time.Duration `json:"duration"`
-	Success   bool          `json:"success"`
-	Stderr    string        `json:"stderr,omitempty"`
-	Checksums Checksums     `json:"checksums",omitempty`
+	Start     time.Time `json:"started_at"`
+	Duration  string    `json:"duration"`
+	Success   bool      `json:"success"`
+	Stderr    string    `json:"stderr,omitempty"`
+	Checksums Checksums `json:"checksums",omitempty`
 }
 
 type processResult struct {
