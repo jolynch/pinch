@@ -4,3 +4,4 @@ pipetee/pipetee
 s3/
 tests/state
 *.swp
+*.svg

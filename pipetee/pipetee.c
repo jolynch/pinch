@@ -6,39 +6,74 @@
 #include <errno.h>
 #include <limits.h>
 
+void usage (char *argv[]) {
+    fprintf(stderr, "Usage: %s [OPTION] [FILE]...\n", argv[0]);
+    fprintf(stderr, "  -b    Pipe buffer sizes in bytes. Defaults to the size of the input pipe or 131072 for files.\n");
+    exit(EXIT_FAILURE);
+}
+
+long buffer_size(long user_size, long default_size) {
+    if (user_size > 0 && user_size <= 1048576) {
+        return user_size;
+    }
+    return default_size;
+}
+
 int main(int argc, char *argv[]) {
     int len, dlen, slen, nfd, ret;
-    long inpipe_size;
+    long buf_size = 0;
+    long inpipe_size = 0;
+    int opt;
 
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s [FILE]...\n", argv[0]);
+    while ((opt = getopt(argc, argv, "b:")) != -1 ) {
+        switch (opt) {
+        case 'b':
+            buf_size = atoi(optarg);
+            break;
+        default:
+            usage(argv);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    nfd = (argc - optind);
+    if (nfd < 1) {
+        usage(argv);
         exit(EXIT_FAILURE);
     }
-    nfd = argc-1;
     int fds[nfd];
 
     // How large is our input pipe, we will need each buffer pipe
     // to be at least as large.
     inpipe_size = (long)fcntl(STDIN_FILENO, F_GETPIPE_SZ);
-    // We don't have an input pipe, have a file of some kind
     if (inpipe_size < 0) {
-        inpipe_size = 128 * 1024;
-        fprintf(stderr, "[pipetee] file input, buffers of size %ld\n", inpipe_size);
+        buf_size = buffer_size(buf_size, 128 * 1024);
+        fprintf(stderr, "[pipetee] file input, buffers of size %ld, %d outputs\n", buf_size, nfd);
     } else {
-        fprintf(stderr, "[pipetee] pipe input, buffers of size %ld\n", inpipe_size);
+        buf_size = buffer_size(buf_size, inpipe_size);
+        if (buf_size > inpipe_size) {
+            fcntl(STDIN_FILENO, F_SETPIPE_SZ, buf_size);
+            fcntl(STDOUT_FILENO, F_SETPIPE_SZ, buf_size);
+            inpipe_size = (long)fcntl(STDIN_FILENO, F_GETPIPE_SZ);
+            if (inpipe_size > 0) {
+                buf_size = inpipe_size;
+            }
+        }
+        fprintf(stderr, "[pipetee] pipe input, buffers of size %ld, %d outputs\n", buf_size, nfd);
     }
 
     /*
      * The tee syscall can only duplicate to pipes, so we need to have
      * a kernel "buffer" (aka pipe) we control per output file and
-     * one for our output
+     * one for our output. Without this approach we can't know that our
+     * destinatios can receive the full copy in one tee call.
      */
     int buffers[nfd+1][2];
 
     for (int i = 0; i < nfd; i++) {
-        fds[i] = open(argv[i+1], O_WRONLY | O_CREAT, 0644);
+        fds[i] = open(argv[i+optind], O_WRONLY | O_CREAT, 0644);
         if (fds[i] < 0) {
-            fprintf(stderr, "Could not open %s\n", argv[i+1]);
+            fprintf(stderr, "Could not open %s\n", argv[i+optind]);
             perror("open");
             exit(EXIT_FAILURE);
         }
@@ -46,18 +81,22 @@ int main(int argc, char *argv[]) {
             perror("buffer");
             exit(EXIT_FAILURE);
         }
-        ret = fcntl(buffers[i][0], F_SETPIPE_SZ, inpipe_size);
+        // Since we'll be teeing to these we need these to work
+        ret = fcntl(buffers[i][0], F_SETPIPE_SZ, buf_size);
         if (ret < 0) {
             perror("setpipe_sz");
             exit(EXIT_FAILURE);
         }
+        // If we are producing to a pipe (e.g. a >( cmd )) try raising tha
+        // pipe size there too
+        fcntl(fds[i], F_SETPIPE_SZ, buf_size);
     }
     // Last pipe is our input buffer
     if (pipe(buffers[nfd]) < 0) {
         perror("inbuf");
         exit(EXIT_FAILURE);
     } else {
-        ret = fcntl(buffers[nfd][0], F_SETPIPE_SZ, inpipe_size);
+        ret = fcntl(buffers[nfd][0], F_SETPIPE_SZ, buf_size);
         if (ret < 0) {
             perror("setpipe_sz");
             exit(EXIT_FAILURE);
@@ -70,7 +109,7 @@ int main(int argc, char *argv[]) {
          * buffer pipe but don't exceed the size of our downstream buffers
          * (as we need the tee calls below to always succeed in one call)
          */
-        len = splice(STDIN_FILENO, NULL, buffers[nfd][1], NULL, inpipe_size, SPLICE_F_MOVE);
+        len = splice(STDIN_FILENO, NULL, buffers[nfd][1], NULL, buf_size, SPLICE_F_MOVE);
 
         if (len < 0) {
             perror("stdin_splice");
