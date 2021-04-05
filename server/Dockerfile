@@ -26,6 +26,9 @@ RUN chmod +x /usr/local/bin/dumb-init
 ###### RUNTIME CONTAINER   ######
 FROM jolynch/pinch
 
+# Busybox coreutils has a bad implementation of tee and timeout
+RUN apk --no-cache add coreutils
+
 COPY --from=builder /usr/local/bin/dumb-init /usr/bin/dumb-init
 COPY --from=builder /go/src/pinch-server /usr/local/bin/pinch-server
 

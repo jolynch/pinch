@@ -45,16 +45,10 @@ RUN strip pipetee
 # Step 2. Minimal image to only keep the built binaries, this should be about 15MiB
 FROM alpine:3.13.2
 
-RUN apk --no-cache add mandoc bash
-RUN apk --no-cache del openssl
+RUN apk --no-cache add mandoc bash && apk --no-cache del openssl
 
-COPY --from=builder /build_lz4  /
-COPY --from=builder /build_zstd /
-COPY --from=builder /build_xxh  /
-COPY --from=builder /usr/local/bin/b3sum /usr/local/bin/b3sum
-COPY --from=builder /age/age-keygen /usr/local/bin/age-keygen
-COPY --from=builder /age/age /usr/local/bin/age
-COPY --from=builder /pipetee /usr/local/bin/pipetee
+COPY --from=builder /build_lz4  /build_zstd /build_xxh ./
+COPY --from=builder /usr/local/bin/b3sum /age/age-keygen /age/age /pipetee ./usr/local/bin/
 
 # For some reason man pages don't work unless in the global setup
 RUN ln -sf /usr/local/share/man/man1 /usr/share/man/man1

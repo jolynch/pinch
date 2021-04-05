@@ -104,6 +104,7 @@ func cleanupPipeline(name string, start time.Time, expire time.Duration, output 
 		CleanupDigests(output)
 	}
 	MaybeReleaseWriter(name)
+
 }
 
 func CleanupDigests(output string) {

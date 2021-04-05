@@ -22,9 +22,11 @@ int main(int argc, char *argv[]) {
     inpipe_size = (long)fcntl(STDIN_FILENO, F_GETPIPE_SZ);
     // We don't have an input pipe, have a file of some kind
     if (inpipe_size < 0) {
-        inpipe_size = 64 * 1024;
+        inpipe_size = 128 * 1024;
+        fprintf(stderr, "[pipetee] file input, buffers of size %ld\n", inpipe_size);
+    } else {
+        fprintf(stderr, "[pipetee] pipe input, buffers of size %ld\n", inpipe_size);
     }
-    fprintf(stderr, "[pipetee] using buffers of size %ld\n", inpipe_size);
 
     /*
      * The tee syscall can only duplicate to pipes, so we need to have
@@ -54,6 +56,12 @@ int main(int argc, char *argv[]) {
     if (pipe(buffers[nfd]) < 0) {
         perror("inbuf");
         exit(EXIT_FAILURE);
+    } else {
+        ret = fcntl(buffers[nfd][0], F_SETPIPE_SZ, inpipe_size);
+        if (ret < 0) {
+            perror("setpipe_sz");
+            exit(EXIT_FAILURE);
+        }
     }
 
     while (1) {

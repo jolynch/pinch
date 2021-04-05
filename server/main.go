@@ -33,15 +33,15 @@ var (
 )
 
 func compress(
-	name string,
-	input string,
-	output string,
+	fifos utils.FifoPair,
 	timeout time.Duration,
 	minLevel int,
 	maxLevel int,
 	encKey interface{},
 ) {
+	defer fifos.Close()
 	start := time.Now()
+	input, output, name := fifos.InPath, fifos.OutPath, fifos.Handle
 
 	var compressorCmd string
 	var compressor string
@@ -64,7 +64,7 @@ func compress(
 	}
 
 	pipeline := fmt.Sprintf(
-		"pipetee < %s >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) | %s",
+		"$(command -v pipetee || echo 'tee') < %s >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) | %s",
 		input,
 		output+".xxh128",
 		output+".blake3",
@@ -75,24 +75,19 @@ func compress(
 	log.Printf("[%s][pinch]: Produce data to   [%s]", name, input)
 	log.Printf("[%s][pinch]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command("bash", "-o", "pipefail", "-c", pipeline)
+	cmdTerm, cmdKill := utils.KillAfter(timeout)
+	cmd := exec.Command(
+		"time",
+		"timeout", "-k", cmdKill, cmdTerm,
+		"bash", "-o", "pipefail", "-c", pipeline,
+	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	// Since busybox timeout doesn't really work (it doesn't put all children
-	// into a process group), implement it ourself
+	// To help make reaping processes on timeout easier
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	timer := time.AfterFunc(timeout, func() {
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-	})
-	killTimer := time.AfterFunc(timeout+10*time.Second, func() {
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	})
 
 	state.PreparePipeline(name)
 	err := cmd.Run()
-
-	timer.Stop()
-	killTimer.Stop()
 
 	if err != nil {
 		log.Printf("[%s][pinch]: Failed! with error %s", name, err)
@@ -140,20 +135,17 @@ func compress(
 			output,
 		)
 	}
-
-	os.Remove(input)
-	os.Remove(output)
 	log.Printf("[%s][pinch]: Done", name)
 }
 
 func decompress(
-	name string,
-	input string,
-	output string,
+	fifos utils.FifoPair,
 	timeout time.Duration,
 	encKey interface{},
 ) {
+	defer fifos.Close()
 	start := time.Now()
+	input, output, name := fifos.InPath, fifos.OutPath, fifos.Handle
 	var decompressor string
 
 	if encKey == nil {
@@ -166,7 +158,7 @@ func decompress(
 	}
 
 	pipeline := fmt.Sprintf(
-		"%s | pipetee >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) > %s",
+		"%s | $(command -v pipetee || echo 'tee') >(xxh128sum - > %s) >(b3sum --num-threads 1 - > %s) > %s",
 		decompressor,
 		output+".xxh128",
 		output+".blake3",
@@ -177,25 +169,19 @@ func decompress(
 	log.Printf("[%s][unpinch]: Produce data to   [%s]", name, input)
 	log.Printf("[%s][unpinch]: Consume data from [%s]", name, output)
 
-	cmd := exec.Command("bash", "-o", "pipefail", "-c", pipeline)
+	cmdTerm, cmdKill := utils.KillAfter(timeout)
+	cmd := exec.Command(
+		"time",
+		"timeout", "-k", cmdKill, cmdTerm,
+		"bash", "-o", "pipefail", "-c", pipeline,
+	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-
-	// Since busybox timeout doesn't really work (it doesn't put all children
-	// into a process group), implement it ourself
+	// To help make reaping processes on timeout easier
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	timer := time.AfterFunc(timeout, func() {
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-	})
-	killTimer := time.AfterFunc(timeout+10*time.Second, func() {
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	})
 
 	state.PreparePipeline(name)
 	err := cmd.Run()
-
-	timer.Stop()
-	killTimer.Stop()
 
 	if err != nil {
 		log.Printf("[%s][unpinch]: Failed! with error %s", name, err)
@@ -242,8 +228,6 @@ func decompress(
 		)
 	}
 
-	os.Remove(input)
-	os.Remove(output)
 	log.Printf("[%s][unpinch]: Done", name)
 }
 
@@ -356,8 +340,11 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		// Make the pipes first so that when this function returns
 		// the input stages and output stages are ready to start
 		// consuming (even if we haven't wired them up yet)
-		utils.MakeFifo(path.Join(inputDir, handle), bufSizeBytes)
-		utils.MakeFifo(path.Join(outputDir, handle), bufSizeBytes)
+		fifos := utils.MakeFifoPair(inputDir, outputDir, handle, bufSizeBytes)
+		if fifos.In == nil || fifos.Out == nil {
+			http.Error(w, "Could not create pipes", http.StatusInternalServerError)
+			return
+		}
 
 		response.Handles[handle] = io{
 			Http:    "http://" + listen + "/io/" + handle,
@@ -366,9 +353,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		}
 
 		go compress(
-			handle,
-			path.Join(inputDir, handle),
-			path.Join(outputDir, handle),
+			fifos,
 			timeout,
 			minLevel,
 			maxLevel,
@@ -436,8 +421,11 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 		// Make the pipes first so that when this function returns
 		// the input stages and output stages are ready to start
 		// consuming (even if we haven't wired them up yet)
-		utils.MakeFifo(path.Join(inputDir, handle), bufSizeBytes)
-		utils.MakeFifo(path.Join(outputDir, handle), bufSizeBytes)
+		fifos := utils.MakeFifoPair(inputDir, outputDir, handle, bufSizeBytes)
+		if fifos.In == nil || fifos.Out == nil {
+			http.Error(w, "Could not create pipes", http.StatusInternalServerError)
+			return
+		}
 
 		response.Handles[handle] = io{
 			Http:    "http://" + listen + "/io/" + handle,
@@ -446,9 +434,7 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 		}
 
 		go decompress(
-			handle,
-			path.Join(inputDir, handle),
-			path.Join(outputDir, handle),
+			fifos,
 			timeout,
 			encKey,
 		)
@@ -530,7 +516,7 @@ func writeChunk(name string, w http.ResponseWriter, req *http.Request) {
 		readFinished <- true
 	}
 
-	log.Printf("[%s][write]: Copying to pipe", name)
+	log.Printf("[%s][write]: Copying to pipe [%s]", name, path.Join(inputDir, name))
 	buf := make([]byte, bufSizeBytes)
 	bytesWritten, err := io.CopyBuffer(fd, req.Body, buf)
 	if err != nil {
