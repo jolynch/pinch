@@ -27,8 +27,12 @@ type processResult struct {
 	done     bool
 }
 
-type write struct {
-	fd *os.File
+// Input processes close writers on error, we want an explicit
+// signal via a _second_ file that the write is done so we know
+// the producer is really done
+type Writer struct {
+	Fd      *os.File
+	Control *os.File
 }
 
 var (
@@ -104,7 +108,6 @@ func cleanupPipeline(name string, start time.Time, expire time.Duration, output 
 		CleanupDigests(output)
 	}
 	MaybeReleaseWriter(name)
-
 }
 
 func CleanupDigests(output string) {
@@ -112,24 +115,33 @@ func CleanupDigests(output string) {
 	os.Remove(output + ".blake3")
 }
 
-func AcquireWriter(writeDir string, name string) *os.File {
+func AcquireWriter(writeDir string, name string) Writer {
 	value, ok := writers.Load(name)
 	if !ok {
 		fd, err := os.OpenFile(path.Join(writeDir, name), os.O_WRONLY, 0666)
 		if err != nil {
-			return nil
+			log.Printf("[%s][state]: could not open writer: %s", name, err)
+			return Writer{Fd: nil, Control: nil}
 		}
-		value, ok = writers.LoadOrStore(name, write{
-			fd: fd,
+		// If we open this WRONLY it will block, also it's used to write to
+		// in order to indicate the transfer is done
+		controlFd, err := os.OpenFile(path.Join(writeDir, name+".ctrl"), os.O_RDWR, 0666)
+		if err != nil {
+			fd.Close()
+			log.Printf("[%s][state]: could not open control: %s", name, err)
+			return Writer{Fd: nil, Control: nil}
+		}
+
+		value, ok = writers.LoadOrStore(name, Writer{
+			Fd: fd, Control: controlFd,
 		})
 		// Race, someone else made a FD
-		// TODO: I'm pretty sure closing the write side is bad ... should
-		// probably just use a locked map instead of a sync map
 		if ok {
 			fd.Close()
+			controlFd.Close()
 		}
 	}
-	return value.(write).fd
+	return value.(Writer)
 }
 
 func MaybeReleaseWriter(name string) {
@@ -137,6 +149,7 @@ func MaybeReleaseWriter(name string) {
 	if hasWriter {
 		log.Printf("[%s][cleanup]: Cleaning up open writer", name)
 		writers.Delete(name)
-		value.(write).fd.Close()
+		value.(Writer).Fd.Close()
+		value.(Writer).Control.Close()
 	}
 }

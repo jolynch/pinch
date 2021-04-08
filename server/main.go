@@ -295,9 +295,10 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		PublicKey string `json:"public-key,omitempty"`
 	}
 	type io struct {
-		Http    string `json:"io-http"`
-		InPipe  string `json:"in-pipe"`
-		OutPipe string `json:"out-pipe"`
+		Http        string `json:"io-http"`
+		InPipe      string `json:"in-pipe"`
+		ControlPipe string `json:"ctrl-pipe"`
+		OutPipe     string `json:"out-pipe"`
 	}
 	type resp struct {
 		Handles           map[string]io `json:"handles"`
@@ -341,15 +342,18 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		// the input stages and output stages are ready to start
 		// consuming (even if we haven't wired them up yet)
 		fifos := utils.MakeFifoPair(inputDir, outputDir, handle, bufSizeBytes)
-		if fifos.In == nil || fifos.Out == nil {
-			http.Error(w, "Could not create pipes", http.StatusInternalServerError)
+		if fifos.In == nil || fifos.Out == nil || fifos.Control == nil {
+			fifos.Close()
+			http.Error(w, fmt.Sprintf("Could not create pipes %s", fifos), http.StatusInternalServerError)
 			return
 		}
+		go monitorControl(fifos)
 
 		response.Handles[handle] = io{
-			Http:    "http://" + listen + "/io/" + handle,
-			InPipe:  path.Join(inputDir, handle),
-			OutPipe: path.Join(outputDir, handle),
+			Http:        "http://" + listen + "/io/" + handle,
+			InPipe:      fifos.InPath,
+			ControlPipe: fifos.ControlPath,
+			OutPipe:     fifos.OutPath,
 		}
 
 		go compress(
@@ -399,9 +403,10 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 	}
 
 	type io struct {
-		Http    string `json:"io-http"`
-		InPipe  string `json:"in-pipe"`
-		OutPipe string `json:"out-pipe"`
+		Http        string `json:"io-http"`
+		InPipe      string `json:"in-pipe"`
+		ControlPipe string `json:"ctrl-pipe"`
+		OutPipe     string `json:"out-pipe"`
 	}
 
 	type resp struct {
@@ -422,15 +427,18 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 		// the input stages and output stages are ready to start
 		// consuming (even if we haven't wired them up yet)
 		fifos := utils.MakeFifoPair(inputDir, outputDir, handle, bufSizeBytes)
-		if fifos.In == nil || fifos.Out == nil {
+		if fifos.In == nil || fifos.Out == nil || fifos.Control == nil {
+			fifos.Close()
 			http.Error(w, "Could not create pipes", http.StatusInternalServerError)
 			return
 		}
+		go monitorControl(fifos)
 
 		response.Handles[handle] = io{
-			Http:    "http://" + listen + "/io/" + handle,
-			InPipe:  path.Join(inputDir, handle),
-			OutPipe: path.Join(outputDir, handle),
+			Http:        "http://" + listen + "/io/" + handle,
+			InPipe:      fifos.InPath,
+			ControlPipe: fifos.ControlPath,
+			OutPipe:     fifos.OutPath,
 		}
 
 		go decompress(
@@ -497,8 +505,9 @@ func handleIO(w http.ResponseWriter, req *http.Request) {
 }
 
 func writeChunk(name string, w http.ResponseWriter, req *http.Request) {
-	var fd *os.File = state.AcquireWriter(inputDir, name)
-	if fd == nil {
+	writer := state.AcquireWriter(inputDir, name)
+	fd, controlFd := writer.Fd, writer.Control
+	if fd == nil || controlFd == nil {
 		http.Error(w, "No such handle: "+name, http.StatusNotFound)
 		return
 	}
@@ -532,7 +541,10 @@ func writeChunk(name string, w http.ResponseWriter, req *http.Request) {
 
 	if !partial {
 		log.Printf("[%s][write]: Closing due to lack of partial flag", name)
-		state.MaybeReleaseWriter(name)
+		_, err := controlFd.Write([]byte(`c`))
+		if err != nil {
+			log.Printf("[%s][write]: Failed to close!: %s", name, err)
+		}
 	}
 
 	<-readFinished
@@ -586,6 +598,26 @@ func readChunk(name string, w http.ResponseWriter, req *http.Request) {
 	readFinished := make(chan bool)
 	doReadChunk(w, name, readFinished)
 	<-readFinished
+}
+
+func monitorControl(fifo utils.FifoPair) {
+	// Wait for anything to be written to the "done" pipe, note that we
+	// want to use the fifo Control pipe so that we can man
+	data := make([]byte, 0, 1)
+	data = []byte{'0'}
+
+	// The writer to this pipe get's closed during timeout so we should
+	// always finish this read
+	n, err := fifo.Control.Read(data)
+	if err != nil {
+		log.Printf("[%s][done] error while reading from control, %s", fifo.Handle, err)
+	} else if n == 0 {
+		log.Printf("[%s][done] EOF reading from control, %s", fifo.Handle)
+	} else {
+		// TODO we should probably care what byte was written
+		log.Printf("[%s][done] Read indicating pipeline done", fifo.Handle)
+		state.MaybeReleaseWriter(fifo.Handle)
+	}
 }
 
 func token(length int) string {
