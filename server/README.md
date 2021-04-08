@@ -20,6 +20,8 @@ curl "localhost:8080/status/${FD} | jq ."
 There is also a pure file API available on the local server via control
 pipes:
 ```
+# Step 1: Setup the pipeline you want
+
 $ PIPELINE=$(curl -s 'localhost:8080/pinch?min-level=1&timeout=2m')
 $ echo $PIPELINE | jq .
 {
@@ -43,11 +45,11 @@ $ echo $PIPELINE | jq .
 }
 
 $ FD=$(echo $PIPELINE | jq '.handles | keys[0]' -r)
-# For writing data
+
+# For writing data into the pipeline
 $ IN=$(echo $PIPELINE | jq --arg FD "$FD" '.handles | values[$FD]["in-pipe"]' -r)
-# For indicating the write finished and was successful
-$ CTRL=$(echo $PIPELINE | jq --arg FD "$FD" '.handles | values[$FD]["ctrl-pipe"]' -r)
-# For reading data
+
+# For reading out of the pipeline
 $ OUT=$(echo $PIPELINE | jq --arg FD "$FD" '.handles | values[$FD]["out-pipe"]' -r)
 
 # Now write some data to the pipe and read it back
@@ -59,10 +61,11 @@ Or for easy copy-paste
 PIPELINE=$(curl -s 'localhost:8080/pinch?min-level=1&timeout=2m')
 FD=$(echo $PIPELINE | jq '.handles | keys[0]' -r)
 IN=$(echo $PIPELINE | jq --arg FD "$FD" '.handles | values[$FD]["in-pipe"]' -r)
-CTRL=$(echo $PIPELINE | jq --arg FD "$FD" '.handles | values[$FD]["ctrl-pipe"]' -r)
 OUT=$(echo $PIPELINE | jq --arg FD "$FD" '.handles | values[$FD]["out-pipe"]' -r)
 
-time dd if=/dev/zero bs=16K count=16384 > $IN && echo "c" > $CTRL & cat $OUT | wc -c
+time dd if=/dev/zero bs=16K count=16384 > $IN && curl -XPUT localhost:8080/io/${FD} & cat $OUT | wc -c
+
+curl localhost:8080/status/${FD} | jq .
 ```
 
 Compression and Encryption

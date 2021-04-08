@@ -51,29 +51,19 @@ func makeFifoAndSetSize(filePath string, flag int, bufSize int) *os.File {
 
 func MakeFifoPair(inDir, outDir, handle string, bufSize int) FifoPair {
 	var (
-		in        *os.File
-		inControl *os.File
-		out       *os.File
+		in  *os.File
+		out *os.File
 	)
-
 	in = makeFifoAndSetSize(path.Join(inDir, handle), os.O_RDONLY|syscall.O_NONBLOCK, bufSize)
-	// Just create the done pipe so we can open it for read/write
-	ctrlPath := path.Join(inDir, handle+".ctrl")
-	makeFifo(ctrlPath)
 
 	// Acquire a writer to the input side so we can control when it closes
 	w := state.AcquireWriter(inDir, handle)
-	if w.Fd == nil || w.Control == nil {
+	if w.Fd == nil {
 		if in != nil {
 			in.Close()
 		}
 		log.Printf("[%s][fifo]: Could not open writers %s", handle, w)
-		return FifoPair{Handle: handle, In: nil, Out: nil, Control: nil}
-	} else {
-		// Now that the writer side is open we can size down the buffer for
-		// the control pipe
-		trySetFifoSize(ctrlPath, w.Control, 32)
-		inControl = w.Control
+		return FifoPair{Handle: handle, In: nil, Out: nil}
 	}
 
 	out = makeFifoAndSetSize(path.Join(outDir, handle), os.O_RDONLY|syscall.O_NONBLOCK, bufSize)
@@ -84,8 +74,6 @@ func MakeFifoPair(inDir, outDir, handle string, bufSize int) FifoPair {
 		InPath:        path.Join(inDir, handle),
 		Out:           out,
 		OutPath:       path.Join(outDir, handle),
-		Control:       inControl,
-		ControlPath:   ctrlPath,
 		BuffSizeBytes: bufSize,
 	}
 }
@@ -96,8 +84,6 @@ type FifoPair struct {
 	InPath        string
 	Out           *os.File
 	OutPath       string
-	Control       *os.File
-	ControlPath   string
 	BuffSizeBytes int
 }
 
@@ -112,9 +98,5 @@ func (fp FifoPair) Close() {
 	if fp.Out != nil {
 		os.Remove(fp.OutPath)
 		fp.Out.Close()
-	}
-	if fp.Control != nil {
-		os.Remove(fp.ControlPath)
-		fp.Control.Close()
 	}
 }

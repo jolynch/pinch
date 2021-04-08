@@ -27,12 +27,10 @@ type processResult struct {
 	done     bool
 }
 
-// Input processes close writers on error, we want an explicit
-// signal via a _second_ file that the write is done so we know
-// the producer is really done
+// Input processes close writers on error or success so we want to hold
+// a write so users can signal via a HTTP call that they are done and succeeded
 type Writer struct {
-	Fd      *os.File
-	Control *os.File
+	Fd *os.File
 }
 
 var (
@@ -121,24 +119,13 @@ func AcquireWriter(writeDir string, name string) Writer {
 		fd, err := os.OpenFile(path.Join(writeDir, name), os.O_WRONLY, 0666)
 		if err != nil {
 			log.Printf("[%s][state]: could not open writer: %s", name, err)
-			return Writer{Fd: nil, Control: nil}
-		}
-		// If we open this WRONLY it will block, also it's used to write to
-		// in order to indicate the transfer is done
-		controlFd, err := os.OpenFile(path.Join(writeDir, name+".ctrl"), os.O_RDWR, 0666)
-		if err != nil {
-			fd.Close()
-			log.Printf("[%s][state]: could not open control: %s", name, err)
-			return Writer{Fd: nil, Control: nil}
+			return Writer{Fd: nil}
 		}
 
-		value, ok = writers.LoadOrStore(name, Writer{
-			Fd: fd, Control: controlFd,
-		})
+		value, ok = writers.LoadOrStore(name, Writer{Fd: fd})
 		// Race, someone else made a FD
 		if ok {
 			fd.Close()
-			controlFd.Close()
 		}
 	}
 	return value.(Writer)
@@ -150,6 +137,5 @@ func MaybeReleaseWriter(name string) {
 		log.Printf("[%s][cleanup]: Cleaning up open writer", name)
 		writers.Delete(name)
 		value.(Writer).Fd.Close()
-		value.(Writer).Control.Close()
 	}
 }
