@@ -11,8 +11,8 @@ other tools.
 
 * [zstd](https://github.com/facebook/zstd) v1.4.9 for great compression
 * [lz4](https://github.com/lz4/lz4) v1.9.3 for very fast compression
-* [xxHash](https://github.com/facebook/zstd) v0.8.0 for ridculously fast hashing
-* [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) v0.3.7 for ridculously fast cryptographic hashing
+* [xxHash](https://github.com/facebook/zstd) v0.8.0 for ridiculously fast hashing
+* [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) v0.3.7 for ridiculously fast cryptographic hashing
 * [age](https://github.com/FiloSottile/age) v0.3.7 for reasonably fast encryption/decryption
 
 Note that licenses of these tools are included in the
