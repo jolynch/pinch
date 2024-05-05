@@ -6,7 +6,7 @@ DEBUG="${DEBUG:-no}"
 PORT="${PORT:-2355}"
 DIEAFTER="${DIEAFTER:-0s}"
 ONESHOT="${ONESHOT:-false}"
-PIPEDIR="${PIPEDIR:-/run/pinch}"
+PIPEDIR="${PIPEDIR:-/var/lib/pinch}"
 DETACH="${DETACH:-true}"
 
 if [[ "$(docker images -q jolynch/pinch-server:latest 2> /dev/null)" == "" ]]; then
@@ -14,21 +14,21 @@ if [[ "$(docker images -q jolynch/pinch-server:latest 2> /dev/null)" == "" ]]; t
     docker pull jolynch/pinch-server
 fi
 
-if [ ! -d "/run/pinch" ]; then
-    echo "Creating /run/pinch"
-    sudo mkdir "/run/pinch"
-    echo "Chowning /run/pinch to $(whoami)"
-    sudo chown -R $MUID /run/pinch
+if [ ! -d "/var/lib/pinch" ]; then
+    echo "Creating /var/lib/pinch"
+    sudo mkdir "/var/lib/pinch"
+    echo "Chowning /var/lib/pinch to $(whoami)"
+    sudo chown -R $MUID /var/lib/pinch
 fi
 
-mkdir -p "/run/pinch/in"
-mkdir -p "/run/pinch/keys"
-mkdir -p "/run/pinch/out"
+mkdir -p "/var/lib/pinch/in"
+mkdir -p "/var/lib/pinch/keys"
+mkdir -p "/var/lib/pinch/out"
 
 if [[ "${DETACH}" == "true" ]]; then
-    DOCKER_RUN="docker run --rm -d -v /run/pinch/:/run/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
+    DOCKER_RUN="docker run --rm -d -v /var/lib/pinch/:/var/lib/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
 else
-    DOCKER_RUN="docker run --rm -v /run/pinch/:/run/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
+    DOCKER_RUN="docker run --rm -v /var/lib/pinch/:/var/lib/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
 fi
 
 

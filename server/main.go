@@ -19,17 +19,20 @@ import (
 	"syscall"
 	"time"
 
+	"filippo.io/age"
+
 	"github.com/jolynch/pinch/state"
 	"github.com/jolynch/pinch/utils"
 )
 
 var (
 	listen       = "127.0.0.1:8080"
-	inputDir     = "/run/pinch/in"
-	outputDir    = "/run/pinch/out"
-	keysDir      = "/run/pinch/keys"
+	inputDir     = "/var/lib/pinch/in"
+	outputDir    = "/var/lib/pinch/out"
+	keysDir      = "/var/lib/pinch/keys"
 	tokenLength  = 8
 	bufSizeBytes = 128 * 1024 // Usually pipes are 64KiB, we bump it slightly
+	serverKey*    age.X25519Identity
 )
 
 func compress(
@@ -271,8 +274,12 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	}
 
 	k, ok := req.URL.Query()["age-public-key"]
-	if ok && len(k[0]) >= 0 {
-		encKey = k[0]
+	if ok {
+		if len(k[0]) > 0 {
+			encKey = k[0]
+		} else {
+			encKey = serverKey.Recipient().String()
+		}
 	}
 
 	n, ok := req.URL.Query()["num-handles"]
@@ -603,15 +610,55 @@ func die(duration time.Duration) {
 	syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
 }
 
+func makeDirs(path string) bool {
+	err := os.MkdirAll(path, 0777)
+	if err != nil {
+		log.Println(err)
+		return false
+	}
+	return true
+}
+
 func main() {
 	flag.StringVar(&listen, "listen", listen, "The address to listen on")
 	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
 	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
+	flag.StringVar(&keysDir, "keys", keysDir, "The directory to create output pipes in")
 	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
 	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should buffers be")
 	dieAfter := flag.Duration("die-after", time.Duration(0), "Die after this duration. Zero seconds indicates live forever")
 
 	flag.Parse()
+
+	if !makeDirs(inputDir) {
+		log.Fatalf("Could not setup input directory, dying")
+	}
+	if !makeDirs(outputDir) {
+		log.Fatalf("Could not setup output direcotry, dying")
+	}
+	if !makeDirs(keysDir) {
+		log.Fatalf("Could not setup key directory, dying")
+	}
+	var err error
+	serverKey, err = age.GenerateX25519Identity()
+	if err != nil {
+		log.Fatalf("AGE could not generate private and public keys for this node")
+	} else {
+		keyPath := path.Join(keysDir, "key");
+		out, err := os.OpenFile(keyPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+
+		if err != nil {
+			log.Fatal("Error while opening key file: %s", err)
+		}
+		fmt.Fprintf(out, "# created: %s\n", time.Now().Format(time.RFC3339))
+		fmt.Fprintf(out, "# public key: %s\n", serverKey.Recipient())
+		fmt.Fprintf(out, "%s\n", serverKey)
+		log.Printf("Public key %s", serverKey.Recipient().String())
+		defer out.Close()
+
+		
+		log.Printf("AGE key file generated and saved to %s", keyPath)
+	}
 
 	log.Printf("Scanning input directory [%s] to clean up.", inputDir)
 	dir, _ := ioutil.ReadDir(inputDir)
@@ -637,5 +684,10 @@ func main() {
 	}
 
 	log.Printf("Listening at %s/pinch", listen)
-	http.ListenAndServe(listen, nil)
+	err = http.ListenAndServe(listen, nil)
+	if err != nil {
+		log.Fatalf("Failed to bind, is another server listening at this address?");
+	} else {
+		log.Printf("Success!");
+	}
 }

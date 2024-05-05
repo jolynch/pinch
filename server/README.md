@@ -19,7 +19,8 @@ curl "localhost:8080/status/${FD} | jq ."
 
 There is also a pure file API available on the local server via control
 pipes:
-```
+
+```bash
 # Step 1: Setup the pipeline you want
 
 $ PIPELINE=$(curl -s 'localhost:8080/pinch?min-level=1&timeout=2m')
@@ -28,8 +29,8 @@ $ echo $PIPELINE | jq .
   "handles": {
     "d11bece37bef8d8b": {
       "io-http": "http://127.0.0.1:8080/io/d11bece37bef8d8b",
-      "in-pipe": "/run/pinch/in/d11bece37bef8d8b",
-      "out-pipe": "/run/pinch/out/d11bece37bef8d8b"
+      "in-pipe": "/var/lib/pinch/in/d11bece37bef8d8b",
+      "out-pipe": "/var/lib/pinch/out/d11bece37bef8d8b"
     }
   },
   "compression": {
@@ -79,8 +80,8 @@ $ curl -s 'localhost:8080/pinch?timeout=100s&age-public-key=age1630vztsaydze8r9q
   "handles": {
     "14ccbb285f4d5822": {
       "io-http": "http://127.0.0.1:8080/io/14ccbb285f4d5822",
-      "in-pipe": "/run/pinch/in/14ccbb285f4d5822",
-      "out-pipe": "/run/pinch/out/14ccbb285f4d5822"
+      "in-pipe": "/var/lib/pinch/in/14ccbb285f4d5822",
+      "out-pipe": "/var/lib/pinch/out/14ccbb285f4d5822"
     }
   },
   "compression": {
@@ -100,15 +101,15 @@ $ curl -s 'localhost:8080/pinch?timeout=100s&age-public-key=age1630vztsaydze8r9q
 $ curl -sT yelp_academic_dataset_business.json 'localhost:8080/io/14ccbb285f4d5822' > business.zst.age
 
 # And now let's decompress and decrypt it using the private key stored in
-# /run/pinch/keys/private
+# /var/lib/pinch/keys/private
 
 $ curl -s 'localhost:8080/unpinch?age-key-path=private&timeout=200s' | jq .
 {
   "handles": {
     "0d2eeb7e0819c098": {
       "io-http": "http://127.0.0.1:8080/io/0d2eeb7e0819c098",
-      "in-pipe": "/run/pinch/in/0d2eeb7e0819c098",
-      "out-pipe": "/run/pinch/out/0d2eeb7e0819c098"
+      "in-pipe": "/var/lib/pinch/in/0d2eeb7e0819c098",
+      "out-pipe": "/var/lib/pinch/out/0d2eeb7e0819c098"
     }
   },
   "ttl": 200
@@ -119,8 +120,8 @@ $ curl -s 'localhost:8080/unpinch?age-key-path=private&timeout=200' | jq .
   "handles": {
     "1805b02fce8ecca1": {
       "io-http": "http://127.0.0.1:8080/io/1805b02fce8ecca1",
-      "in-pipe": "/run/pinch/in/1805b02fce8ecca1",
-      "out-pipe": "/run/pinch/out/1805b02fce8ecca1"
+      "in-pipe": "/var/lib/pinch/in/1805b02fce8ecca1",
+      "out-pipe": "/var/lib/pinch/out/1805b02fce8ecca1"
     }
   },
   "ttl": 200
