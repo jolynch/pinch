@@ -18,7 +18,7 @@ type PipelineResult struct {
 	Duration  string    `json:"duration"`
 	Success   bool      `json:"success"`
 	Stderr    string    `json:"stderr,omitempty"`
-	Checksums Checksums `json:"checksums",omitempty`
+	Checksums Checksums `json:"checksums,omitempty"`
 }
 
 type processResult struct {
@@ -99,7 +99,7 @@ func cleanupPipeline(name string, start time.Time, expire time.Duration, output 
 			processes.Delete(name)
 			CleanupDigests(output)
 		} else {
-			log.Printf("[%s][cleanup]: Detected handle re-use")
+			log.Printf("[%s][cleanup]: Detected handle re-use", name)
 		}
 	} else {
 		log.Printf("[%s][cleanup]: No process state found ...", name)

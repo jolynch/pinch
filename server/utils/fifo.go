@@ -62,7 +62,7 @@ func MakeFifoPair(inDir, outDir, handle string, bufSize int) FifoPair {
 		if in != nil {
 			in.Close()
 		}
-		log.Printf("[%s][fifo]: Could not open writers %s", handle, w)
+		log.Printf("[%s][fifo]: Could not open writer: %+v", handle, w)
 		return FifoPair{Handle: handle, In: nil, Out: nil}
 	}
 

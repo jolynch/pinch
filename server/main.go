@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -32,7 +31,7 @@ var (
 	keysDir      = "/var/lib/pinch/keys"
 	tokenLength  = 8
 	bufSizeBytes = 128 * 1024 // Usually pipes are 64KiB, we bump it slightly
-	serverKey*    age.X25519Identity
+	serverKey    *age.X25519Identity
 )
 
 func compress(
@@ -245,7 +244,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	)
 
 	m, ok := req.URL.Query()["max-level"]
-	if ok && len(m[0]) >= 0 {
+	if ok && len(m) > 0 && len(m[0]) > 0 {
 		maxLevel, err = strconv.Atoi(m[0])
 		// Zstd needs a lot more memory above 19
 		if err != nil || maxLevel > 19 {
@@ -255,7 +254,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	}
 
 	m, ok = req.URL.Query()["min-level"]
-	if ok && len(m[0]) >= 0 {
+	if ok && len(m) > 0 && len(m[0]) > 0 {
 		minLevel, err = strconv.Atoi(m[0])
 		// Zstd adapt doesn't accept negative levels as min-level
 		if err != nil || minLevel < 0 {
@@ -265,7 +264,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	}
 
 	t, ok := req.URL.Query()["timeout"]
-	if ok && len(t[0]) >= 0 {
+	if ok && len(t) > 0 && len(t[0]) > 0 {
 		timeout, err = time.ParseDuration(t[0])
 		if err != nil || timeout < time.Second {
 			http.Error(w, "Invalid timeout, try something larger than 1s like 60s or 1m", http.StatusBadRequest)
@@ -283,10 +282,11 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 	}
 
 	n, ok := req.URL.Query()["num-handles"]
-	if ok && len(n[0]) >= 0 {
+	if ok && len(n) > 0 && len(n[0]) > 0 {
 		numPaths, err = strconv.Atoi(n[0])
 		if err != nil {
 			http.Error(w, "Invalid num-handles", http.StatusBadRequest)
+			return
 		}
 	}
 
@@ -350,7 +350,7 @@ func pinch(w http.ResponseWriter, req *http.Request) {
 		fifos := utils.MakeFifoPair(inputDir, outputDir, handle, bufSizeBytes)
 		if fifos.In == nil || fifos.Out == nil {
 			fifos.Close()
-			http.Error(w, fmt.Sprintf("Could not create pipes %s", fifos), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("Could not create pipes %+v", fifos), http.StatusInternalServerError)
 			return
 		}
 
@@ -385,7 +385,7 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 	)
 
 	t, ok := req.URL.Query()["timeout"]
-	if ok && len(t[0]) >= 0 {
+	if ok && len(t) > 0 && len(t[0]) > 0 {
 		timeout, err = time.ParseDuration(t[0])
 		if err != nil || timeout < time.Second {
 			http.Error(w, "Invalid timeout, try something larger than 1s like 60s or 1m", http.StatusBadRequest)
@@ -394,15 +394,16 @@ func unpinch(w http.ResponseWriter, req *http.Request) {
 	}
 
 	n, ok := req.URL.Query()["num-handles"]
-	if ok && len(n[0]) >= 0 {
+	if ok && len(n) > 0 && len(n[0]) > 0 {
 		numPaths, err = strconv.Atoi(n[0])
 		if err != nil {
 			http.Error(w, "Invalid num-handles", http.StatusBadRequest)
+			return
 		}
 	}
 
 	k, ok := req.URL.Query()["age-key-path"]
-	if ok && len(k[0]) >= 0 {
+	if ok && len(k) > 0 && len(k[0]) > 0 {
 		encKey = k[0]
 	}
 
@@ -470,7 +471,7 @@ func getStatus(w http.ResponseWriter, req *http.Request) {
 	}
 
 	wf, ok := req.URL.Query()["wait-for"]
-	if ok && len(wf[0]) >= 0 {
+	if ok && len(wf) > 0 && len(wf[0]) > 0 {
 		waitFor, err = time.ParseDuration(wf[0])
 		if err != nil {
 			http.Error(w, "Invalid wait-for", http.StatusBadRequest)
@@ -483,7 +484,9 @@ func getStatus(w http.ResponseWriter, req *http.Request) {
 	log.Printf("[%s][status] Waited for %s", name, time.Since(start))
 	if ok {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(value)
+		if err := json.NewEncoder(w).Encode(value); err != nil {
+			log.Printf("[%s][status] failed to encode response: %v", name, err)
+		}
 	} else {
 		http.Error(w, "Could not find handle: "+name, http.StatusNotFound)
 	}
@@ -599,7 +602,10 @@ func readChunk(name string, w http.ResponseWriter, req *http.Request) {
 
 func token(length int) string {
 	b := make([]byte, length)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		log.Printf("Failed to generate random token bytes: %v", err)
+		return ""
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -611,12 +617,27 @@ func die(duration time.Duration) {
 }
 
 func makeDirs(path string) bool {
-	err := os.MkdirAll(path, 0777)
+	err := os.MkdirAll(path, 0o777)
 	if err != nil {
 		log.Println(err)
 		return false
 	}
 	return true
+}
+
+func cleanupDir(dirPath string) error {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return err
+	}
+	for _, d := range entries {
+		entryPath := path.Join(dirPath, d.Name())
+		log.Printf("[cleanup] Cleaning up %s", entryPath)
+		if err := os.RemoveAll(entryPath); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -626,7 +647,7 @@ func main() {
 	flag.StringVar(&keysDir, "keys", keysDir, "The directory to create output pipes in")
 	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
 	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should buffers be")
-	dieAfter := flag.Duration("die-after", time.Duration(0), "Die after this duration. Zero seconds indicates live forever")
+	dieAfter := flag.Duration("die-after", 0, "Die after this duration. Zero seconds indicates live forever")
 
 	flag.Parse()
 
@@ -644,50 +665,51 @@ func main() {
 	if err != nil {
 		log.Fatalf("AGE could not generate private and public keys for this node")
 	} else {
-		keyPath := path.Join(keysDir, "key");
-		out, err := os.OpenFile(keyPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+		keyPath := path.Join(keysDir, "key")
+		out, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 
 		if err != nil {
-			log.Fatal("Error while opening key file: %s", err)
+			log.Fatalf("Error while opening key file: %v", err)
 		}
 		fmt.Fprintf(out, "# created: %s\n", time.Now().Format(time.RFC3339))
 		fmt.Fprintf(out, "# public key: %s\n", serverKey.Recipient())
 		fmt.Fprintf(out, "%s\n", serverKey)
 		log.Printf("Public key %s", serverKey.Recipient().String())
 		defer out.Close()
-
-		
 		log.Printf("AGE key file generated and saved to %s", keyPath)
 	}
 
 	log.Printf("Scanning input directory [%s] to clean up.", inputDir)
-	dir, _ := ioutil.ReadDir(inputDir)
-	for _, d := range dir {
-		log.Printf("[cleanup] Cleaning up %s", path.Join(inputDir, d.Name()))
-		os.RemoveAll(path.Join(inputDir, d.Name()))
+	if err := cleanupDir(inputDir); err != nil {
+		log.Fatalf("failed cleaning input directory %s: %v", inputDir, err)
 	}
 	log.Printf("Scanning output directory [%s] to clean up", outputDir)
-	dir, _ = ioutil.ReadDir(outputDir)
-	for _, d := range dir {
-		log.Printf("[cleanup] Cleaning up %s", path.Join(outputDir, d.Name()))
-		os.RemoveAll(path.Join(outputDir, d.Name()))
+	if err := cleanupDir(outputDir); err != nil {
+		log.Fatalf("failed cleaning output directory %s: %v", outputDir, err)
 	}
 
 	// Pinch API
-	http.HandleFunc("/pinch", pinch)
-	http.HandleFunc("/unpinch", unpinch)
-	http.HandleFunc("/io/", handleIO)
-	http.HandleFunc("/status/", getStatus)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/pinch", pinch)
+	mux.HandleFunc("/unpinch", unpinch)
+	mux.HandleFunc("/io/", handleIO)
+	mux.HandleFunc("/status/", getStatus)
 
 	if *dieAfter > 0 {
 		go die(*dieAfter)
 	}
 
 	log.Printf("Listening at %s/pinch", listen)
-	err = http.ListenAndServe(listen, nil)
+	server := &http.Server{
+		Addr:              listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	err = server.ListenAndServe()
 	if err != nil {
-		log.Fatalf("Failed to bind, is another server listening at this address?");
+		log.Fatalf("Failed to bind, is another server listening at this address? error=%v", err)
 	} else {
-		log.Printf("Success!");
+		log.Printf("Success!")
 	}
 }
