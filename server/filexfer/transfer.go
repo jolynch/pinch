@@ -6,13 +6,15 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
+	"syscall"
 
 	"github.com/jolynch/pinch/utils"
+	"github.com/zeebo/xxh3"
 )
 
 type manifestEntry struct {
@@ -43,21 +45,18 @@ func TransferHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	entries, err := scanManifestEntries(directory)
-	if err != nil {
-		http.Error(w, "failed to build manifest", http.StatusInternalServerError)
-		return
-	}
-
 	root := filepath.Clean(directory)
-	totalSize := totalManifestSize(entries)
-	transfer, err := NewTransfer(root, len(entries), totalSize)
+	transfer, err := NewTransfer(root, 0, 0)
 	if err != nil {
 		http.Error(w, "failed to initialize transfer", http.StatusInternalServerError)
 		return
 	}
-	SetTransferState(transfer.ID, TransferStateRunning)
-	defer SetTransferState(transfer.ID, TransferStateDone)
+	cleanupTransfer := false
+	defer func() {
+		if cleanupTransfer {
+			DeleteTransfer(transfer.ID)
+		}
+	}()
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Add("Vary", "Accept-Encoding")
@@ -72,7 +71,12 @@ func TransferHandler(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Encoding", contentEncoding)
 	}
 
-	if err := encodeManifest(out, transfer.ID, root, entries, maxChunkSize, verbose); err != nil {
+	if err := encodeManifest(out, transfer.ID, root, maxChunkSize, verbose); err != nil {
+		if isBrokenPipe(err) {
+			cleanupTransfer = true
+			log.Printf("[filexfer][transfer] broken pipe after %d bytes: %v", cw.n, err)
+			return
+		}
 		if cw.n == 0 {
 			w.Header().Del("Content-Encoding")
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -83,6 +87,11 @@ func TransferHandler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if err := closeEncoded(); err != nil {
+		if isBrokenPipe(err) {
+			cleanupTransfer = true
+			log.Printf("[filexfer][transfer] broken pipe while closing after %d bytes: %v", cw.n, err)
+			return
+		}
 		if cw.n == 0 {
 			w.Header().Del("Content-Encoding")
 			http.Error(w, "failed to finalize encoded response", http.StatusInternalServerError)
@@ -141,8 +150,37 @@ func parseVerbose(req *http.Request) (bool, error) {
 	return verbose, nil
 }
 
-func scanManifestEntries(root string) ([]manifestEntry, error) {
-	entries := make([]manifestEntry, 0, 128)
+func encodeManifest(w io.Writer, transferID string, root string, maxChunkSize int, verbose bool) error {
+	rootToken := fmt.Sprintf("%d:%s", len(root), root)
+	header := fmt.Sprintf("FM/1 %s %s\n", transferID, rootToken)
+
+	if maxChunkSize > 0 && len(header) > maxChunkSize {
+		return errors.New("max-manifest-chunk-size is too small for header")
+	}
+
+	chunkBytes := 0
+	prevPath := ""
+	prevMtime := ""
+	updatesCh := make(chan TransferFileStateUpdate, 1000)
+	done := RegisterTransferFileState(transferID, updatesCh, TransferStateStarted)
+	defer func() {
+		close(updatesCh)
+		<-done
+	}()
+	fileID := 0
+
+	startChunk := func() error {
+		if _, err := io.WriteString(w, header); err != nil {
+			return err
+		}
+		chunkBytes = len(header)
+		prevPath = ""
+		prevMtime = ""
+		return nil
+	}
+	if err := startChunk(); err != nil {
+		return err
+	}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -158,52 +196,14 @@ func scanManifestEntries(root string) ([]manifestEntry, error) {
 		if err != nil {
 			return err
 		}
-		rel = filepath.ToSlash(rel)
-		entries = append(entries, manifestEntry{
-			path:  rel,
+		entry := manifestEntry{
+			path:  filepath.ToSlash(rel),
 			size:  info.Size(),
 			mtime: strconv.FormatInt(info.ModTime().UnixNano(), 10),
-		})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].path < entries[j].path
-	})
-	return entries, nil
-}
-
-func encodeManifest(w io.Writer, transferID string, root string, entries []manifestEntry, maxChunkSize int, verbose bool) error {
-	rootToken := fmt.Sprintf("%d:%s", len(root), root)
-	header := fmt.Sprintf("FM/1 %s %s\n", transferID, rootToken)
-
-	if maxChunkSize > 0 && len(header) > maxChunkSize {
-		return errors.New("max-manifest-chunk-size is too small for header")
-	}
-
-	chunkBytes := 0
-	prevPath := ""
-	prevMtime := ""
-
-	startChunk := func() error {
-		if _, err := io.WriteString(w, header); err != nil {
-			return err
 		}
-		chunkBytes = len(header)
-		prevPath = ""
-		prevMtime = ""
-		return nil
-	}
-	if err := startChunk(); err != nil {
-		return err
-	}
-
-	for id, entry := range entries {
 		pathToken := frontToken(prevPath, entry.path, verbose)
 		mtimeToken := mtimeFrontToken(prevMtime, entry.mtime, verbose)
-		line := fmt.Sprintf("%d %d %s %s\n", id, entry.size, mtimeToken, pathToken)
+		line := fmt.Sprintf("%d %d %s %s\n", fileID, entry.size, mtimeToken, pathToken)
 
 		if maxChunkSize > 0 && chunkBytes+len(line) > maxChunkSize {
 			if chunkBytes == len(header) {
@@ -218,29 +218,44 @@ func encodeManifest(w io.Writer, transferID string, root string, entries []manif
 
 			pathToken = frontToken("", entry.path, verbose)
 			mtimeToken = mtimeFrontToken("", entry.mtime, verbose)
-			line = fmt.Sprintf("%d %d %s %s\n", id, entry.size, mtimeToken, pathToken)
+			line = fmt.Sprintf("%d %d %s %s\n", fileID, entry.size, mtimeToken, pathToken)
 			if chunkBytes+len(line) > maxChunkSize {
 				return errors.New("max-manifest-chunk-size is too small for manifest entry")
 			}
 		}
 
+		fullPath := filepath.Clean(filepath.Join(root, entry.path))
+		updatesCh <- TransferFileStateUpdate{
+			FileID:   uint64(fileID),
+			PathHash: xxh3.Hash128([]byte(fullPath)),
+			FileSize: entry.size,
+		}
 		if _, err := io.WriteString(w, line); err != nil {
 			return err
 		}
 		chunkBytes += len(line)
 		prevPath = entry.path
 		prevMtime = entry.mtime
+		fileID++
+		return nil
+	})
+	if err != nil {
+		return err
 	}
+
+	ClipTransfer(transferID)
 
 	return nil
 }
 
-func totalManifestSize(entries []manifestEntry) int64 {
-	var total int64
-	for _, e := range entries {
-		total += e.size
+func isBrokenPipe(err error) bool {
+	if err == nil {
+		return false
 	}
-	return total
+	return errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 func frontToken(prev string, curr string, verbose bool) string {

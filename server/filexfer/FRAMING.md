@@ -11,12 +11,13 @@ file transfers over plain TCP sockets.
 
 ## Frame Structure
 
-Each file transfer frame is:
+Each file transfer response frame is:
 
 1. Header line (ASCII, UTF-8 safe)
 2. Raw payload bytes
+3. Trailer line (ASCII, UTF-8 safe)
 
-Header line is terminated by `\n`.
+Header and trailer lines are terminated by `\n`.
 
 ### First Header Line
 
@@ -34,6 +35,8 @@ Example:
 
 ```text
 FX/1 12 comp=zstd enc=age offset=0 size=1048576 wsize=262144 xsum:xxh3 deadline:30s
+<262144 payload bytes>
+FXT/1 12 status=ok xsum:xxh3=9f12ab...
 ```
 
 ## Properties
@@ -188,3 +191,19 @@ Common trailer properties:
 - `status=ok` indicates segment accepted and written.
 - Non-`ok` status indicates segment rejected or incomplete; sender should treat as failed for retry logic.
 - Trailer `xsum:<algo>=<value>` entries correspond to requested checksum algorithms when declared in request.
+
+## `/fs/file` Contract
+
+`GET /fs/file/{txferid}/{fid}` returns exactly:
+
+1. `FX/1` header line
+2. `wsize` payload bytes (raw or compressed per `comp`)
+3. `FXT/1` trailer line
+
+Current trailer shape:
+
+```text
+FXT/1 <file_id> status=ok xsum:xxh3=<16-hex-byte-64-bit>
+```
+
+The checksum currently covers the logical (uncompressed, plaintext) file block bytes for that frame.

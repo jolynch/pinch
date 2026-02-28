@@ -698,6 +698,7 @@ func main() {
 
 	// Filesystem API
 	mux.HandleFunc("PUT /fs/transfer", filexfer.TransferHandler)
+	mux.HandleFunc("GET /fs/file/{txferid}/{fid}", filexfer.FileHandler)
 
 	if *dieAfter > 0 {
 		go die(*dieAfter)
