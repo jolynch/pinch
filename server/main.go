@@ -20,6 +20,7 @@ import (
 
 	"filippo.io/age"
 
+	"github.com/jolynch/pinch/filexfer"
 	"github.com/jolynch/pinch/state"
 	"github.com/jolynch/pinch/utils"
 )
@@ -694,6 +695,9 @@ func main() {
 	mux.HandleFunc("/unpinch", unpinch)
 	mux.HandleFunc("/io/", handleIO)
 	mux.HandleFunc("/status/", getStatus)
+
+	// Filesystem API
+	mux.HandleFunc("PUT /fs/transfer", filexfer.TransferHandler)
 
 	if *dieAfter > 0 {
 		go die(*dieAfter)
