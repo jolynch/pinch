@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ const (
 	TransferStateStarted uint8 = iota
 	TransferStateRunning
 	TransferStateDone
+	TransferStateMissing
 )
 
 type Transfer struct {
@@ -46,8 +48,23 @@ type TransferFileStateUpdate struct {
 }
 
 type transferStore struct {
-	mu        sync.RWMutex
-	transfers map[string]Transfer
+	mu         sync.RWMutex
+	transfers  map[string]Transfer
+	fileHashes map[fileHashKey]fileHashState
+}
+
+type fileHashKey struct {
+	txferID string
+	fileID  uint64
+}
+
+type fileHashState struct {
+	hasher     *xxh3.Hasher128
+	hashedSize int64
+	hashToken  string
+	valid      bool
+	finalized  bool
+	expiresAt  time.Time
 }
 
 var (
@@ -61,7 +78,8 @@ func init() {
 
 func newTransferStore() *transferStore {
 	return &transferStore{
-		transfers: make(map[string]Transfer),
+		transfers:  make(map[string]Transfer),
+		fileHashes: make(map[fileHashKey]fileHashState),
 	}
 }
 
@@ -140,6 +158,91 @@ func (s *transferStore) appendFileStates(txferID string, updates []TransferFileS
 	s.transfers[txferID] = transfer
 }
 
+func (s *transferStore) appendFileHashChunk(txferID string, fileID uint64, offset int64, chunk []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	transfer, ok := s.transfers[txferID]
+	if !ok {
+		return false
+	}
+	if fileID >= uint64(len(transfer.State)) || offset < 0 {
+		return false
+	}
+	key := fileHashKey{txferID: txferID, fileID: fileID}
+	state, exists := s.fileHashes[key]
+	if !exists || offset == 0 {
+		state = fileHashState{
+			hasher:    xxh3.New128(),
+			valid:     true,
+			finalized: false,
+		}
+	}
+	if !state.valid || state.finalized {
+		state.expiresAt = time.Now().Add(ttl)
+		s.fileHashes[key] = state
+		return true
+	}
+	if offset != state.hashedSize {
+		state.valid = false
+		state.expiresAt = time.Now().Add(ttl)
+		s.fileHashes[key] = state
+		return true
+	}
+
+	if len(chunk) > 0 {
+		if _, err := state.hasher.Write(chunk); err != nil {
+			state.valid = false
+			state.expiresAt = time.Now().Add(ttl)
+			s.fileHashes[key] = state
+			return true
+		}
+	}
+	state.hashedSize += int64(len(chunk))
+	state.hashToken = formatXXH128HashToken(state.hasher.Sum128())
+	state.expiresAt = time.Now().Add(ttl)
+	s.fileHashes[key] = state
+	return true
+}
+
+func (s *transferStore) finalizeFileHash(txferID string, fileID uint64) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := fileHashKey{txferID: txferID, fileID: fileID}
+	state, ok := s.fileHashes[key]
+	if !ok || !state.valid || state.hasher == nil {
+		return "", false
+	}
+	state.hashToken = formatXXH128HashToken(state.hasher.Sum128())
+	state.finalized = true
+	state.hasher = nil
+	state.expiresAt = time.Now().Add(ttl)
+	s.fileHashes[key] = state
+	return state.hashToken, true
+}
+
+func (s *transferStore) verifyFileHashToken(txferID string, fileID uint64, expectedBytes int64, token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := fileHashKey{txferID: txferID, fileID: fileID}
+	state, ok := s.fileHashes[key]
+	if !ok || !state.valid || !state.finalized {
+		return false
+	}
+	if expectedBytes >= 0 && state.hashedSize != expectedBytes {
+		return false
+	}
+	expectedToken := strings.ToLower(strings.TrimSpace(state.hashToken))
+	actualToken := strings.ToLower(strings.TrimSpace(token))
+	if expectedToken == "" || expectedToken != actualToken {
+		return false
+	}
+	delete(s.fileHashes, key)
+	return true
+}
+
 func (s *transferStore) delete(txferID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -147,6 +250,11 @@ func (s *transferStore) delete(txferID string) bool {
 		return false
 	}
 	delete(s.transfers, txferID)
+	for key := range s.fileHashes {
+		if key.txferID == txferID {
+			delete(s.fileHashes, key)
+		}
+	}
 	return true
 }
 
@@ -185,6 +293,7 @@ func (s *transferStore) getFileStates(txferID string) ([]TransferFileState, bool
 func (s *transferStore) resetForTest() {
 	s.mu.Lock()
 	s.transfers = make(map[string]Transfer)
+	s.fileHashes = make(map[fileHashKey]fileHashState)
 	s.mu.Unlock()
 }
 
@@ -209,6 +318,25 @@ func (s *transferStore) listForTest() []Transfer {
 	return out
 }
 
+func (s *transferStore) setFileState(txferID string, fileID uint64, state uint8) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	transfer, ok := s.transfers[txferID]
+	if !ok {
+		return false
+	}
+	if fileID >= uint64(len(transfer.State)) {
+		return false
+	}
+	idx := int(fileID)
+	if shouldAdvanceState(transfer.State[idx], state) {
+		transfer.State[idx] = state
+	}
+	s.transfers[txferID] = transfer
+	return true
+}
+
 func (s *transferStore) acknowledgeFile(txferID string, fileID uint64, ackBytes int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -221,6 +349,24 @@ func (s *transferStore) acknowledgeFile(txferID string, fileID uint64, ackBytes 
 		return false
 	}
 	idx := int(fileID)
+	currentState := transfer.State[idx]
+
+	if currentState == TransferStateMissing {
+		s.transfers[txferID] = transfer
+		return true
+	}
+
+	if ackBytes == -1 {
+		if shouldAdvanceState(currentState, TransferStateMissing) {
+			wasTerminal := currentState == TransferStateDone || currentState == TransferStateMissing
+			transfer.State[idx] = TransferStateMissing
+			if !wasTerminal {
+				transfer.Done++
+			}
+		}
+		s.transfers[txferID] = transfer
+		return true
+	}
 
 	target := ackBytes
 	if target < 0 {
@@ -285,6 +431,15 @@ func (s *transferStore) reapExpiredLoop() {
 		for txferID, transfer := range s.transfers {
 			if !transfer.ExpiresAt.After(now) {
 				delete(s.transfers, txferID)
+			}
+		}
+		for key, state := range s.fileHashes {
+			if !state.expiresAt.After(now) {
+				delete(s.fileHashes, key)
+				continue
+			}
+			if _, ok := s.transfers[key.txferID]; !ok {
+				delete(s.fileHashes, key)
 			}
 		}
 		s.mu.Unlock()
@@ -376,6 +531,22 @@ func AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool
 	return manager.acknowledgeFile(txferID, fileID, ackBytes)
 }
 
+func UpdateTransferFileHash(txferID string, fileID uint64, offset int64, chunk []byte) bool {
+	return manager.appendFileHashChunk(txferID, fileID, offset, chunk)
+}
+
+func VerifyTransferFileHash(txferID string, fileID uint64, expectedBytes int64, hashToken string) bool {
+	return manager.verifyFileHashToken(txferID, fileID, expectedBytes, hashToken)
+}
+
+func FinalizeTransferFileHash(txferID string, fileID uint64) (string, bool) {
+	return manager.finalizeFileHash(txferID, fileID)
+}
+
+func SetTransferFileState(txferID string, fileID uint64, state uint8) bool {
+	return manager.setFileState(txferID, fileID, state)
+}
+
 func ClipTransfer(txferID string) bool {
 	return manager.clipTransfer(txferID)
 }
@@ -398,4 +569,9 @@ func transferID() (string, error) {
 		return "", fmt.Errorf("generate transfer id: %w", err)
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+func formatXXH128HashToken(v xxh3.Uint128) string {
+	b := v.Bytes()
+	return "xxh128:" + hex.EncodeToString(b[:])
 }

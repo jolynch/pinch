@@ -641,7 +641,15 @@ func cleanupDir(dirPath string) error {
 	return nil
 }
 
+func shouldRunCLI(args []string) bool {
+	return len(args) > 1 && args[1] == "cli"
+}
+
 func main() {
+	if shouldRunCLI(os.Args) {
+		os.Exit(filexfer.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	flag.StringVar(&listen, "listen", listen, "The address to listen on")
 	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
 	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
@@ -698,7 +706,9 @@ func main() {
 
 	// Filesystem API
 	mux.HandleFunc("PUT /fs/transfer", filexfer.TransferHandler)
+	mux.HandleFunc("GET /fs/transfer/{txferid}/status", filexfer.TransferStatusHandler)
 	mux.HandleFunc("GET /fs/file/{txferid}/{fid}", filexfer.FileHandler)
+	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/checksum", filexfer.FileChecksumHandler)
 
 	if *dieAfter > 0 {
 		go die(*dieAfter)

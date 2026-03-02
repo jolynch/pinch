@@ -1,6 +1,7 @@
 # Filexfer Manifest Specification (Draft v1)
 
-This document defines the manifest format used to describe files to transfer.
+This document defines the manifest format used to compactly
+describe files to transfer from a server.
 
 ## Structure
 

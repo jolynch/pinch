@@ -298,3 +298,29 @@ func TestAcknowledgeTransferFile(t *testing.T) {
 		t.Fatalf("expected state done after full ack, got %d", stored.State[0])
 	}
 }
+
+func TestAcknowledgeTransferFileMissing(t *testing.T) {
+	resetTransferStore()
+	transfer, err := NewTransfer("/tmp/x", 1, 10)
+	if err != nil {
+		t.Fatalf("NewTransfer failed: %v", err)
+	}
+	updates := []TransferFileStateUpdate{
+		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/x/0")), FileSize: 10},
+	}
+	RegisterTransferFileStates(transfer.ID, updates, TransferStateStarted)
+
+	if ok := AcknowledgeTransferFile(transfer.ID, 0, -1); !ok {
+		t.Fatalf("AcknowledgeTransferFile returned false")
+	}
+	stored, ok := GetTransfer(transfer.ID)
+	if !ok {
+		t.Fatalf("transfer not found")
+	}
+	if stored.State[0] != TransferStateMissing {
+		t.Fatalf("expected missing state, got %d", stored.State[0])
+	}
+	if stored.Done != 1 {
+		t.Fatalf("expected done=1 for missing file, got %d", stored.Done)
+	}
+}
