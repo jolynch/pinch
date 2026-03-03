@@ -1,11 +1,16 @@
 package filexfer
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,17 +112,30 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		return 1
 	}
 	manifest := manifestResp.Manifest
-	if manifestOut == "" {
-		manifestOut = manifest.TransferID + ".fm1"
-	}
-	if err := SaveManifest(manifestOut, manifest); err != nil {
-		fmt.Fprintf(stderr, "save manifest failed: %v\n", err)
-		return 1
-	}
 
 	var total int64
 	for _, e := range manifest.Entries {
 		total += e.Size
+	}
+	if manifestOut == "" || manifestOut == "-" {
+		if _, err := stdout.Write(manifest.Raw); err != nil {
+			fmt.Fprintf(stderr, "write manifest failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(
+			stderr,
+			"transfer loaded: tid=%s files=%d total_size=%d root=%s elapsed=%s manifest=stdout\n",
+			manifest.TransferID,
+			len(manifest.Entries),
+			total,
+			manifest.Root,
+			time.Since(start).Round(time.Millisecond),
+		)
+		return 0
+	}
+	if err := SaveManifest(manifestOut, manifest); err != nil {
+		fmt.Fprintf(stderr, "save manifest failed: %v\n", err)
+		return 1
 	}
 	fmt.Fprintf(
 		stdout,
@@ -213,14 +231,27 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "invalid --fd: %v\n", err)
 		return 2
 	}
-	manifest, err := loadManifestForTransfer(txferID, manifestPath)
+	manifest, resolvedManifestPath, err := loadManifestForTransfer(txferID, manifestPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
 		return 1
 	}
+	progressPath := resolvedManifestPath + ".progress"
+	progressState, err := loadProgressState(progressPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
+		return 1
+	}
+	progressUpdates := make(chan DownloadProgressUpdate, 128)
+	stopProgress := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
+	defer stopProgress()
 
 	client := NewClient(serverURL, nil)
 	start := time.Now()
+	if ack, ok := progressState[fileID]; ok && ack >= manifestEntrySize(manifest, fileID) {
+		fmt.Fprintf(stderr, "get skipped: already complete fd=%d ack=%d\n", fileID, ack)
+		return 0
+	}
 	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
 		Manifest:       manifest,
 		FileID:         fileID,
@@ -230,6 +261,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		AcceptEncoding: acceptEncoding,
 		AckEveryBytes:  ackEvery,
 		SyncEveryBytes: syncEvery,
+		ProgressUpdates: progressUpdates,
 	})
 	elapsed := time.Since(start)
 	if err != nil {
@@ -278,11 +310,20 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintln(stderr, "--sync-every must be > 0")
 		return 2
 	}
-	manifest, err := loadManifestForTransfer(txferID, manifestPath)
+	manifest, resolvedManifestPath, err := loadManifestForTransfer(txferID, manifestPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
 		return 1
 	}
+	progressPath := resolvedManifestPath + ".progress"
+	progressState, err := loadProgressState(progressPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
+		return 1
+	}
+	progressUpdates := make(chan DownloadProgressUpdate, 1024)
+	stopProgress := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
+	defer stopProgress()
 	client := NewClient(serverURL, nil)
 
 	startAll := time.Now()
@@ -294,6 +335,10 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	worker := func() {
 		defer wg.Done()
 		for entry := range workCh {
+			if ack, ok := progressState[entry.ID]; ok && ack >= entry.Size {
+				completed.Add(1)
+				continue
+			}
 			startOne := time.Now()
 			downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
 				Manifest:       manifest,
@@ -303,6 +348,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 				AcceptEncoding: acceptEncoding,
 				AckEveryBytes:  ackEvery,
 				SyncEveryBytes: syncEvery,
+				ProgressUpdates: progressUpdates,
 			})
 			if err != nil {
 				errCh <- fmt.Errorf("id=%d: %w", entry.ID, err)
@@ -349,18 +395,150 @@ func parseFileID(raw string) (uint64, error) {
 	return strconv.ParseUint(raw, 10, 64)
 }
 
-func loadManifestForTransfer(txferID string, manifestPath string) (*Manifest, error) {
+func loadManifestForTransfer(txferID string, manifestPath string) (*Manifest, string, error) {
 	if manifestPath == "" {
 		manifestPath = txferID + ".fm1"
 	}
 	manifest, err := LoadManifest(manifestPath)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if manifest.TransferID != txferID {
-		return nil, fmt.Errorf("manifest transfer id mismatch: expected %s got %s", txferID, manifest.TransferID)
+		return nil, "", fmt.Errorf("manifest transfer id mismatch: expected %s got %s", txferID, manifest.TransferID)
 	}
-	return manifest, nil
+	return manifest, manifestPath, nil
+}
+
+func manifestEntrySize(manifest *Manifest, fileID uint64) int64 {
+	if manifest == nil {
+		return 0
+	}
+	entry, ok := manifest.EntryByID(fileID)
+	if !ok {
+		return 0
+	}
+	return entry.Size
+}
+
+func loadProgressState(progressPath string) (map[uint64]int64, error) {
+	state := make(map[uint64]int64)
+	fd, err := os.Open(progressPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return state, nil
+		}
+		return nil, err
+	}
+	defer fd.Close()
+
+	scanner := bufio.NewScanner(fd)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid progress line: %q", line)
+		}
+		fileID, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid progress file id %q: %w", parts[0], err)
+		}
+		ack, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid progress ack %q: %w", parts[1], err)
+		}
+		if prev, ok := state[fileID]; !ok || ack > prev {
+			state[fileID] = ack
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func startProgressWriter(progressPath string, initial map[uint64]int64, updates <-chan DownloadProgressUpdate, stderr io.Writer) func() {
+	state := make(map[uint64]int64, len(initial))
+	for fileID, ack := range initial {
+		state[fileID] = ack
+	}
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+
+	writeSnapshot := func() error {
+		dir := filepath.Dir(progressPath)
+		if dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return err
+			}
+		}
+		tmpPath := progressPath + ".tmp"
+		fd, err := os.Create(tmpPath)
+		if err != nil {
+			return err
+		}
+		ids := make([]uint64, 0, len(state))
+		for fileID := range state {
+			ids = append(ids, fileID)
+		}
+		slices.Sort(ids)
+		for _, fileID := range ids {
+			if _, err := fmt.Fprintf(fd, "%d %d\n", fileID, state[fileID]); err != nil {
+				_ = fd.Close()
+				return err
+			}
+		}
+		if err := fd.Close(); err != nil {
+			return err
+		}
+		return os.Rename(tmpPath, progressPath)
+	}
+
+	go func() {
+		defer close(doneCh)
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		dirty := false
+		for {
+			select {
+			case <-stopCh:
+				if dirty {
+					if err := writeSnapshot(); err != nil {
+						fmt.Fprintf(stderr, "progress flush failed: %v\n", err)
+					}
+				}
+				return
+			case update, ok := <-updates:
+				if !ok {
+					if dirty {
+						if err := writeSnapshot(); err != nil {
+							fmt.Fprintf(stderr, "progress flush failed: %v\n", err)
+						}
+					}
+					return
+				}
+				if prev, ok := state[update.FileID]; !ok || update.AckBytes > prev {
+					state[update.FileID] = update.AckBytes
+					dirty = true
+				}
+			case <-ticker.C:
+				if dirty {
+					if err := writeSnapshot(); err != nil {
+						fmt.Fprintf(stderr, "progress flush failed: %v\n", err)
+					} else {
+						dirty = false
+					}
+				}
+			}
+		}
+	}()
+
+	return func() {
+		close(stopCh)
+		<-doneCh
+	}
 }
 
 func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path string, meta FileFrameMeta, elapsed time.Duration) {

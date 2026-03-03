@@ -68,6 +68,12 @@ type DownloadFileRequest struct {
 	AcceptEncoding string
 	AckEveryBytes  int64
 	SyncEveryBytes int64
+	ProgressUpdates chan<- DownloadProgressUpdate
+}
+
+type DownloadProgressUpdate struct {
+	FileID   uint64
+	AckBytes int64
 }
 
 type DownloadFileResponse struct {
@@ -457,6 +463,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			TransferID: req.Manifest.TransferID,
 			FileID:     req.FileID,
 			FullPath:   serverPath,
+			ProgressUpdates: req.ProgressUpdates,
 		})
 	}()
 	ackClosed := false
@@ -736,6 +743,7 @@ type ackRequestBase struct {
 	TransferID string
 	FileID     uint64
 	FullPath   string
+	ProgressUpdates chan<- DownloadProgressUpdate
 }
 
 func enqueueAck(ctx context.Context, ackQueue chan<- ackEvent, ackErrCh <-chan error, evt ackEvent) error {
@@ -795,6 +803,13 @@ func (c *Client) runAckWorker(ctx context.Context, ackQueue <-chan ackEvent, ack
 				evt.AckBytes,
 				err,
 			)
+			continue
+		}
+		if evt.AckBytes >= 0 && base.ProgressUpdates != nil {
+			select {
+			case base.ProgressUpdates <- DownloadProgressUpdate{FileID: base.FileID, AckBytes: evt.AckBytes}:
+			default:
+			}
 		}
 	}
 }
