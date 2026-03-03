@@ -170,19 +170,25 @@ func TestFetchFileDecodesByHeaderComp(t *testing.T) {
 			defer srv.Close()
 
 			client := NewClient(srv.URL, nil)
-			reader, meta, err := client.FetchFile(context.Background(), "tx", 7, "/root/a.txt", defaultCLIEncodings, -1)
+			resp, err := client.FetchFile(context.Background(), FetchFileRequest{
+				TransferID:     "tx",
+				FileID:         7,
+				FullPath:       "/root/a.txt",
+				AcceptEncoding: defaultCLIEncodings,
+				AckBytes:       -1,
+			})
 			if err != nil {
 				t.Fatalf("FetchFile failed: %v", err)
 			}
-			got, err := readAndClose(t, reader)
+			got, err := readAndClose(t, resp.Reader)
 			if err != nil {
 				t.Fatalf("FetchFile read failed: %v", err)
 			}
 			if !bytes.Equal(got, logical) {
 				t.Fatalf("unexpected logical bytes: %q", got)
 			}
-			if meta.Comp != comp {
-				t.Fatalf("expected comp %q, got %q", comp, meta.Comp)
+			if resp.Meta.Comp != comp {
+				t.Fatalf("expected comp %q, got %q", comp, resp.Meta.Comp)
 			}
 		})
 	}
@@ -208,11 +214,11 @@ func TestFetchFileRejectsChecksumMismatch(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	reader, _, err := client.FetchFile(context.Background(), "tx", 0, "/root/a.txt", defaultCLIEncodings, -1)
+	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", FileID: 0, FullPath: "/root/a.txt", AcceptEncoding: defaultCLIEncodings, AckBytes: -1})
 	if err != nil {
 		t.Fatalf("FetchFile setup failed: %v", err)
 	}
-	if _, err := readAndClose(t, reader); err == nil {
+	if _, err := readAndClose(t, resp.Reader); err == nil {
 		t.Fatalf("expected checksum mismatch error")
 	}
 }
@@ -232,11 +238,11 @@ func TestFetchFileRejectsMalformedTrailer(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	reader, _, err := client.FetchFile(context.Background(), "tx", 0, "/root/a.txt", defaultCLIEncodings, -1)
+	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", FileID: 0, FullPath: "/root/a.txt", AcceptEncoding: defaultCLIEncodings, AckBytes: -1})
 	if err != nil {
 		t.Fatalf("FetchFile setup failed: %v", err)
 	}
-	if _, err := readAndClose(t, reader); err == nil {
+	if _, err := readAndClose(t, resp.Reader); err == nil {
 		t.Fatalf("expected malformed trailer error")
 	}
 }
@@ -249,11 +255,11 @@ func TestFetchFileRejectsPayloadLengthMismatch(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	reader, _, err := client.FetchFile(context.Background(), "tx", 0, "/root/a.txt", defaultCLIEncodings, -1)
+	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", FileID: 0, FullPath: "/root/a.txt", AcceptEncoding: defaultCLIEncodings, AckBytes: -1})
 	if err != nil {
 		t.Fatalf("FetchFile setup failed: %v", err)
 	}
-	if _, err := readAndClose(t, reader); err == nil {
+	if _, err := readAndClose(t, resp.Reader); err == nil {
 		t.Fatalf("expected payload length error")
 	}
 }
@@ -274,7 +280,7 @@ func TestFetchFileRejectsUnsupportedEnc(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	if _, _, err := client.FetchFile(context.Background(), "tx", 0, "/root/a.txt", defaultCLIEncodings, -1); err == nil {
+	if _, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", FileID: 0, FullPath: "/root/a.txt", AcceptEncoding: defaultCLIEncodings, AckBytes: -1}); err == nil {
 		t.Fatalf("expected unsupported enc error")
 	}
 }
@@ -291,24 +297,24 @@ func TestFetchFileDecodesMultiFrameSequence(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	reader, meta, err := client.FetchFile(context.Background(), "tx", 0, "/root/a.txt", defaultCLIEncodings, -1)
+	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", FileID: 0, FullPath: "/root/a.txt", AcceptEncoding: defaultCLIEncodings, AckBytes: -1})
 	if err != nil {
 		t.Fatalf("FetchFile failed: %v", err)
 	}
-	got, err := readAndClose(t, reader)
+	got, err := readAndClose(t, resp.Reader)
 	if err != nil {
 		t.Fatalf("read stream failed: %v", err)
 	}
 	if string(got) != "hello world" {
 		t.Fatalf("unexpected stream body: %q", got)
 	}
-	if meta.Size != int64(len(got)) {
-		t.Fatalf("expected aggregated logical size %d, got %d", len(got), meta.Size)
+	if resp.Meta.Size != int64(len(got)) {
+		t.Fatalf("expected aggregated logical size %d, got %d", len(got), resp.Meta.Size)
 	}
-	if meta.HeaderTS <= 0 || meta.TrailerTS <= 0 {
-		t.Fatalf("expected parsed frame timestamps, got header=%d trailer=%d", meta.HeaderTS, meta.TrailerTS)
+	if resp.Meta.HeaderTS <= 0 || resp.Meta.TrailerTS <= 0 {
+		t.Fatalf("expected parsed frame timestamps, got header=%d trailer=%d", resp.Meta.HeaderTS, resp.Meta.TrailerTS)
 	}
-	if meta.HashToken == "" {
+	if resp.Meta.HashToken == "" {
 		t.Fatalf("expected parsed hash token")
 	}
 }
@@ -322,11 +328,11 @@ func TestFetchFileRejectsMissingNextFrame(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	reader, _, err := client.FetchFile(context.Background(), "tx", 0, "/root/a.txt", defaultCLIEncodings, -1)
+	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", FileID: 0, FullPath: "/root/a.txt", AcceptEncoding: defaultCLIEncodings, AckBytes: -1})
 	if err != nil {
 		t.Fatalf("FetchFile setup failed: %v", err)
 	}
-	_, err = readAndClose(t, reader)
+	_, err = readAndClose(t, resp.Reader)
 	if err == nil || !strings.Contains(err.Error(), "missing next frame") {
 		t.Fatalf("expected missing next frame error, got %v", err)
 	}
@@ -344,11 +350,11 @@ func TestFetchFileRejectsNonContiguousFrameOffsets(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	reader, _, err := client.FetchFile(context.Background(), "tx", 0, "/root/a.txt", defaultCLIEncodings, -1)
+	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", FileID: 0, FullPath: "/root/a.txt", AcceptEncoding: defaultCLIEncodings, AckBytes: -1})
 	if err != nil {
 		t.Fatalf("FetchFile setup failed: %v", err)
 	}
-	_, err = readAndClose(t, reader)
+	_, err = readAndClose(t, resp.Reader)
 	if err == nil || !strings.Contains(err.Error(), "non-contiguous frame offset") {
 		t.Fatalf("expected non-contiguous frame offset error, got %v", err)
 	}
@@ -367,8 +373,7 @@ func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 	var sawDataReq bool
 	var sawAckReq bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAck := r.URL.Query().Get("ack-bytes")
-		if gotAck == "" {
+		if r.Method == http.MethodGet && r.URL.Path == "/fs/file/tx1/0" {
 			sawDataReq = true
 			if got := r.URL.Query().Get("path"); got != "/remote/dir/a.txt" {
 				t.Fatalf("unexpected path query: %q", got)
@@ -377,29 +382,34 @@ func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 			_, _ = w.Write([]byte(frame))
 			return
 		}
-		sawAckReq = true
-		expectedAck := "5@1001@xxh128:" + xxh128HexTest(logical)
-		if gotAck != expectedAck {
-			t.Fatalf("expected ack-bytes=%s, got %q", expectedAck, gotAck)
+		if r.Method == http.MethodPut && r.URL.Path == "/fs/file/tx1/0/ack" {
+			sawAckReq = true
+			gotAck := r.URL.Query().Get("ack-bytes")
+			expectedAck := "5@1001@xxh128:" + xxh128HexTest(logical)
+			if gotAck != expectedAck {
+				t.Fatalf("expected ack-bytes=%s, got %q", expectedAck, gotAck)
+			}
+			if got := r.URL.Query().Get("path"); got != "/remote/dir/a.txt" {
+				t.Fatalf("unexpected path query: %q", got)
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
 		}
-		if got := r.URL.Query().Get("offset"); got != "0" {
-			t.Fatalf("expected offset=0 for ack-only, got %q", got)
-		}
-		if got := r.URL.Query().Get("size"); got != "0" {
-			t.Fatalf("expected size=0 for ack-only, got %q", got)
-		}
-		if got := r.URL.Query().Get("path"); got != "/remote/dir/a.txt" {
-			t.Fatalf("unexpected path query: %q", got)
-		}
-		w.WriteHeader(http.StatusNoContent)
+		http.NotFound(w, r)
 	}))
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	outPath, _, err := client.DownloadFileFromManifest(context.Background(), manifest, 0, outRoot, "", nil, defaultCLIEncodings)
+	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:       manifest,
+		FileID:         0,
+		OutRoot:        outRoot,
+		AcceptEncoding: defaultCLIEncodings,
+	})
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
 	}
+	outPath := downloadResp.DestinationPath
 	expected := filepath.Join(outRoot, "dir", "a.txt")
 	if outPath != expected {
 		t.Fatalf("expected output path %q, got %q", expected, outPath)
@@ -427,12 +437,8 @@ func TestDownloadFileFromManifestWritesToStdout(t *testing.T) {
 	logical := []byte("hello")
 	var acked bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if ack := r.URL.Query().Get("ack-bytes"); ack != "" {
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/ack") {
 			acked = true
-			expectedAck := "5@1001@xxh128:" + xxh128HexTest(logical)
-			if ack != expectedAck {
-				t.Fatalf("unexpected ack token: %q", ack)
-			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -443,10 +449,18 @@ func TestDownloadFileFromManifestWritesToStdout(t *testing.T) {
 
 	var out bytes.Buffer
 	client := NewClient(srv.URL, nil)
-	outPath, _, err := client.DownloadFileFromManifest(context.Background(), manifest, 0, ".", "-", &out, defaultCLIEncodings)
+	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:       manifest,
+		FileID:         0,
+		OutRoot:        ".",
+		OutFile:        "-",
+		Stdout:         &out,
+		AcceptEncoding: defaultCLIEncodings,
+	})
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
 	}
+	outPath := downloadResp.DestinationPath
 	if outPath != "-" {
 		t.Fatalf("expected outPath '-', got %q", outPath)
 	}
@@ -470,36 +484,39 @@ func TestGetTransferStatus(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	status, err := client.GetTransferStatus(context.Background(), "tx123")
+	statusResp, err := client.GetTransferStatus(context.Background(), GetTransferStatusRequest{
+		TransferID: "tx123",
+	})
 	if err != nil {
 		t.Fatalf("GetTransferStatus failed: %v", err)
 	}
+	status := statusResp.Status
 	if status.TransferID != "tx123" || status.DownloadStatus.Running != 2 {
 		t.Fatalf("unexpected status payload: %+v", status)
 	}
 }
 
-func TestFetchFileMissingAcksWithMinusOne(t *testing.T) {
-	var first bool
-	var gotAck string
+func TestFetchFileMissingDoesNotAckInline(t *testing.T) {
+	var requests int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !first {
-			first = true
-			http.Error(w, "file not found", http.StatusNotFound)
-			return
-		}
-		gotAck = r.URL.Query().Get("ack-bytes")
-		w.WriteHeader(http.StatusNoContent)
+		requests++
+		http.Error(w, "file not found", http.StatusNotFound)
 	}))
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	_, _, err := client.FetchFile(context.Background(), "tx", 0, "/root/missing.txt", defaultCLIEncodings, -1)
+	_, err := client.FetchFile(context.Background(), FetchFileRequest{
+		TransferID:     "tx",
+		FileID:         0,
+		FullPath:       "/root/missing.txt",
+		AcceptEncoding: defaultCLIEncodings,
+		AckBytes:       -1,
+	})
 	if err == nil || !errors.Is(err, ErrFileMissing) {
 		t.Fatalf("expected ErrFileMissing, got %v", err)
 	}
-	if gotAck != "-1" {
-		t.Fatalf("expected ack-bytes=-1 on missing ack, got %q", gotAck)
+	if requests != 1 {
+		t.Fatalf("expected one request, got %d", requests)
 	}
 }
 
@@ -512,7 +529,13 @@ func TestFetchFileTransferNotFoundDoesNotAckMissing(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, nil)
-	_, _, err := client.FetchFile(context.Background(), "tx", 0, "/root/missing.txt", defaultCLIEncodings, -1)
+	_, err := client.FetchFile(context.Background(), FetchFileRequest{
+		TransferID:     "tx",
+		FileID:         0,
+		FullPath:       "/root/missing.txt",
+		AcceptEncoding: defaultCLIEncodings,
+		AckBytes:       -1,
+	})
 	if err == nil || !errors.Is(err, ErrFileMissing) {
 		t.Fatalf("expected ErrFileMissing, got %v", err)
 	}

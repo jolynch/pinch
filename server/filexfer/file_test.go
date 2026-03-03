@@ -186,6 +186,13 @@ func newFileRequest(txferID string, fileID string, query string) *http.Request {
 	return req
 }
 
+func newFileAckRequest(txferID string, fileID string, query string) *http.Request {
+	req := httptest.NewRequest(http.MethodPut, "/fs/file/"+url.PathEscape(txferID)+"/"+fileID+"/ack"+query, nil)
+	req.SetPathValue("txferid", txferID)
+	req.SetPathValue("fid", fileID)
+	return req
+}
+
 func TestFileHandlerIdentityFrame(t *testing.T) {
 	txferID, fullPath := setupSingleFileTransfer(t)
 	req := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath))
@@ -387,7 +394,7 @@ func TestFileHandlerMultiFrameDefaultChunkSize(t *testing.T) {
 			t.Fatalf("last frame should carry next=0")
 		}
 	}
-	if !strings.Contains(string(w.Body.Bytes()), " meta:size=") {
+	if !strings.Contains(w.Body.String(), " meta:size=") {
 		t.Fatalf("expected terminal metadata tokens")
 	}
 }
@@ -506,20 +513,20 @@ func TestFileHandlerRejectsPathOutsideRoot(t *testing.T) {
 	}
 }
 
-func TestFileHandlerAckBytesUpdatesTransferProgress(t *testing.T) {
+func TestFileAckHandlerAckBytesUpdatesTransferProgress(t *testing.T) {
 	txferID, fullPath := setupSingleFileTransfer(t)
 	makeReq := func(ack string) *http.Request {
-		return newFileRequest(
+		return newFileAckRequest(
 			txferID,
 			"0",
-			"?path="+url.QueryEscape(fullPath)+"&ack-bytes="+url.QueryEscape(ack),
+			"?path="+url.QueryEscape(fullPath)+"&ack-bytes="+url.QueryEscape(ack)+"&delta-bytes=1&recv-ms=1&sync-ms=1",
 		)
 	}
 
 	w := httptest.NewRecorder()
-	FileHandler(w, makeReq("2@1"))
-	if got := w.Result().StatusCode; got != http.StatusOK {
-		t.Fatalf("expected 200, got %d", got)
+	FileAckHandler(w, makeReq("2@1"))
+	if got := w.Result().StatusCode; got != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", got)
 	}
 	tx, ok := GetTransfer(txferID)
 	if !ok {
@@ -537,9 +544,9 @@ func TestFileHandlerAckBytesUpdatesTransferProgress(t *testing.T) {
 	}
 
 	w = httptest.NewRecorder()
-	FileHandler(w, makeReq("5@1@xxh128:"+xxh128Hex([]byte("hello"))))
-	if got := w.Result().StatusCode; got != http.StatusOK {
-		t.Fatalf("expected 200, got %d", got)
+	FileAckHandler(w, makeReq("5@1@xxh128:"+xxh128Hex([]byte("hello"))))
+	if got := w.Result().StatusCode; got != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", got)
 	}
 	tx, _ = GetTransfer(txferID)
 	if tx.Done != 1 || tx.DoneSize != 5 {
@@ -550,31 +557,31 @@ func TestFileHandlerAckBytesUpdatesTransferProgress(t *testing.T) {
 	}
 }
 
-func TestFileHandlerRejectsLegacyPositiveAckBytes(t *testing.T) {
+func TestFileAckHandlerRejectsLegacyPositiveAckBytes(t *testing.T) {
 	txferID, fullPath := setupSingleFileTransfer(t)
-	req := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)+"&ack-bytes=2")
+	req := newFileAckRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)+"&ack-bytes=2")
 	w := httptest.NewRecorder()
 
-	FileHandler(w, req)
+	FileAckHandler(w, req)
 
 	if got := w.Result().StatusCode; got != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", got)
 	}
 }
 
-func TestFileHandlerAckOnlyRequestReturnsNoContent(t *testing.T) {
+func TestFileAckHandlerAckReturnsNoContent(t *testing.T) {
 	txferID, fullPath := setupSingleFileTransfer(t)
 	seed := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath))
 	FileHandler(httptest.NewRecorder(), seed)
 
-	req := newFileRequest(
+	req := newFileAckRequest(
 		txferID,
 		"0",
-		"?path="+url.QueryEscape(fullPath)+"&offset=0&size=0&ack-bytes="+url.QueryEscape("5@1@xxh128:"+xxh128Hex([]byte("hello"))),
+		"?path="+url.QueryEscape(fullPath)+"&ack-bytes="+url.QueryEscape("5@1@xxh128:"+xxh128Hex([]byte("hello")))+"&delta-bytes=5&recv-ms=1&sync-ms=1",
 	)
 	w := httptest.NewRecorder()
 
-	FileHandler(w, req)
+	FileAckHandler(w, req)
 
 	if got := w.Result().StatusCode; got != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", got)
@@ -584,7 +591,7 @@ func TestFileHandlerAckOnlyRequestReturnsNoContent(t *testing.T) {
 	}
 }
 
-func TestFileHandlerMissingFileReturns404AndAckMissing(t *testing.T) {
+func TestFileHandlerMissingFileReturns404AndFileAckMissing(t *testing.T) {
 	txferID, fullPath := setupSingleFileTransfer(t)
 	if err := os.Remove(fullPath); err != nil {
 		t.Fatalf("remove file: %v", err)
@@ -597,9 +604,9 @@ func TestFileHandlerMissingFileReturns404AndAckMissing(t *testing.T) {
 		t.Fatalf("expected 404 for missing file, got %d", got)
 	}
 
-	req = newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)+"&ack-bytes=-1")
+	req = newFileAckRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)+"&ack-bytes=-1")
 	w = httptest.NewRecorder()
-	FileHandler(w, req)
+	FileAckHandler(w, req)
 	if got := w.Result().StatusCode; got != http.StatusNoContent {
 		t.Fatalf("expected 204 for missing-file ack, got %d", got)
 	}
@@ -616,14 +623,23 @@ func TestFileHandlerMissingFileReturns404AndAckMissing(t *testing.T) {
 	}
 }
 
-func TestShouldFallbackToNone(t *testing.T) {
-	if !shouldFallbackToNone(EncodingZstd, 100, 120) {
-		t.Fatalf("expected fallback for zstd ratio below threshold")
+func TestFileHandlerRejectsAckBytesOnGet(t *testing.T) {
+	txferID, fullPath := setupSingleFileTransfer(t)
+	req := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)+"&ack-bytes=1@1")
+	w := httptest.NewRecorder()
+
+	FileHandler(w, req)
+
+	if got := w.Result().StatusCode; got != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", got)
 	}
-	if shouldFallbackToNone(EncodingZstd, 100, 100) {
-		t.Fatalf("did not expect fallback for zstd ratio above threshold")
+}
+
+func TestCompressionRatio(t *testing.T) {
+	if got := compressionRatio(100, 120); got <= 0 {
+		t.Fatalf("expected positive ratio, got %f", got)
 	}
-	if shouldFallbackToNone("none", 100, 120) {
-		t.Fatalf("did not expect fallback for non-zstd mode")
+	if got := compressionRatio(100, 0); got != 0 {
+		t.Fatalf("expected zero ratio when wire size is zero, got %f", got)
 	}
 }

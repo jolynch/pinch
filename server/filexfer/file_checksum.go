@@ -111,7 +111,7 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 		if len(fileHashes) > 0 {
 			headerHash = fileHashes[0]
 		}
-		if err := writeFrame(w, frameWriteArgs{
+		if _, err := writeFrame(w, frameWriteArgs{
 			FileID:     fileID,
 			Offset:     0,
 			Size:       0,
@@ -191,7 +191,7 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 
 		headerTS := time.Now().UnixMilli()
 		trailerTS := time.Now().UnixMilli()
-		if err := writeFrame(w, frameWriteArgs{
+		if _, err := writeFrame(w, frameWriteArgs{
 			FileID:     fileID,
 			Offset:     cursor,
 			Size:       chunkSize,

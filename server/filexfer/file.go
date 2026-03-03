@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,7 +20,6 @@ import (
 )
 
 const defaultFileFrameLogicalSize int64 = 8 * 1024 * 1024
-const zstdMinCompressionRatio = 0.9
 
 func FileHandler(w http.ResponseWriter, req *http.Request) {
 	txferID := req.PathValue("txferid")
@@ -38,10 +38,8 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	ackRaw := req.URL.Query().Get("ack-bytes")
-	ackBytes, ackTS, ackHashToken, ackProvided, err := parseAckBytesQuery(ackRaw)
-	if err != nil {
-		http.Error(w, "invalid query parameter: ack-bytes", http.StatusBadRequest)
+	if req.URL.Query().Get("ack-bytes") != "" {
+		http.Error(w, "ack-bytes is only supported on PUT /fs/file/{txferid}/{fid}/ack", http.StatusBadRequest)
 		return
 	}
 
@@ -64,58 +62,6 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 	if fileID >= uint64(len(transfer.State)) {
 		http.Error(w, "file id out of range", http.StatusNotFound)
 		return
-	}
-
-	if ackProvided {
-		maxAck := transfer.FileSize[fileID]
-		ackTarget := ackBytes
-		if ackTarget > maxAck {
-			ackTarget = maxAck
-		}
-		if ackTarget < 0 {
-			ackTarget = 0
-		}
-		if ackBytes >= 0 && ackTarget == maxAck {
-			if ackHashToken == "" {
-				http.Error(w, "missing final ack hash token", http.StatusBadRequest)
-				return
-			}
-			if !VerifyTransferFileHash(txferID, fileID, maxAck, ackHashToken) {
-				http.Error(w, "final ack hash token mismatch", http.StatusConflict)
-				return
-			}
-		}
-		if ok := AcknowledgeTransferFile(txferID, fileID, ackBytes); !ok {
-			http.Error(w, "failed to acknowledge file progress", http.StatusInternalServerError)
-			return
-		}
-		if ackBytes >= 0 {
-			nowTS := time.Now().UnixMilli()
-			lagMS := nowTS - ackTS
-			throughput := 0.0
-			if lagMS > 0 {
-				throughput = float64(ackBytes) / (float64(lagMS) / 1000.0)
-			}
-			log.Printf(
-				"filexfer ack tid=%s fid=%d ack_bytes=%d ack_hash=%s acked_server_ts=%d ack_recv_ts=%d lag_ms=%d ack_throughput=%s",
-				txferID,
-				fileID,
-				ackBytes,
-				ackHashToken,
-				ackTS,
-				nowTS,
-				lagMS,
-				humanRate(throughput),
-			)
-		}
-		if ackBytes == -1 {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if offset == 0 && logicalSizeLimit == 0 {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
 	}
 
 	fullPath := filepath.Clean(fullPathRaw)
@@ -188,13 +134,23 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	defer compressors.Close()
 
-	activeComp := comp
+	activeMode := initialCompressionMode(comp)
+	if mode, ok := GetTransferFileCompressionMode(txferID, fileID); ok {
+		activeMode = clampCompressionModeForAccept(mode, comp)
+	}
+	activeComp := frameCompTokenForMode(activeMode)
 	maxWSizeHint, err := maxFrameWireSizeHintBytes(activeComp, defaultFileFrameLogicalSize)
 	if err != nil {
 		http.Error(w, "failed to compute frame wire-size hint", http.StatusInternalServerError)
 		return
 	}
+	policy := NewCompressionPolicy()
 	cursor := offset
+	windowStart := offset
+	windowWireTotal := int64(0)
+	windowLogicalTotal := int64(0)
+	windowFrames := 0
+	windowTS0 := time.Now().UnixMilli()
 	if !UpdateTransferFileHash(txferID, fileID, cursor, nil) {
 		http.Error(w, "invalid file stream offset for file hash", http.StatusConflict)
 		return
@@ -206,11 +162,13 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 			chunkLogical = defaultFileFrameLogicalSize
 		}
 
-		logicalChunk, framePayload, wireSize, chunkHash, err := prepareFramePayload(fd, compressors, activeComp, cursor, chunkLogical)
+		prepareStart := time.Now()
+		logicalChunk, framePayload, wireSize, chunkHash, err := prepareFramePayload(fd, compressors, activeMode, cursor, chunkLogical)
 		if err != nil {
 			http.Error(w, "failed to prepare frame payload", http.StatusInternalServerError)
 			return
 		}
+		prepareLatency := time.Since(prepareStart)
 		if !UpdateTransferFileHash(txferID, fileID, cursor, logicalChunk) {
 			http.Error(w, "failed to update file hash state", http.StatusInternalServerError)
 			return
@@ -248,7 +206,7 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		if firstFrame {
 			maxHint = &maxWSizeHint
 		}
-		if err := writeFrame(w, frameWriteArgs{
+		writeStats, err := writeFrame(w, frameWriteArgs{
 			FileID:       fileID,
 			Offset:       cursor,
 			Size:         chunkLogical,
@@ -264,47 +222,185 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 			FileHashes:   fileHashes,
 			Next:         nextValue,
 			Metadata:     terminalMD,
-		}); err != nil {
+		})
+		if err != nil {
 			return
 		}
-		frameMS := trailerTS - headerTS
-		logicalBps := 0.0
-		wireBps := 0.0
-		if frameMS > 0 {
-			seconds := float64(frameMS) / 1000.0
-			logicalBps = float64(chunkLogical) / seconds
-			wireBps = float64(wireSize) / seconds
-		}
-		log.Printf(
-			"filexfer frame tid=%s fid=%d comp=%s offset=%d size=%d wsize=%d ts0=%d ts1=%d frame_ms=%d logical=%s wire=%s",
-			txferID,
-			fileID,
-			activeComp,
-			cursor,
-			chunkLogical,
-			wireSize,
-			headerTS,
-			trailerTS,
-			frameMS,
-			humanRate(logicalBps),
-			humanRate(wireBps),
-		)
-		if shouldFallbackToNone(activeComp, chunkLogical, wireSize) {
+		windowFrames++
+		windowLogicalTotal += chunkLogical
+		windowWireTotal += wireSize
+		decision := policy.Decide(activeMode, CompressionMetrics{
+			LogicalSize:    chunkLogical,
+			WireSize:       wireSize,
+			PrepareLatency: prepareLatency,
+			WriteLatency:   writeStats.WriteLatency,
+		})
+		nextMode := clampCompressionModeForAccept(decision.Next, comp)
+		if nextMode != activeMode {
+			prevComp := frameCompTokenForMode(activeMode)
+			nextComp := frameCompTokenForMode(nextMode)
 			log.Printf(
-				"filexfer frame tid=%s fid=%d switching compression %s->none ratio=%.3f threshold=%.3f",
+				"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f prepare_over_write=%.3f",
 				txferID,
 				fileID,
-				activeComp,
-				compressionRatio(chunkLogical, wireSize),
-				zstdMinCompressionRatio,
+				prevComp,
+				nextComp,
+				decision.Reason,
+				decision.Ratio,
+				decision.PrepareOverWrite,
 			)
-			activeComp = "none"
+			activeMode = nextMode
+			_ = SetTransferFileCompressionMode(txferID, fileID, activeMode)
+			activeComp = frameCompTokenForMode(activeMode)
 		}
 
 		cursor = nextOffset
 		remaining -= chunkLogical
 		firstFrame = false
 	}
+	windowTS1 := time.Now().UnixMilli()
+	windowMS := windowTS1 - windowTS0
+	logicalBps := 0.0
+	wireBps := 0.0
+	if windowMS > 0 {
+		seconds := float64(windowMS) / 1000.0
+		logicalBps = float64(windowLogicalTotal) / seconds
+		wireBps = float64(windowWireTotal) / seconds
+	}
+	log.Printf(
+		"filexfer window tid=%s fid=%d frames=%d offset=%d size=%d wsize=%d ts0=%d ts1=%d window_ms=%d logical=%s wire=%s",
+		txferID,
+		fileID,
+		windowFrames,
+		windowStart,
+		windowLogicalTotal,
+		windowWireTotal,
+		windowTS0,
+		windowTS1,
+		windowMS,
+		humanRate(logicalBps),
+		humanRate(wireBps),
+	)
+}
+
+func FileAckHandler(w http.ResponseWriter, req *http.Request) {
+	txferID := req.PathValue("txferid")
+	if txferID == "" {
+		http.Error(w, "missing required path parameter: txferid", http.StatusBadRequest)
+		return
+	}
+	fileIDRaw := req.PathValue("fid")
+	if fileIDRaw == "" {
+		http.Error(w, "missing required path parameter: fid", http.StatusBadRequest)
+		return
+	}
+	fileID, err := strconv.ParseUint(fileIDRaw, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid path parameter: fid", http.StatusBadRequest)
+		return
+	}
+
+	fullPathRaw := req.URL.Query().Get("path")
+	if fullPathRaw == "" {
+		http.Error(w, "missing required query parameter: path", http.StatusBadRequest)
+		return
+	}
+	ackBytes, ackTS, ackHashToken, ackProvided, err := parseAckBytesQuery(req.URL.Query().Get("ack-bytes"))
+	if err != nil || !ackProvided {
+		http.Error(w, "invalid query parameter: ack-bytes", http.StatusBadRequest)
+		return
+	}
+	ackDeltaBytes, ackRecvMS, ackSyncMS, err := parseAckTelemetryQuery(req.URL.Query(), ackBytes)
+	if err != nil {
+		http.Error(w, "invalid query parameters: delta-bytes/recv-ms/sync-ms", http.StatusBadRequest)
+		return
+	}
+
+	transfer, ok := GetTransfer(txferID)
+	if !ok {
+		http.Error(w, "transfer not found", http.StatusNotFound)
+		return
+	}
+	if fileID >= uint64(len(transfer.State)) {
+		http.Error(w, "file id out of range", http.StatusNotFound)
+		return
+	}
+
+	fullPath := filepath.Clean(fullPathRaw)
+	if !filepath.IsAbs(fullPath) {
+		http.Error(w, "path must be absolute", http.StatusBadRequest)
+		return
+	}
+	if !pathWithinRoot(transfer.Directory, fullPath) {
+		http.Error(w, "path must be within transfer root", http.StatusForbidden)
+		return
+	}
+	computedDigest := xxh3.Hash128([]byte(fullPath))
+	if transfer.PathHash[fileID] != computedDigest {
+		http.Error(w, "file path digest mismatch", http.StatusForbidden)
+		return
+	}
+
+	maxAck := transfer.FileSize[fileID]
+	ackTarget := ackBytes
+	if ackTarget > maxAck {
+		ackTarget = maxAck
+	}
+	if ackTarget < 0 {
+		ackTarget = 0
+	}
+	if ackBytes >= 0 && ackTarget == maxAck {
+		if ackHashToken == "" {
+			http.Error(w, "missing final ack hash token", http.StatusBadRequest)
+			return
+		}
+		if !VerifyTransferFileHash(txferID, fileID, maxAck, ackHashToken) {
+			http.Error(w, "final ack hash token mismatch", http.StatusConflict)
+			return
+		}
+	}
+	if ok := AcknowledgeTransferFile(txferID, fileID, ackBytes); !ok {
+		http.Error(w, "failed to acknowledge file progress", http.StatusInternalServerError)
+		return
+	}
+
+	if ackBytes >= 0 {
+		nowTS := time.Now().UnixMilli()
+		lagMS := nowTS - ackTS
+		receiverMS := ackRecvMS + ackSyncMS
+		receiverBps := 0.0
+		recvBps := 0.0
+		syncBps := 0.0
+		if ackDeltaBytes > 0 {
+			if receiverMS > 0 {
+				receiverBps = float64(ackDeltaBytes) / (float64(receiverMS) / 1000.0)
+			}
+			if ackRecvMS > 0 {
+				recvBps = float64(ackDeltaBytes) / (float64(ackRecvMS) / 1000.0)
+			}
+			if ackSyncMS > 0 {
+				syncBps = float64(ackDeltaBytes) / (float64(ackSyncMS) / 1000.0)
+			}
+		}
+		log.Printf(
+			"filexfer ack tid=%s fid=%d ack_bytes=%d ack_hash=%s acked_server_ts=%d ack_recv_ts=%d lag_ms=%d delta_bytes=%d recv_ms=%d sync_ms=%d receiver_ms=%d receiver_throughput=%s recv_throughput=%s sync_throughput=%s",
+			txferID,
+			fileID,
+			ackBytes,
+			ackHashToken,
+			ackTS,
+			nowTS,
+			lagMS,
+			ackDeltaBytes,
+			ackRecvMS,
+			ackSyncMS,
+			receiverMS,
+			humanRate(receiverBps),
+			humanRate(recvBps),
+			humanRate(syncBps),
+		)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func compressionRatio(logicalSize int64, wireSize int64) float64 {
@@ -314,11 +410,29 @@ func compressionRatio(logicalSize int64, wireSize int64) float64 {
 	return float64(logicalSize) / float64(wireSize)
 }
 
-func shouldFallbackToNone(comp string, logicalSize int64, wireSize int64) bool {
-	if comp != EncodingZstd {
-		return false
+func initialCompressionMode(comp string) CompressionMode {
+	switch comp {
+	case EncodingLz4:
+		return CompressionModeLz4
+	case "none", EncodingIdentity:
+		return CompressionModeNone
+	default:
+		return CompressionModeZstdDefault
 	}
-	return compressionRatio(logicalSize, wireSize) < zstdMinCompressionRatio
+}
+
+func clampCompressionModeForAccept(mode CompressionMode, acceptedComp string) CompressionMode {
+	switch acceptedComp {
+	case EncodingLz4:
+		if mode == CompressionModeNone {
+			return CompressionModeNone
+		}
+		return CompressionModeLz4
+	case "none", EncodingIdentity:
+		return CompressionModeNone
+	default:
+		return mode
+	}
 }
 
 func parseAckBytesQuery(raw string) (ackBytes int64, ackTS int64, ackHashToken string, provided bool, err error) {
@@ -350,7 +464,32 @@ func parseAckBytesQuery(raw string) (ackBytes int64, ackTS int64, ackHashToken s
 	return ackBytes, ackTS, ackHashToken, true, nil
 }
 
-func prepareFramePayload(fd *os.File, compressors *frameCompressor, comp string, offset int64, logicalSize int64) ([]byte, []byte, int64, xxh3.Uint128, error) {
+func parseAckTelemetryQuery(values url.Values, ackBytes int64) (deltaBytes int64, recvMS int64, syncMS int64, err error) {
+	if ackBytes < 0 {
+		return 0, 0, 0, nil
+	}
+	deltaRaw := strings.TrimSpace(values.Get("delta-bytes"))
+	recvRaw := strings.TrimSpace(values.Get("recv-ms"))
+	syncRaw := strings.TrimSpace(values.Get("sync-ms"))
+	if deltaRaw == "" || recvRaw == "" || syncRaw == "" {
+		return 0, 0, 0, errors.New("missing required ack telemetry")
+	}
+	deltaBytes, err = strconv.ParseInt(deltaRaw, 10, 64)
+	if err != nil || deltaBytes < 0 {
+		return 0, 0, 0, errors.New("invalid delta-bytes")
+	}
+	recvMS, err = strconv.ParseInt(recvRaw, 10, 64)
+	if err != nil || recvMS < 0 {
+		return 0, 0, 0, errors.New("invalid recv-ms")
+	}
+	syncMS, err = strconv.ParseInt(syncRaw, 10, 64)
+	if err != nil || syncMS < 0 {
+		return 0, 0, 0, errors.New("invalid sync-ms")
+	}
+	return deltaBytes, recvMS, syncMS, nil
+}
+
+func prepareFramePayload(fd *os.File, compressors *frameCompressor, mode CompressionMode, offset int64, logicalSize int64) ([]byte, []byte, int64, xxh3.Uint128, error) {
 	if logicalSize < 0 {
 		return nil, nil, 0, xxh3.Uint128{}, errors.New("negative logical size")
 	}
@@ -367,7 +506,7 @@ func prepareFramePayload(fd *os.File, compressors *frameCompressor, comp string,
 	}
 	hash128 := xxh3.Hash128(logical)
 
-	payload, err := compressors.Compress(logical, comp)
+	payload, err := compressors.Compress(logical, mode)
 	if err != nil {
 		return nil, nil, 0, xxh3.Uint128{}, err
 	}
@@ -375,9 +514,10 @@ func prepareFramePayload(fd *os.File, compressors *frameCompressor, comp string,
 }
 
 type frameCompressor struct {
-	buf     bytes.Buffer
-	zstdEnc *zstd.Encoder
-	lz4Enc  *lz4.Writer
+	buf          bytes.Buffer
+	zstdEnc      *zstd.Encoder
+	zstdFastEnc  *zstd.Encoder
+	lz4Enc       *lz4.Writer
 }
 
 func newFrameCompressor() (*frameCompressor, error) {
@@ -385,17 +525,23 @@ func newFrameCompressor() (*frameCompressor, error) {
 }
 
 func (c *frameCompressor) Close() error {
-	if c == nil || c.zstdEnc == nil {
+	if c == nil {
 		return nil
 	}
-	return c.zstdEnc.Close()
+	if c.zstdEnc != nil {
+		_ = c.zstdEnc.Close()
+	}
+	if c.zstdFastEnc != nil {
+		_ = c.zstdFastEnc.Close()
+	}
+	return nil
 }
 
-func (c *frameCompressor) Compress(data []byte, comp string) ([]byte, error) {
-	switch comp {
-	case "none":
+func (c *frameCompressor) Compress(data []byte, mode CompressionMode) ([]byte, error) {
+	switch mode {
+	case CompressionModeNone:
 		return data, nil
-	case EncodingZstd:
+	case CompressionModeZstdDefault:
 		c.buf.Reset()
 		if c.zstdEnc == nil {
 			enc, err := zstd.NewWriter(&c.buf)
@@ -413,7 +559,25 @@ func (c *frameCompressor) Compress(data []byte, comp string) ([]byte, error) {
 			return nil, err
 		}
 		return c.buf.Bytes(), nil
-	case EncodingLz4:
+	case CompressionModeZstdLevel1:
+		c.buf.Reset()
+		if c.zstdFastEnc == nil {
+			enc, err := zstd.NewWriter(&c.buf, zstd.WithEncoderLevel(zstd.SpeedFastest))
+			if err != nil {
+				return nil, err
+			}
+			c.zstdFastEnc = enc
+		} else {
+			c.zstdFastEnc.Reset(&c.buf)
+		}
+		if _, err := c.zstdFastEnc.Write(data); err != nil {
+			return nil, err
+		}
+		if err := c.zstdFastEnc.Close(); err != nil {
+			return nil, err
+		}
+		return c.buf.Bytes(), nil
+	case CompressionModeLz4:
 		c.buf.Reset()
 		if c.lz4Enc == nil {
 			c.lz4Enc = lz4.NewWriter(&c.buf)

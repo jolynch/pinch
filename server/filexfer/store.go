@@ -64,6 +64,8 @@ type fileHashState struct {
 	hashToken  string
 	valid      bool
 	finalized  bool
+	latestComp  uint8
+	hasLatestComp bool
 	expiresAt  time.Time
 }
 
@@ -220,6 +222,38 @@ func (s *transferStore) finalizeFileHash(txferID string, fileID uint64) (string,
 	state.expiresAt = time.Now().Add(ttl)
 	s.fileHashes[key] = state
 	return state.hashToken, true
+}
+
+func (s *transferStore) getFileCompressionMode(txferID string, fileID uint64) (CompressionMode, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	key := fileHashKey{txferID: txferID, fileID: fileID}
+	state, ok := s.fileHashes[key]
+	if !ok || !state.hasLatestComp {
+		return CompressionModeZstdDefault, false
+	}
+	return compressionModeFromStored(state.latestComp), true
+}
+
+func (s *transferStore) setFileCompressionMode(txferID string, fileID uint64, mode CompressionMode) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := fileHashKey{txferID: txferID, fileID: fileID}
+	state, ok := s.fileHashes[key]
+	if !ok {
+		state = fileHashState{
+			hasher:    xxh3.New128(),
+			valid:     true,
+			finalized: false,
+		}
+	}
+	state.latestComp = uint8(mode)
+	state.hasLatestComp = true
+	state.expiresAt = time.Now().Add(ttl)
+	s.fileHashes[key] = state
+	return true
 }
 
 func (s *transferStore) verifyFileHashToken(txferID string, fileID uint64, expectedBytes int64, token string) bool {
@@ -541,6 +575,14 @@ func VerifyTransferFileHash(txferID string, fileID uint64, expectedBytes int64, 
 
 func FinalizeTransferFileHash(txferID string, fileID uint64) (string, bool) {
 	return manager.finalizeFileHash(txferID, fileID)
+}
+
+func GetTransferFileCompressionMode(txferID string, fileID uint64) (CompressionMode, bool) {
+	return manager.getFileCompressionMode(txferID, fileID)
+}
+
+func SetTransferFileCompressionMode(txferID string, fileID uint64, mode CompressionMode) bool {
+	return manager.setFileCompressionMode(txferID, fileID, mode)
 }
 
 func SetTransferFileState(txferID string, fileID uint64, state uint8) bool {

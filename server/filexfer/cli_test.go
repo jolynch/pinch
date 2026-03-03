@@ -48,15 +48,14 @@ func TestRunCLITransferAndGet(t *testing.T) {
 		case r.Method == http.MethodPut && r.URL.Path == "/fs/transfer":
 			_, _ = w.Write([]byte(manifestRaw))
 		case r.Method == http.MethodGet && r.URL.Path == "/fs/file/txcli/0":
-			if ack := r.URL.Query().Get("ack-bytes"); ack != "" {
-				expectedAck := "5@1001@xxh128:" + xxh128HexCLI(fileBody)
-				if ack != expectedAck {
-					t.Fatalf("expected ack-bytes=%s, got %q", expectedAck, ack)
-				}
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
 			_, _ = w.Write([]byte(buildCLIFrame(0, fileBody, 0)))
+		case r.Method == http.MethodPut && r.URL.Path == "/fs/file/txcli/0/ack":
+			ack := r.URL.Query().Get("ack-bytes")
+			expectedAck := "5@1001@xxh128:" + xxh128HexCLI(fileBody)
+			if ack != expectedAck {
+				t.Fatalf("expected ack-bytes=%s, got %q", expectedAck, ack)
+			}
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
@@ -98,7 +97,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 	stderr.Reset()
 	outRoot := filepath.Join(tmp, "out")
 	code = RunCLI(
-		[]string{srv.URL, "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot},
+		[]string{srv.URL, "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-A", "1024", "-S", "1024"},
 		&stdout,
 		&stderr,
 	)
@@ -131,19 +130,13 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/fs/file/txstart/0":
-			if r.URL.Query().Get("ack-bytes") != "" {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
 			body := []byte("hello")
 			_, _ = w.Write([]byte(buildCLIFrame(0, body, 0)))
 		case "/fs/file/txstart/1":
-			if r.URL.Query().Get("ack-bytes") != "" {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
 			body := []byte("test")
 			_, _ = w.Write([]byte(buildCLIFrame(1, body, 0)))
+		case "/fs/file/txstart/0/ack", "/fs/file/txstart/1/ack":
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
@@ -154,7 +147,7 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	code := RunCLI(
-		[]string{srv.URL, "start", "--tid", "txstart", "--manifest", manifestPath, "--out-root", outRoot, "--concurrency", "2"},
+		[]string{srv.URL, "start", "--tid", "txstart", "--manifest", manifestPath, "--out-root", outRoot, "--concurrency", "2", "--ack-every", "1024", "--sync-every", "1024"},
 		&stdout,
 		&stderr,
 	)
@@ -205,6 +198,12 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	}
 	if code := RunCLI([]string{"http://x", "get", "--tid", "t"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for missing --fd, got %d", code)
+	}
+	if code := RunCLI([]string{"http://x", "get", "--tid", "t", "--fd", "0", "--ack-every", "0"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --ack-every, got %d", code)
+	}
+	if code := RunCLI([]string{"http://x", "start", "--tid", "t", "--sync-every", "0"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --sync-every, got %d", code)
 	}
 	if code := RunCLI([]string{"http://x", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for legacy --directory flag, got %d", code)

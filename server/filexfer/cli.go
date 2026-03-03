@@ -65,9 +65,9 @@ func validateServerURL(raw string) error {
 func printCLIUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  pinch cli <server-url> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--verbose] [--max-manifest-chunk-size N]")
-	fmt.Fprintln(w, "  pinch cli <server-url> start --tid <id> [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--concurrency N]")
+	fmt.Fprintln(w, "  pinch cli <server-url> start --tid <id> [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--concurrency N] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>]")
 	fmt.Fprintln(w, "  pinch cli <server-url> status --tid <id>")
-	fmt.Fprintln(w, "  pinch cli <server-url> get --tid <id> --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>]")
+	fmt.Fprintln(w, "  pinch cli <server-url> get --tid <id> --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>]")
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -96,11 +96,17 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 
 	client := NewClient(serverURL, nil)
 	start := time.Now()
-	manifest, err := client.FetchManifest(context.Background(), sourceDir, verbose, maxChunk, defaultCLIEncodings)
+	manifestResp, err := client.FetchManifest(context.Background(), FetchManifestRequest{
+		Directory:      sourceDir,
+		Verbose:        verbose,
+		MaxChunkSize:   maxChunk,
+		AcceptEncoding: defaultCLIEncodings,
+	})
 	if err != nil {
 		fmt.Fprintf(stderr, "transfer failed: %v\n", err)
 		return 1
 	}
+	manifest := manifestResp.Manifest
 	if manifestOut == "" {
 		manifestOut = manifest.TransferID + ".fm1"
 	}
@@ -140,11 +146,14 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 	}
 
 	client := NewClient(serverURL, nil)
-	status, err := client.GetTransferStatus(context.Background(), txferID)
+	statusResp, err := client.GetTransferStatus(context.Background(), GetTransferStatusRequest{
+		TransferID: txferID,
+	})
 	if err != nil {
 		fmt.Fprintf(stderr, "status failed: %v\n", err)
 		return 1
 	}
+	status := statusResp.Status
 
 	fmt.Fprintf(stdout, "transfer=%s files=%d done=%d done_size=%d total_size=%d\n", status.TransferID, status.NumFiles, status.Done, status.DoneSize, status.TotalSize)
 	fmt.Fprintf(stdout, "complete: files=%.2f%% bytes=%.2f%%\n", status.PercentFiles, status.PercentBytes)
@@ -168,12 +177,18 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var outRoot string
 	var outFile string
 	var acceptEncoding string
+	var ackEvery int64
+	var syncEvery int64
 	fs.StringVar(&txferID, "tid", "", "transfer id")
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm1)")
 	fs.StringVar(&fileIDRaw, "fd", "", "file id to download")
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
 	fs.StringVar(&outFile, "o", "", "output file path, or '-' for stdout")
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
+	fs.Int64Var(&ackEvery, "A", defaultClientAckEveryBytes, "bytes between progress acks")
+	fs.Int64Var(&ackEvery, "ack-every", defaultClientAckEveryBytes, "bytes between progress acks")
+	fs.Int64Var(&syncEvery, "S", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
+	fs.Int64Var(&syncEvery, "sync-every", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -183,6 +198,14 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	}
 	if fileIDRaw == "" {
 		fmt.Fprintln(stderr, "get requires --fd")
+		return 2
+	}
+	if ackEvery <= 0 {
+		fmt.Fprintln(stderr, "--ack-every must be > 0")
+		return 2
+	}
+	if syncEvery <= 0 {
+		fmt.Fprintln(stderr, "--sync-every must be > 0")
 		return 2
 	}
 	fileID, err := parseFileID(fileIDRaw)
@@ -198,13 +221,22 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 
 	client := NewClient(serverURL, nil)
 	start := time.Now()
-	destPath, meta, err := client.DownloadFileFromManifest(context.Background(), manifest, fileID, outRoot, outFile, stdout, acceptEncoding)
+	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:       manifest,
+		FileID:         fileID,
+		OutRoot:        outRoot,
+		OutFile:        outFile,
+		Stdout:         stdout,
+		AcceptEncoding: acceptEncoding,
+		AckEveryBytes:  ackEvery,
+		SyncEveryBytes: syncEvery,
+	})
 	elapsed := time.Since(start)
 	if err != nil {
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1
 	}
-	printFileMetrics(stdout, manifest.TransferID, fileID, destPath, meta, elapsed)
+	printFileMetrics(stdout, manifest.TransferID, fileID, downloadResp.DestinationPath, downloadResp.Meta, elapsed)
 	return 0
 }
 
@@ -216,11 +248,17 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var outRoot string
 	var acceptEncoding string
 	var concurrency int
+	var ackEvery int64
+	var syncEvery int64
 	fs.StringVar(&txferID, "tid", "", "transfer id")
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm1)")
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
 	fs.IntVar(&concurrency, "concurrency", 4, "parallel download workers")
+	fs.Int64Var(&ackEvery, "A", defaultClientAckEveryBytes, "bytes between progress acks")
+	fs.Int64Var(&ackEvery, "ack-every", defaultClientAckEveryBytes, "bytes between progress acks")
+	fs.Int64Var(&syncEvery, "S", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
+	fs.Int64Var(&syncEvery, "sync-every", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -230,6 +268,14 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	if concurrency <= 0 {
 		fmt.Fprintln(stderr, "--concurrency must be > 0")
+		return 2
+	}
+	if ackEvery <= 0 {
+		fmt.Fprintln(stderr, "--ack-every must be > 0")
+		return 2
+	}
+	if syncEvery <= 0 {
+		fmt.Fprintln(stderr, "--sync-every must be > 0")
 		return 2
 	}
 	manifest, err := loadManifestForTransfer(txferID, manifestPath)
@@ -249,13 +295,21 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		defer wg.Done()
 		for entry := range workCh {
 			startOne := time.Now()
-			destPath, meta, err := client.DownloadFileFromManifest(context.Background(), manifest, entry.ID, outRoot, "", nil, acceptEncoding)
+			downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+				Manifest:       manifest,
+				FileID:         entry.ID,
+				OutRoot:        outRoot,
+				OutFile:        "",
+				AcceptEncoding: acceptEncoding,
+				AckEveryBytes:  ackEvery,
+				SyncEveryBytes: syncEvery,
+			})
 			if err != nil {
 				errCh <- fmt.Errorf("id=%d: %w", entry.ID, err)
 				continue
 			}
 			completed.Add(1)
-			printFileMetrics(stdout, manifest.TransferID, entry.ID, destPath, meta, time.Since(startOne))
+			printFileMetrics(stdout, manifest.TransferID, entry.ID, downloadResp.DestinationPath, downloadResp.Meta, time.Since(startOne))
 		}
 	}
 

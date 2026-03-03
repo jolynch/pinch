@@ -79,7 +79,7 @@ func TestFileChecksumHandlerWindowAndAlgorithms(t *testing.T) {
 	full128 := xxh3.Hash128(content).Bytes()
 	expected128 := "xxh128:" + hex.EncodeToString(full128[:])
 	expected64 := formatXXH64HashToken(xxh3.Hash(content))
-	body := string(w.Body.Bytes())
+	body := w.Body.String()
 	if !strings.Contains(body, " hash=xxh64:") {
 		t.Fatalf("expected per-window xxh64 hash tokens")
 	}

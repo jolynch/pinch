@@ -220,6 +220,55 @@ func TestGetTransferFileStates(t *testing.T) {
 	}
 }
 
+func TestTransferFileCompressionModeSetGet(t *testing.T) {
+	resetTransferStore()
+	transfer, err := NewTransfer("/tmp/x", 1, 1)
+	if err != nil {
+		t.Fatalf("NewTransfer returned error: %v", err)
+	}
+	if _, ok := GetTransferFileCompressionMode(transfer.ID, 0); ok {
+		t.Fatalf("expected no compression mode before set")
+	}
+	if ok := SetTransferFileCompressionMode(transfer.ID, 0, CompressionModeLz4); !ok {
+		t.Fatalf("SetTransferFileCompressionMode returned false")
+	}
+	mode, ok := GetTransferFileCompressionMode(transfer.ID, 0)
+	if !ok {
+		t.Fatalf("expected compression mode to be present")
+	}
+	if mode != CompressionModeLz4 {
+		t.Fatalf("expected lz4 mode, got %v", mode)
+	}
+}
+
+func TestTransferFileCompressionModeClearedAfterVerify(t *testing.T) {
+	resetTransferStore()
+	transfer, err := NewTransfer("/tmp/x", 1, 5)
+	if err != nil {
+		t.Fatalf("NewTransfer returned error: %v", err)
+	}
+	data := []byte("hello")
+	if ok := UpdateTransferFileHash(transfer.ID, 0, 0, data); !ok {
+		t.Fatalf("UpdateTransferFileHash returned false")
+	}
+	if _, ok := FinalizeTransferFileHash(transfer.ID, 0); !ok {
+		t.Fatalf("FinalizeTransferFileHash returned false")
+	}
+	token := formatXXH128HashToken(xxh3.Hash128(data))
+	if ok := SetTransferFileCompressionMode(transfer.ID, 0, CompressionModeZstdLevel1); !ok {
+		t.Fatalf("SetTransferFileCompressionMode returned false")
+	}
+	if _, ok := GetTransferFileCompressionMode(transfer.ID, 0); !ok {
+		t.Fatalf("expected compression mode before verify")
+	}
+	if ok := VerifyTransferFileHash(transfer.ID, 0, int64(len(data)), token); !ok {
+		t.Fatalf("VerifyTransferFileHash returned false")
+	}
+	if _, ok := GetTransferFileCompressionMode(transfer.ID, 0); ok {
+		t.Fatalf("expected compression mode to be cleared after verify")
+	}
+}
+
 func TestRegisterTransferFileStateBatchOver1000(t *testing.T) {
 	resetTransferStore()
 

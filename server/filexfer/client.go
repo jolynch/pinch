@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/zeebo/xxh3"
 )
@@ -24,7 +26,7 @@ import (
 type Client struct {
 	BaseURL                 string
 	HTTP                    *http.Client
-	RequestWindowBytes      int64
+	FileRequestWindowBytes  int64
 	FrameBufferBytes        int
 	MaxFrameReadBufferBytes int
 }
@@ -57,88 +59,155 @@ type FileFrameMeta struct {
 	FileHashToken   string
 }
 
+type DownloadFileRequest struct {
+	Manifest       *Manifest
+	FileID         uint64
+	OutRoot        string
+	OutFile        string
+	Stdout         io.Writer
+	AcceptEncoding string
+	AckEveryBytes  int64
+	SyncEveryBytes int64
+}
+
+type DownloadFileResponse struct {
+	DestinationPath string
+	Meta            FileFrameMeta
+}
+
+type FetchManifestRequest struct {
+	Directory      string
+	Verbose        bool
+	MaxChunkSize   int
+	AcceptEncoding string
+}
+
+type FetchManifestResponse struct {
+	Manifest *Manifest
+}
+
+type FetchFileRequest struct {
+	TransferID     string
+	FileID         uint64
+	FullPath       string
+	AcceptEncoding string
+	AckBytes       int64
+}
+
+type FetchFileResponse struct {
+	Reader io.ReadCloser
+	Meta   *FileFrameMeta
+}
+
+type AcknowledgeFileProgressRequest struct {
+	TransferID string
+	FileID     uint64
+	FullPath   string
+	AckBytes   int64
+	ServerTS   int64
+	HashToken  string
+	DeltaBytes int64
+	RecvMS     int64
+	SyncMS     int64
+}
+
+type AcknowledgeFileProgressResponse struct{}
+
+type GetTransferStatusRequest struct {
+	TransferID string
+}
+
+type GetTransferStatusResponse struct {
+	Status *TransferStatus
+}
+
+type fileMissingError struct {
+	Status int
+	Body   string
+}
+
+func (e *fileMissingError) Error() string {
+	return fmt.Sprintf("status=%d body=%s", e.Status, e.Body)
+}
+
 var ErrFileMissing = errors.New("file missing")
 
 const (
-	defaultClientRequestWindowBytes      int64 = 256 * 1024 * 1024
+	defaultClientRequestWindowBytes      int64 = 1024 * 1024 * 1024
 	defaultClientFrameBufferBytes        int   = 8 * 1024 * 1024
 	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024
 	minClientFrameReadBufferBytes        int   = 32 * 1024
+	defaultClientAckEveryBytes           int64 = 256 * 1024 * 1024
+	defaultClientSyncEveryBytes          int64 = 256 * 1024 * 1024
 )
 
 func NewClient(baseURL string, hc *http.Client) *Client {
 	return &Client{
 		BaseURL:                 strings.TrimRight(baseURL, "/"),
 		HTTP:                    hc,
-		RequestWindowBytes:      defaultClientRequestWindowBytes,
+		FileRequestWindowBytes:  defaultClientRequestWindowBytes,
 		FrameBufferBytes:        defaultClientFrameBufferBytes,
 		MaxFrameReadBufferBytes: defaultClientMaxFrameReadBufferBytes,
 	}
 }
 
-func (c *Client) FetchManifest(
-	ctx context.Context,
-	directory string,
-	verbose bool,
-	maxChunkSize int,
-	acceptEncoding string,
-) (*Manifest, error) {
+func (c *Client) FetchManifest(ctx context.Context, request FetchManifestRequest) (FetchManifestResponse, error) {
 	if c == nil {
-		return nil, errors.New("nil client")
+		return FetchManifestResponse{}, errors.New("nil client")
 	}
-	if directory == "" {
-		return nil, errors.New("missing directory")
+	if request.Directory == "" {
+		return FetchManifestResponse{}, errors.New("missing directory")
 	}
 
 	u, err := url.Parse(c.BaseURL + "/fs/transfer")
 	if err != nil {
-		return nil, fmt.Errorf("build transfer url: %w", err)
+		return FetchManifestResponse{}, fmt.Errorf("build transfer url: %w", err)
 	}
 	q := u.Query()
-	q.Set("directory", directory)
-	if verbose {
+	q.Set("directory", request.Directory)
+	if request.Verbose {
 		q.Set("verbose", "true")
 	}
-	if maxChunkSize > 0 {
-		q.Set("max-manifest-chunk-size", strconv.Itoa(maxChunkSize))
+	if request.MaxChunkSize > 0 {
+		q.Set("max-manifest-chunk-size", strconv.Itoa(request.MaxChunkSize))
 	}
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("build manifest request: %w", err)
+		return FetchManifestResponse{}, fmt.Errorf("build manifest request: %w", err)
 	}
-	if acceptEncoding != "" {
-		req.Header.Set("Accept-Encoding", acceptEncoding)
+	if request.AcceptEncoding != "" {
+		httpReq.Header.Set("Accept-Encoding", request.AcceptEncoding)
 	}
 
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.httpClient().Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("request manifest: %w", err)
+		return FetchManifestResponse{}, fmt.Errorf("request manifest: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-		return nil, fmt.Errorf("manifest request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return FetchManifestResponse{}, fmt.Errorf("manifest request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 
 	reader, err := WrapDecompressedReader(resp.Body, resp.Header.Get("Content-Encoding"))
 	if err != nil {
-		return nil, fmt.Errorf("decode manifest body: %w", err)
+		return FetchManifestResponse{}, fmt.Errorf("decode manifest body: %w", err)
 	}
 	defer reader.Close()
 
 	raw, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, fmt.Errorf("read manifest body: %w", err)
+		return FetchManifestResponse{}, fmt.Errorf("read manifest body: %w", err)
 	}
 
 	manifest, err := parseManifest(raw)
 	if err != nil {
-		return nil, err
+		return FetchManifestResponse{}, err
 	}
-	return manifest, nil
+	return FetchManifestResponse{Manifest: manifest}, nil
 }
 
 func SaveManifest(path string, manifest *Manifest) error {
@@ -186,16 +255,24 @@ func (m *Manifest) EntryByID(id uint64) (ManifestEntry, bool) {
 	return ManifestEntry{}, false
 }
 
-func (c *Client) FetchFile(
-	ctx context.Context,
-	txferID string,
-	fileID uint64,
-	fullPath string,
-	acceptEncoding string,
-	ackBytes int64,
-) (io.ReadCloser, *FileFrameMeta, error) {
-	_ = ackBytes
-	return c.fetchFileWindow(ctx, txferID, fileID, fullPath, acceptEncoding, 0, -1, "")
+func (c *Client) FetchFile(ctx context.Context, request FetchFileRequest) (FetchFileResponse, error) {
+	_ = request.AckBytes
+	reader, meta, err := c.fetchFileWindow(
+		ctx,
+		request.TransferID,
+		request.FileID,
+		request.FullPath,
+		request.AcceptEncoding,
+		0,
+		-1,
+	)
+	if err != nil {
+		return FetchFileResponse{}, err
+	}
+	return FetchFileResponse{
+		Reader: reader,
+		Meta:   meta,
+	}, nil
 }
 
 func (c *Client) fetchFileWindow(
@@ -206,7 +283,6 @@ func (c *Client) fetchFileWindow(
 	acceptEncoding string,
 	offset int64,
 	size int64,
-	ackToken string,
 ) (io.ReadCloser, *FileFrameMeta, error) {
 	if c == nil {
 		return nil, nil, errors.New("nil client")
@@ -230,9 +306,6 @@ func (c *Client) fetchFileWindow(
 	if size >= 0 {
 		q.Set("size", strconv.FormatInt(size, 10))
 	}
-	if ackToken != "" {
-		q.Set("ack-bytes", ackToken)
-	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -253,13 +326,10 @@ func (c *Client) fetchFileWindow(
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusNotFound {
 			body := strings.TrimSpace(string(msg))
-			if shouldAcknowledgeMissing404(body) {
-				ackErr := c.acknowledgeMissing(ctx, txferID, fileID, fullPath)
-				if ackErr != nil {
-					return nil, nil, fmt.Errorf("%w: status=%d body=%s (failed to ack missing: %v)", ErrFileMissing, resp.StatusCode, body, ackErr)
-				}
-			}
-			return nil, nil, fmt.Errorf("%w: status=%d body=%s", ErrFileMissing, resp.StatusCode, body)
+			return nil, nil, fmt.Errorf("%w: %w", ErrFileMissing, &fileMissingError{
+				Status: resp.StatusCode,
+				Body:   body,
+			})
 		}
 		return nil, nil, fmt.Errorf("file request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
@@ -280,29 +350,21 @@ func (c *Client) fetchFileWindow(
 	return stream, meta, nil
 }
 
-func (c *Client) DownloadFileFromManifest(
-	ctx context.Context,
-	manifest *Manifest,
-	fileID uint64,
-	outRoot string,
-	outFile string,
-	stdout io.Writer,
-	acceptEncoding string,
-) (string, FileFrameMeta, error) {
-	if manifest == nil {
-		return "", FileFrameMeta{}, errors.New("nil manifest")
+func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileRequest) (DownloadFileResponse, error) {
+	if req.Manifest == nil {
+		return DownloadFileResponse{}, errors.New("nil manifest")
 	}
-	entry, serverPath, err := resolveManifestEntryPath(manifest, fileID)
+	entry, serverPath, err := resolveManifestEntryPath(req.Manifest, req.FileID)
 	if err != nil {
-		return "", FileFrameMeta{}, err
+		return DownloadFileResponse{}, err
 	}
 
-	destPath := outFile
+	destPath := req.OutFile
 	if destPath == "" {
-		if outRoot == "" {
-			outRoot = "."
+		if req.OutRoot == "" {
+			req.OutRoot = "."
 		}
-		destPath = filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
+		destPath = filepath.Clean(filepath.Join(req.OutRoot, filepath.FromSlash(entry.Path)))
 	}
 	destPath = filepath.Clean(destPath)
 
@@ -310,17 +372,17 @@ func (c *Client) DownloadFileFromManifest(
 	closeWriter := func() error { return nil }
 	fileWriter := (*os.File)(nil)
 	if destPath == "-" {
-		if stdout == nil {
-			stdout = os.Stdout
+		if req.Stdout == nil {
+			req.Stdout = os.Stdout
 		}
-		writer = stdout
+		writer = req.Stdout
 	} else {
 		if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
-			return "", FileFrameMeta{}, fmt.Errorf("create output parent directory: %w", err)
+			return DownloadFileResponse{}, fmt.Errorf("create output parent directory: %w", err)
 		}
 		fd, err := os.Create(destPath)
 		if err != nil {
-			return "", FileFrameMeta{}, fmt.Errorf("create output file: %w", err)
+			return DownloadFileResponse{}, fmt.Errorf("create output file: %w", err)
 		}
 		writer = fd
 		closeWriter = fd.Close
@@ -328,15 +390,23 @@ func (c *Client) DownloadFileFromManifest(
 	}
 	var frameBuf []byte
 
-	windowSize := c.RequestWindowBytes
+	windowSize := c.FileRequestWindowBytes
 	if windowSize <= 0 {
 		windowSize = defaultClientRequestWindowBytes
 	}
+	ackEvery := req.AckEveryBytes
+	if ackEvery <= 0 {
+		ackEvery = defaultClientAckEveryBytes
+	}
+	syncEvery := req.SyncEveryBytes
+	if syncEvery <= 0 {
+		syncEvery = defaultClientSyncEveryBytes
+	}
 
 	if fileWriter == nil {
-		reader, meta, err := c.fetchFileWindow(ctx, manifest.TransferID, fileID, serverPath, acceptEncoding, 0, -1, "")
+		reader, meta, err := c.fetchFileWindow(ctx, req.Manifest.TransferID, req.FileID, serverPath, req.AcceptEncoding, 0, -1)
 		if err != nil {
-			return "", FileFrameMeta{}, err
+			return DownloadFileResponse{}, err
 		}
 		frameBufSize := effectiveFrameReadBufferSize(c.FrameBufferBytes, meta.MaxWireSizeHint, c.MaxFrameReadBufferBytes)
 		frameBuf = make([]byte, frameBufSize)
@@ -344,34 +414,61 @@ func (c *Client) DownloadFileFromManifest(
 		closeReadErr := reader.Close()
 		closeWriteErr := closeWriter()
 		if copyErr != nil {
-			return "", FileFrameMeta{}, fmt.Errorf("stream output file: %w", copyErr)
+			return DownloadFileResponse{}, fmt.Errorf("stream output file: %w", copyErr)
 		}
 		if closeReadErr != nil {
-			return "", FileFrameMeta{}, closeReadErr
+			return DownloadFileResponse{}, closeReadErr
 		}
 		if closeWriteErr != nil {
-			return "", FileFrameMeta{}, fmt.Errorf("close output file: %w", closeWriteErr)
+			return DownloadFileResponse{}, fmt.Errorf("close output file: %w", closeWriteErr)
 		}
-		return destPath, *meta, nil
+		return DownloadFileResponse{DestinationPath: destPath, Meta: *meta}, nil
 	}
 
 	totalSize := entry.Size
 	if totalSize < 0 {
 		closeWriteErr := closeWriter()
 		if closeWriteErr != nil {
-			return "", FileFrameMeta{}, fmt.Errorf("close output file: %w", closeWriteErr)
+			return DownloadFileResponse{}, fmt.Errorf("close output file: %w", closeWriteErr)
 		}
-		return "", FileFrameMeta{}, errors.New("manifest entry has negative size")
+		return DownloadFileResponse{}, errors.New("manifest entry has negative size")
 	}
 
 	var (
 		offset     int64
-		ackToken   string
 		firstMeta  *FileFrameMeta
 		resultMeta FileFrameMeta
 		mixedComp  bool
 		fileHasher = xxh3.New128()
+		lastTS     int64
+		lastAcked  int64
+		synced     int64
+		intervalTS = time.Now()
 	)
+
+	ackCtx, stopAck := context.WithCancel(ctx)
+	defer stopAck()
+	ackQueue := make(chan ackEvent, 8)
+	ackErrCh := make(chan error, 1)
+	ackDone := make(chan struct{})
+	go func() {
+		defer close(ackDone)
+		c.runAckWorker(ackCtx, ackQueue, ackErrCh, ackRequestBase{
+			TransferID: req.Manifest.TransferID,
+			FileID:     req.FileID,
+			FullPath:   serverPath,
+		})
+	}()
+	ackClosed := false
+	closeAckWorker := func() {
+		if !ackClosed {
+			close(ackQueue)
+			ackClosed = true
+		}
+		<-ackDone
+	}
+	defer closeAckWorker()
+
 	for offset < totalSize {
 		window := totalSize - offset
 		if window > windowSize {
@@ -379,43 +476,80 @@ func (c *Client) DownloadFileFromManifest(
 		}
 		windowReader, windowMeta, err := c.fetchFileWindow(
 			ctx,
-			manifest.TransferID,
-			fileID,
+			req.Manifest.TransferID,
+			req.FileID,
 			serverPath,
-			acceptEncoding,
+			req.AcceptEncoding,
 			offset,
 			window,
-			ackToken,
 		)
 		if err != nil {
+			var missingErr *fileMissingError
+			if errors.Is(err, ErrFileMissing) && errors.As(err, &missingErr) && shouldAcknowledgeMissing404(missingErr.Body) {
+				if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{AckBytes: -1, Final: true}); qErr != nil {
+					_ = closeWriter()
+					return DownloadFileResponse{}, fmt.Errorf("%w (failed to ack missing: %v)", err, qErr)
+				}
+				closeAckWorker()
+			}
 			_ = closeWriter()
-			return "", FileFrameMeta{}, err
+			return DownloadFileResponse{}, err
 		}
 		targetBufSize := effectiveFrameReadBufferSize(c.FrameBufferBytes, windowMeta.MaxWireSizeHint, c.MaxFrameReadBufferBytes)
 		if len(frameBuf) != targetBufSize {
 			frameBuf = make([]byte, targetBufSize)
 		}
-		ackToken = ""
-		copyErr := copyStream(writer, windowReader, frameBuf, fileHasher)
+		getTrailerTS := func() int64 {
+			if tsReader, ok := windowReader.(interface{ LastTrailerTS() int64 }); ok {
+				if ts := tsReader.LastTrailerTS(); ts > 0 {
+					return ts
+				}
+			}
+			return lastTS
+		}
+		copyErr := copyStreamWithProgress(writer, windowReader, frameBuf, fileHasher, func(written int64) error {
+			currentTotal := offset + written
+			if currentTotal-synced < syncEvery {
+				return nil
+			}
+			recvMS := time.Since(intervalTS).Milliseconds()
+			syncStart := time.Now()
+			if err := dataSyncFile(fileWriter); err != nil {
+				return fmt.Errorf("fdatasync output file: %w", err)
+			}
+			syncMS := time.Since(syncStart).Milliseconds()
+			synced = currentTotal
+			deltaBytes := synced - lastAcked
+			if deltaBytes >= ackEvery {
+				if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{
+					AckBytes:   synced,
+					ServerTS:   getTrailerTS(),
+					DeltaBytes: deltaBytes,
+					RecvMS:     recvMS,
+					SyncMS:     syncMS,
+				}); qErr != nil {
+					return fmt.Errorf("enqueue ack failed: %w", qErr)
+				}
+				lastAcked = synced
+				intervalTS = time.Now()
+			}
+			return nil
+		})
 		closeReadErr := windowReader.Close()
 		if copyErr != nil {
 			_ = closeWriter()
-			return "", FileFrameMeta{}, fmt.Errorf("stream output file: %w", copyErr)
+			return DownloadFileResponse{}, fmt.Errorf("stream output file: %w", copyErr)
 		}
 		if closeReadErr != nil {
 			_ = closeWriter()
-			return "", FileFrameMeta{}, closeReadErr
+			return DownloadFileResponse{}, closeReadErr
 		}
 		if windowMeta.Size != window {
 			_ = closeWriter()
-			return "", FileFrameMeta{}, fmt.Errorf("window size mismatch: requested=%d got=%d", window, windowMeta.Size)
+			return DownloadFileResponse{}, fmt.Errorf("window size mismatch: requested=%d got=%d", window, windowMeta.Size)
 		}
 		offset += windowMeta.Size
-		if err := dataSyncFile(fileWriter); err != nil {
-			_ = closeWriter()
-			return "", FileFrameMeta{}, fmt.Errorf("fdatasync output file: %w", err)
-		}
-		ackToken = fmt.Sprintf("%d@%d", offset, windowMeta.TrailerTS)
+		lastTS = windowMeta.TrailerTS
 
 		if firstMeta == nil {
 			tmp := *windowMeta
@@ -433,7 +567,7 @@ func (c *Client) DownloadFileFromManifest(
 	}
 	if firstMeta == nil {
 		resultMeta = FileFrameMeta{
-			FileID:    fileID,
+			FileID:    req.FileID,
 			Comp:      "none",
 			Enc:       "none",
 			Offset:    0,
@@ -445,150 +579,257 @@ func (c *Client) DownloadFileFromManifest(
 	if mixedComp {
 		resultMeta.Comp = "mixed"
 	}
-	if ackToken != "" {
-		fullHash := formatXXH128HashToken(fileHasher.Sum128())
-		if resultMeta.FileHashToken != "" && !strings.EqualFold(resultMeta.FileHashToken, fullHash) {
-			_ = closeWriter()
-			return "", FileFrameMeta{}, fmt.Errorf("file hash mismatch: server=%s client=%s", resultMeta.FileHashToken, fullHash)
-		}
-		finalAckToken := ackToken + "@" + fullHash
-		if err := c.acknowledgeProgressWithToken(ctx, manifest.TransferID, fileID, serverPath, finalAckToken); err != nil {
-			_ = closeWriter()
-			return "", FileFrameMeta{}, fmt.Errorf("acknowledge download failed: %w", err)
-		}
+
+	finalRecvMS := time.Since(intervalTS).Milliseconds()
+	finalSyncStart := time.Now()
+	if err := dataSyncFile(fileWriter); err != nil {
+		_ = closeWriter()
+		return DownloadFileResponse{}, fmt.Errorf("fdatasync output file: %w", err)
+	}
+	finalSyncMS := time.Since(finalSyncStart).Milliseconds()
+	synced = offset
+	fullHash := formatXXH128HashToken(fileHasher.Sum128())
+	if resultMeta.FileHashToken != "" && !strings.EqualFold(resultMeta.FileHashToken, fullHash) {
+		_ = closeWriter()
+		return DownloadFileResponse{}, fmt.Errorf("file hash mismatch: server=%s client=%s", resultMeta.FileHashToken, fullHash)
+	}
+	if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{
+		AckBytes:   synced,
+		ServerTS:   lastTS,
+		HashToken:  fullHash,
+		DeltaBytes: synced - lastAcked,
+		RecvMS:     finalRecvMS,
+		SyncMS:     finalSyncMS,
+		Final:      true,
+	}); qErr != nil {
+		_ = closeWriter()
+		return DownloadFileResponse{}, fmt.Errorf("enqueue final ack failed: %w", qErr)
+	}
+	closeAckWorker()
+	if err := waitAckWorker(ackErrCh); err != nil {
+		_ = closeWriter()
+		return DownloadFileResponse{}, fmt.Errorf("acknowledge download failed: %w", err)
 	}
 	closeWriteErr := closeWriter()
 	if closeWriteErr != nil {
-		return "", FileFrameMeta{}, fmt.Errorf("close output file: %w", closeWriteErr)
+		return DownloadFileResponse{}, fmt.Errorf("close output file: %w", closeWriteErr)
 	}
-	return destPath, resultMeta, nil
+	return DownloadFileResponse{DestinationPath: destPath, Meta: resultMeta}, nil
 }
 
-func (c *Client) GetTransferStatus(ctx context.Context, txferID string) (*TransferStatus, error) {
+func (c *Client) GetTransferStatus(ctx context.Context, request GetTransferStatusRequest) (GetTransferStatusResponse, error) {
 	if c == nil {
-		return nil, errors.New("nil client")
+		return GetTransferStatusResponse{}, errors.New("nil client")
 	}
-	if txferID == "" {
-		return nil, errors.New("missing transfer id")
+	if request.TransferID == "" {
+		return GetTransferStatusResponse{}, errors.New("missing transfer id")
 	}
-	u := fmt.Sprintf("%s/fs/transfer/%s/status", c.BaseURL, url.PathEscape(txferID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	u := fmt.Sprintf("%s/fs/transfer/%s/status", c.BaseURL, url.PathEscape(request.TransferID))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build status request: %w", err)
+		return GetTransferStatusResponse{}, fmt.Errorf("build status request: %w", err)
 	}
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.httpClient().Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("request transfer status: %w", err)
+		return GetTransferStatusResponse{}, fmt.Errorf("request transfer status: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-		return nil, fmt.Errorf("transfer status failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return GetTransferStatusResponse{}, fmt.Errorf("transfer status failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	var status TransferStatus
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		return nil, fmt.Errorf("decode transfer status: %w", err)
+		return GetTransferStatusResponse{}, fmt.Errorf("decode transfer status: %w", err)
 	}
-	return &status, nil
-}
-
-func (c *Client) acknowledgeMissing(ctx context.Context, txferID string, fileID uint64, fullPath string) error {
-	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d", c.BaseURL, url.PathEscape(txferID), fileID))
-	if err != nil {
-		return fmt.Errorf("build missing-ack url: %w", err)
-	}
-	q := u.Query()
-	q.Set("path", fullPath)
-	q.Set("offset", "0")
-	q.Set("size", "0")
-	q.Set("ack-bytes", "-1")
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return fmt.Errorf("build missing-ack request: %w", err)
-	}
-	resp, err := c.fileHTTPClient().Do(req)
-	if err != nil {
-		return fmt.Errorf("missing-ack request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
-		return fmt.Errorf("missing-ack failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
-	}
-	return nil
+	return GetTransferStatusResponse{Status: &status}, nil
 }
 
 func shouldAcknowledgeMissing404(body string) bool {
 	return strings.EqualFold(strings.TrimSpace(body), "file not found")
 }
 
-func (c *Client) acknowledgeProgress(
-	ctx context.Context,
-	txferID string,
-	fileID uint64,
-	fullPath string,
-	ackBytes int64,
-	serverTS int64,
-) error {
-	if ackBytes < 0 {
-		return errors.New("ack bytes must be non-negative")
+func (c *Client) AcknowledgeFileProgress(ctx context.Context, request AcknowledgeFileProgressRequest) (AcknowledgeFileProgressResponse, error) {
+	if request.TransferID == "" {
+		return AcknowledgeFileProgressResponse{}, errors.New("missing transfer id")
 	}
-	if serverTS < 0 {
-		return errors.New("ack server timestamp must be non-negative")
+	if request.FullPath == "" {
+		return AcknowledgeFileProgressResponse{}, errors.New("missing full path")
 	}
-	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d", c.BaseURL, url.PathEscape(txferID), fileID))
+	ackToken, err := buildAckToken(request.AckBytes, request.ServerTS, request.HashToken)
 	if err != nil {
-		return fmt.Errorf("build progress-ack url: %w", err)
+		return AcknowledgeFileProgressResponse{}, err
 	}
-	q := u.Query()
-	q.Set("path", fullPath)
-	q.Set("offset", "0")
-	q.Set("size", "0")
-	q.Set("ack-bytes", fmt.Sprintf("%d@%d", ackBytes, serverTS))
-	u.RawQuery = q.Encode()
-	return c.acknowledgeProgressWithURL(ctx, u.String())
-}
+	if request.AckBytes >= 0 {
+		if request.DeltaBytes < 0 {
+			return AcknowledgeFileProgressResponse{}, errors.New("ack delta bytes must be >= 0")
+		}
+		if request.RecvMS < 0 {
+			return AcknowledgeFileProgressResponse{}, errors.New("ack recv-ms must be >= 0")
+		}
+		if request.SyncMS < 0 {
+			return AcknowledgeFileProgressResponse{}, errors.New("ack sync-ms must be >= 0")
+		}
+	}
 
-func (c *Client) acknowledgeProgressWithToken(
-	ctx context.Context,
-	txferID string,
-	fileID uint64,
-	fullPath string,
-	ackToken string,
-) error {
-	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d", c.BaseURL, url.PathEscape(txferID), fileID))
+	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d/ack", c.BaseURL, url.PathEscape(request.TransferID), request.FileID))
 	if err != nil {
-		return fmt.Errorf("build progress-ack url: %w", err)
+		return AcknowledgeFileProgressResponse{}, fmt.Errorf("build progress-ack url: %w", err)
 	}
 	q := u.Query()
-	q.Set("path", fullPath)
-	q.Set("offset", "0")
-	q.Set("size", "0")
+	q.Set("path", request.FullPath)
 	q.Set("ack-bytes", ackToken)
-	u.RawQuery = q.Encode()
-	return c.acknowledgeProgressWithURL(ctx, u.String())
-}
-
-func (c *Client) acknowledgeProgressWithURL(ctx context.Context, rawURL string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return fmt.Errorf("build progress-ack request: %w", err)
+	if request.AckBytes >= 0 {
+		q.Set("delta-bytes", strconv.FormatInt(request.DeltaBytes, 10))
+		q.Set("recv-ms", strconv.FormatInt(request.RecvMS, 10))
+		q.Set("sync-ms", strconv.FormatInt(request.SyncMS, 10))
 	}
-	resp, err := c.fileHTTPClient().Do(req)
+	u.RawQuery = q.Encode()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), nil)
 	if err != nil {
-		return fmt.Errorf("progress-ack request failed: %w", err)
+		return AcknowledgeFileProgressResponse{}, fmt.Errorf("build progress-ack request: %w", err)
+	}
+	resp, err := c.fileHTTPClient().Do(httpReq)
+	if err != nil {
+		return AcknowledgeFileProgressResponse{}, fmt.Errorf("progress-ack request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
-		return fmt.Errorf("progress-ack failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return AcknowledgeFileProgressResponse{}, fmt.Errorf("progress-ack failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
-	return nil
+	return AcknowledgeFileProgressResponse{}, nil
+}
+
+func buildAckToken(ackBytes int64, serverTS int64, hashToken string) (string, error) {
+	if ackBytes == -1 {
+		return "-1", nil
+	}
+	if ackBytes < 0 {
+		return "", errors.New("ack bytes must be -1 or non-negative")
+	}
+	if serverTS < 0 {
+		return "", errors.New("ack server timestamp must be non-negative")
+	}
+	token := fmt.Sprintf("%d@%d", ackBytes, serverTS)
+	if hashToken != "" {
+		if !validHashToken(hashToken) {
+			return "", errors.New("invalid ack hash token")
+		}
+		token += "@" + hashToken
+	}
+	return token, nil
+}
+
+type ackEvent struct {
+	AckBytes  int64
+	ServerTS  int64
+	HashToken string
+	DeltaBytes int64
+	RecvMS     int64
+	SyncMS     int64
+	Final     bool
+}
+
+type ackRequestBase struct {
+	TransferID string
+	FileID     uint64
+	FullPath   string
+}
+
+func enqueueAck(ctx context.Context, ackQueue chan<- ackEvent, ackErrCh <-chan error, evt ackEvent) error {
+	select {
+	case err := <-ackErrCh:
+		return err
+	default:
+	}
+	select {
+	case ackQueue <- evt:
+		return nil
+	case err := <-ackErrCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func waitAckWorker(ackErrCh <-chan error) error {
+	select {
+	case err := <-ackErrCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (c *Client) runAckWorker(ctx context.Context, ackQueue <-chan ackEvent, ackErrCh chan<- error, base ackRequestBase) {
+	for evt := range ackQueue {
+		req := AcknowledgeFileProgressRequest{
+			TransferID: base.TransferID,
+			FileID:     base.FileID,
+			FullPath:   base.FullPath,
+			AckBytes:   evt.AckBytes,
+			ServerTS:   evt.ServerTS,
+			HashToken:  evt.HashToken,
+			DeltaBytes: evt.DeltaBytes,
+			RecvMS:     evt.RecvMS,
+			SyncMS:     evt.SyncMS,
+		}
+		err := retryAck(ctx, func(callCtx context.Context) error {
+			_, err := c.AcknowledgeFileProgress(callCtx, req)
+			return err
+		})
+		if err != nil {
+			if evt.Final {
+				select {
+				case ackErrCh <- err:
+				default:
+				}
+				return
+			}
+			log.Printf(
+				"filexfer client: non-final ack failed tid=%s fid=%d bytes=%d err=%v",
+				base.TransferID,
+				base.FileID,
+				evt.AckBytes,
+				err,
+			)
+		}
+	}
+}
+
+func retryAck(ctx context.Context, fn func(context.Context) error) error {
+	const maxAttempts = 5
+	backoff := 100 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := fn(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		backoff *= 2
+	}
+	return lastErr
 }
 
 func copyStream(dst io.Writer, src io.Reader, buf []byte, hash *xxh3.Hasher128) error {
+	return copyStreamWithProgress(dst, src, buf, hash, nil)
+}
+
+func copyStreamWithProgress(dst io.Writer, src io.Reader, buf []byte, hash *xxh3.Hasher128, onWrite func(written int64) error) error {
+	var written int64
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
@@ -597,6 +838,12 @@ func copyStream(dst io.Writer, src io.Reader, buf []byte, hash *xxh3.Hasher128) 
 			}
 			if hash != nil {
 				if _, err := hash.Write(buf[:n]); err != nil {
+					return err
+				}
+			}
+			written += int64(n)
+			if onWrite != nil {
+				if err := onWrite(written); err != nil {
 					return err
 				}
 			}
@@ -929,6 +1176,13 @@ type fileStream struct {
 	closed     bool
 }
 
+func (s *fileStream) LastTrailerTS() int64 {
+	if s == nil || s.meta == nil {
+		return 0
+	}
+	return s.meta.TrailerTS
+}
+
 func newFileStream(respBody io.ReadCloser) (io.ReadCloser, *FileFrameMeta, error) {
 	stream := &fileStream{
 		respBody: respBody,
@@ -1047,9 +1301,6 @@ func (s *fileStream) openNextFrame() error {
 		if meta.FileID != s.meta.FileID {
 			return fmt.Errorf("file id mismatch across frames: expected=%d got=%d", s.meta.FileID, meta.FileID)
 		}
-		if meta.Comp != s.meta.Comp {
-			return fmt.Errorf("compression mode mismatch across frames: expected=%s got=%s", s.meta.Comp, meta.Comp)
-		}
 		if meta.Enc != s.meta.Enc {
 			return fmt.Errorf("encryption mode mismatch across frames: expected=%s got=%s", s.meta.Enc, meta.Enc)
 		}
@@ -1105,6 +1356,9 @@ func (s *fileStream) finishFrame() error {
 
 	s.meta.Size += s.frameMeta.Size
 	s.meta.WireSize += s.frameMeta.WireSize
+	if s.meta.Comp != s.frameMeta.Comp {
+		s.meta.Comp = "mixed"
+	}
 	s.meta.TrailerTS = trailer.TS
 	s.meta.HashToken = trailer.HashToken
 	if trailer.FileHashToken != "" {

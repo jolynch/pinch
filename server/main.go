@@ -708,6 +708,7 @@ func main() {
 	mux.HandleFunc("PUT /fs/transfer", filexfer.TransferHandler)
 	mux.HandleFunc("GET /fs/transfer/{txferid}/status", filexfer.TransferStatusHandler)
 	mux.HandleFunc("GET /fs/file/{txferid}/{fid}", filexfer.FileHandler)
+	mux.HandleFunc("PUT /fs/file/{txferid}/{fid}/ack", filexfer.FileAckHandler)
 	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/checksum", filexfer.FileChecksumHandler)
 
 	if *dieAfter > 0 {

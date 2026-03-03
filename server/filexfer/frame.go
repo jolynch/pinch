@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 type fileFrameMetadata struct {
@@ -74,14 +75,20 @@ type frameWriteArgs struct {
 	Metadata     *fileFrameMetadata
 }
 
-func writeFrame(w http.ResponseWriter, args frameWriteArgs) error {
+type frameWriteStats struct {
+	WriteLatency      time.Duration
+	WireThroughputBps float64
+}
+
+func writeFrame(w http.ResponseWriter, args frameWriteArgs) (frameWriteStats, error) {
+	start := time.Now()
 	if args.MaxWSizeHint != nil {
 		if _, err := fmt.Fprintf(
 			w,
 			"FX/1 %d offset=%d size=%d wsize=%d comp=%s enc=%s hash=%s max-wsize=%d ts=%d\n",
 			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.Enc, args.HeaderHash, *args.MaxWSizeHint, args.HeaderTS,
 		); err != nil {
-			return err
+			return frameWriteStats{}, err
 		}
 	} else {
 		if _, err := fmt.Fprintf(
@@ -89,13 +96,13 @@ func writeFrame(w http.ResponseWriter, args frameWriteArgs) error {
 			"FX/1 %d offset=%d size=%d wsize=%d comp=%s enc=%s hash=%s ts=%d\n",
 			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.Enc, args.HeaderHash, args.HeaderTS,
 		); err != nil {
-			return err
+			return frameWriteStats{}, err
 		}
 	}
 
 	if len(args.Payload) > 0 {
 		if _, err := w.Write(args.Payload); err != nil {
-			return err
+			return frameWriteStats{}, err
 		}
 	}
 
@@ -123,11 +130,19 @@ func writeFrame(w http.ResponseWriter, args frameWriteArgs) error {
 	}
 	b.WriteByte('\n')
 	if _, err := w.Write([]byte(b.String())); err != nil {
-		return err
+		return frameWriteStats{}, err
 	}
 
 	if fl, ok := w.(http.Flusher); ok {
 		fl.Flush()
 	}
-	return nil
+	writeLatency := time.Since(start)
+	wireBps := 0.0
+	if writeLatency > 0 && args.WSize > 0 {
+		wireBps = float64(args.WSize) / writeLatency.Seconds()
+	}
+	return frameWriteStats{
+		WriteLatency:      writeLatency,
+		WireThroughputBps: wireBps,
+	}, nil
 }
