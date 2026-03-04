@@ -417,7 +417,7 @@ func initialCompressionMode(comp string) CompressionMode {
 	case "none", EncodingIdentity:
 		return CompressionModeNone
 	default:
-		return CompressionModeZstdDefault
+		return CompressionModeLz4
 	}
 }
 

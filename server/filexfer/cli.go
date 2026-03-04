@@ -72,7 +72,7 @@ func printCLIUsage(w io.Writer) {
 	fmt.Fprintln(w, "  pinch cli <server-url> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--verbose] [--max-manifest-chunk-size N]")
 	fmt.Fprintln(w, "  pinch cli <server-url> start --tid <id> [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--concurrency N] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>]")
 	fmt.Fprintln(w, "  pinch cli <server-url> status --tid <id>")
-	fmt.Fprintln(w, "  pinch cli <server-url> get --tid <id> --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>]")
+	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>]")
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -210,10 +210,6 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if txferID == "" {
-		fmt.Fprintln(stderr, "get requires --tid")
-		return 2
-	}
 	if fileIDRaw == "" {
 		fmt.Fprintln(stderr, "get requires --fd")
 		return 2
@@ -231,11 +227,12 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "invalid --fd: %v\n", err)
 		return 2
 	}
-	manifest, resolvedManifestPath, err := loadManifestForTransfer(txferID, manifestPath)
+	manifest, resolvedManifestPath, resolvedTxferID, err := loadManifestForGet(txferID, manifestPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
 		return 1
 	}
+	txferID = resolvedTxferID
 	progressPath := resolvedManifestPath + ".progress"
 	progressState, err := loadProgressState(progressPath)
 	if err != nil {
@@ -407,6 +404,26 @@ func loadManifestForTransfer(txferID string, manifestPath string) (*Manifest, st
 		return nil, "", fmt.Errorf("manifest transfer id mismatch: expected %s got %s", txferID, manifest.TransferID)
 	}
 	return manifest, manifestPath, nil
+}
+
+func loadManifestForGet(txferID string, manifestPath string) (*Manifest, string, string, error) {
+	if manifestPath == "" {
+		if txferID == "" {
+			return nil, "", "", errors.New("get requires --manifest when --tid is not provided")
+		}
+		manifestPath = txferID + ".fm1"
+	}
+	manifest, err := LoadManifest(manifestPath)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if txferID == "" {
+		txferID = manifest.TransferID
+	}
+	if manifest.TransferID != txferID {
+		return nil, "", "", fmt.Errorf("manifest transfer id mismatch: expected %s got %s", txferID, manifest.TransferID)
+	}
+	return manifest, manifestPath, txferID, nil
 }
 
 func manifestEntrySize(manifest *Manifest, fileID uint64) int64 {

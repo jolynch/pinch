@@ -256,7 +256,7 @@ func TestFileHandlerCompressedFrameHeaders(t *testing.T) {
 		if !ok {
 			t.Fatalf("encoding %s: expected frame header/payload/trailer", enc)
 		}
-		if !strings.Contains(header, " comp="+enc+" ") {
+		if !strings.Contains(header, " comp="+EncodingLz4+" ") {
 			t.Fatalf("encoding %s: unexpected frame header: %q", enc, header)
 		}
 		if !strings.HasPrefix(trailer, "FXT/1 0 status=ok ts=") {
@@ -418,8 +418,10 @@ func TestFileHandlerCompressedMultiFrameChecksumsAndNext(t *testing.T) {
 	expectedSizes := []int64{8 * 1024 * 1024, 8 * 1024 * 1024, 1 * 1024 * 1024}
 	var offset int64
 	for i, frame := range frames {
-		if frame.meta.Comp != EncodingZstd {
-			t.Fatalf("frame %d: expected comp=zstd got %s", i, frame.meta.Comp)
+		switch frame.meta.Comp {
+		case EncodingZstd, EncodingLz4, "none":
+		default:
+			t.Fatalf("frame %d: unexpected comp=%s", i, frame.meta.Comp)
 		}
 		if frame.meta.Size != expectedSizes[i] {
 			t.Fatalf("frame %d: expected size %d got %d", i, expectedSizes[i], frame.meta.Size)

@@ -292,6 +292,74 @@ func TestRunCLIGetWritesProgressFile(t *testing.T) {
 	}
 }
 
+func TestRunCLIGetInfersTransferIDFromManifest(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txinfer.fm1")
+	manifestRaw := strings.Join([]string{
+		"FM/1 txinfer 7:/remote",
+		"0 5 0:100 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	fileBody := []byte("hello")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/fs/file/txinfer/0":
+			_, _ = w.Write([]byte(buildCLIFrame(0, fileBody, 0)))
+		case r.Method == http.MethodPut && r.URL.Path == "/fs/file/txinfer/0/ack":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	outRoot := filepath.Join(tmp, "out")
+	code := RunCLI(
+		[]string{srv.URL, "get", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot},
+		&stdout,
+		&stderr,
+	)
+	if code != 0 {
+		t.Fatalf("get: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(outRoot, "a.txt")); err != nil {
+		t.Fatalf("missing output file: %v", err)
+	}
+}
+
+func TestRunCLIGetRejectsManifestTransferIDMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txmismatch.fm1")
+	manifestRaw := strings.Join([]string{
+		"FM/1 txmanifest 7:/remote",
+		"0 5 0:100 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI(
+		[]string{"http://127.0.0.1:1", "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath},
+		&stdout,
+		&stderr,
+	)
+	if code != 1 {
+		t.Fatalf("expected mismatch to return 1, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "manifest transfer id mismatch") {
+		t.Fatalf("expected mismatch error in stderr, got: %s", stderr.String())
+	}
+}
+
 func TestRunCLIStartSkipsCompletedFromProgress(t *testing.T) {
 	tmp := t.TempDir()
 	manifestPath := filepath.Join(tmp, "txskip.fm1")
@@ -357,6 +425,9 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	}
 	if code := RunCLI([]string{"http://x", "get", "--tid", "t"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for missing --fd, got %d", code)
+	}
+	if code := RunCLI([]string{"http://x", "get", "--fd", "0"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("expected runtime error when get has no --tid and no --manifest, got %d", code)
 	}
 	if code := RunCLI([]string{"http://x", "get", "--tid", "t", "--fd", "0", "--ack-every", "0"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --ack-every, got %d", code)

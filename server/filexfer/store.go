@@ -231,7 +231,7 @@ func (s *transferStore) getFileCompressionMode(txferID string, fileID uint64) (C
 	key := fileHashKey{txferID: txferID, fileID: fileID}
 	state, ok := s.fileHashes[key]
 	if !ok || !state.hasLatestComp {
-		return CompressionModeZstdDefault, false
+		return CompressionModeLz4, false
 	}
 	return compressionModeFromStored(state.latestComp), true
 }
@@ -606,7 +606,7 @@ func listTransfersForTest() []Transfer {
 }
 
 func transferID() (string, error) {
-	buf := make([]byte, 16)
+	buf := make([]byte, 4)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("generate transfer id: %w", err)
 	}

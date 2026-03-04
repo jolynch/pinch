@@ -165,7 +165,7 @@ func compressionModeFromStored(raw uint8) CompressionMode {
 	case CompressionModeZstdDefault, CompressionModeZstdLevel1, CompressionModeLz4, CompressionModeNone:
 		return mode
 	default:
-		return CompressionModeZstdDefault
+		return CompressionModeLz4
 	}
 }
 
