@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/zeebo/xxh3"
 )
 
 type fileFrameMetadata struct {
@@ -82,22 +84,20 @@ type frameWriteStats struct {
 
 func writeFrame(w http.ResponseWriter, args frameWriteArgs) (frameWriteStats, error) {
 	start := time.Now()
+	header := ""
 	if args.MaxWSizeHint != nil {
-		if _, err := fmt.Fprintf(
-			w,
+		header = fmt.Sprintf(
 			"FX/1 %d offset=%d size=%d wsize=%d comp=%s enc=%s hash=%s max-wsize=%d ts=%d\n",
 			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.Enc, args.HeaderHash, *args.MaxWSizeHint, args.HeaderTS,
-		); err != nil {
-			return frameWriteStats{}, err
-		}
+		)
 	} else {
-		if _, err := fmt.Fprintf(
-			w,
+		header = fmt.Sprintf(
 			"FX/1 %d offset=%d size=%d wsize=%d comp=%s enc=%s hash=%s ts=%d\n",
 			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.Enc, args.HeaderHash, args.HeaderTS,
-		); err != nil {
-			return frameWriteStats{}, err
-		}
+		)
+	}
+	if _, err := w.Write([]byte(header)); err != nil {
+		return frameWriteStats{}, err
 	}
 
 	if len(args.Payload) > 0 {
@@ -108,12 +108,6 @@ func writeFrame(w http.ResponseWriter, args frameWriteArgs) (frameWriteStats, er
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "FXT/1 %d status=ok ts=%d", args.FileID, args.TrailerTS)
-	for _, token := range args.HashTokens {
-		if token != "" {
-			b.WriteString(" hash=")
-			b.WriteString(token)
-		}
-	}
 	for _, token := range args.FileHashes {
 		if token != "" {
 			b.WriteString(" file-hash=")
@@ -128,8 +122,16 @@ func writeFrame(w http.ResponseWriter, args frameWriteArgs) (frameWriteStats, er
 			b.WriteString(token)
 		}
 	}
-	b.WriteByte('\n')
-	if _, err := w.Write([]byte(b.String())); err != nil {
+	trailerPrefix := b.String()
+	frameHasher := xxh3.New()
+	_, _ = frameHasher.Write([]byte(header))
+	if len(args.Payload) > 0 {
+		_, _ = frameHasher.Write(args.Payload)
+	}
+	_, _ = frameHasher.Write([]byte(trailerPrefix))
+	frameHashToken := fmt.Sprintf("xxh64:%016x", frameHasher.Sum64())
+	trailer := trailerPrefix + " hash=" + frameHashToken + "\n"
+	if _, err := w.Write([]byte(trailer)); err != nil {
 		return frameWriteStats{}, err
 	}
 

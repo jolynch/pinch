@@ -42,7 +42,7 @@ Example:
 ```text
 FX/1 12 offset=0 size=1048576 wsize=262144 comp=zstd enc=age hash=xxh128:9f12ab... deadline:30s
 <262144 payload bytes>
-FXT/1 12 status=ok hash=xxh128:9f12ab...
+FXT/1 12 status=ok hash=xxh64:1af3bc9d00ee42aa
 ```
 
 ## Properties
@@ -61,7 +61,8 @@ Properties are ASCII and case-sensitive.
 ### Optional
 
 - `hash=<algo>:<value>`: checksum token carried on frame headers/trailers.
-  - Supported algorithms: `xxh3`, `blake3`, `xxh128`, `sha256`.
+  - Current trailer frame checksum algorithm is `xxh64`.
+  - Header `hash` is backward-compatible metadata from transfer emission flow.
   - At most one `hash` token per frame.
 - `max-wsize=<bytes>`: server hint for maximum wire payload bytes per frame for this response window.
   - Emitted on the first `/fs/file` frame.
@@ -112,7 +113,7 @@ Receiver behavior:
 - For `comp=none`, `size` must equal `wsize`.
 - For `enc=age`, decrypt before applying `comp`.
 - For `comp=zstd|lz4`, decompressed bytes must equal `size`.
-- `hash=<algo>:<value>` carries the checksum algorithm and value used for validation/logging.
+- Trailer `hash=<algo>:<value>` is used for frame-integrity validation/logging.
 - `deadline:<duration>` limits how long receiver should allow this frame to complete; exceeded deadline is a protocol timeout.
 
 ## Error Handling
@@ -159,7 +160,7 @@ Example:
 ```text
 FXR/1 12 status=ok comp=zstd enc=age offset=0 size=1048576 wsize=262144 elapsed=420ms
 <262144 payload bytes>
-FXT/1 12 status=ok hash=xxh128:9f12ab...
+FXT/1 12 status=ok hash=xxh64:1af3bc9d00ee42aa
 ```
 
 ### Required Response Properties
@@ -190,7 +191,7 @@ Trailer is used for realized post-transfer metadata, especially checksums.
 Common trailer properties:
 
 - `status=<code>`: final trailer status (`ok` or error code).
-- `hash=<algo>:<value>`: computed checksum value.
+- `hash=<algo>:<value>`: frame checksum value.
 - `detail=<token>`: optional machine-readable detail.
 
 ### Response Semantics
@@ -200,7 +201,7 @@ Common trailer properties:
 - Trailer is emitted after payload and carries final checksum values.
 - `status=ok` indicates segment accepted and written.
 - Non-`ok` status indicates segment rejected or incomplete; sender should treat as failed for retry logic.
-- Trailer `hash=<algo>:<value>` corresponds to the checksum algorithm/value used for this frame.
+- Trailer `hash=<algo>:<value>` is the frame checksum token for this frame payload and framing bytes.
 
 ## `/fs/file` Contract
 
@@ -230,10 +231,14 @@ The final trailer uses `next=0` as a terminal marker.
 The final trailer also includes file metadata tokens:
 `meta:size`, `meta:mtime_ns`, `meta:mode`, `meta:uid`, `meta:gid`, `meta:user`, `meta:group`.
 
-The checksum covers the logical (uncompressed, plaintext) bytes for that frame.
-
 `hash=<algo>:<value>` is the canonical checksum token for `/fs/file` trailers.
-The current implementation emits `hash=xxh128:<hex>`.
+For `/fs/file`, trailer hash is `hash=xxh64:<hex16>` and covers:
+- header line bytes (including trailing `\n`)
+- payload bytes (`wsize`)
+- trailer prefix bytes up to but not including ` hash=...`
+
+`file-hash=<algo>:<value>` on terminal trailer is the full logical object checksum.
+Current implementation emits `file-hash=xxh128:<hex32>`.
 
 `max-wsize` is a first-frame hint only. Clients may use it to pre-size a reusable
 frame buffer, but they may cap allocation (current client default cap is `64 MiB`)
@@ -277,6 +282,7 @@ Query parameters:
 
 Checksum trailer semantics:
 
-- Per-window frames include repeated `hash=<algo>:<value>` tokens for requested algorithms.
-- Terminal frame (`next=0`) includes repeated `file-hash=<algo>:<value>` tokens for full-file rolling checksums.
+- Per-window frames include repeated `file-hash=<algo>:<value>` tokens as rolling cumulative checksum snapshots.
+- Terminal frame (`next=0`) includes final `file-hash=<algo>:<value>` values.
+- Every frame still includes `hash=xxh64:<hex16>` as frame integrity checksum.
 - Terminal frame includes the same metadata tokens as `/fs/file`.

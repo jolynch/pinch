@@ -71,9 +71,11 @@ func setupTransferForPath(t *testing.T, dir string, fullPath string, expectedSiz
 }
 
 type decodedFrame struct {
-	meta    FileFrameMeta
-	payload []byte
-	trailer frameTrailer
+	header      string
+	meta        FileFrameMeta
+	payload     []byte
+	trailerLine string
+	trailer     frameTrailer
 }
 
 func decodeFrameSequence(t *testing.T, body []byte) []decodedFrame {
@@ -110,12 +112,27 @@ func decodeFrameSequence(t *testing.T, body []byte) []decodedFrame {
 		cursor += trailerEnd + 1
 
 		frames = append(frames, decodedFrame{
-			meta:    meta,
-			payload: payload,
-			trailer: trailer,
+			header:      headerLine,
+			meta:        meta,
+			payload:     payload,
+			trailerLine: trailerLine,
+			trailer:     trailer,
 		})
 	}
 	return frames
+}
+
+func expectedFrameHashToken(header string, payload []byte, trailerLine string) string {
+	idx := strings.LastIndex(trailerLine, " hash=")
+	if idx < 0 {
+		return ""
+	}
+	trailerPrefix := trailerLine[:idx]
+	h := xxh3.New()
+	_, _ = h.Write([]byte(header + "\n"))
+	_, _ = h.Write(payload)
+	_, _ = h.Write([]byte(trailerPrefix))
+	return formatXXH64HashToken(h.Sum64())
 }
 
 func splitFrame(body []byte) (string, []byte, string, bool) {
@@ -227,8 +244,8 @@ func TestFileHandlerIdentityFrame(t *testing.T) {
 	if parsedTrailer.TS <= 0 {
 		t.Fatalf("missing/invalid trailer ts: %d", parsedTrailer.TS)
 	}
-	expectedHash := xxh128Hex([]byte("hello"))
-	if parsedTrailer.HashToken != "xxh128:"+expectedHash {
+	expectedHash := expectedFrameHashToken(header, payload, trailer)
+	if parsedTrailer.HashToken != expectedHash {
 		t.Fatalf("unexpected hash token: %q", parsedTrailer.HashToken)
 	}
 	if !strings.Contains(trailer, " meta:size=5 ") && !strings.HasSuffix(trailer, " meta:size=5") {
@@ -262,7 +279,7 @@ func TestFileHandlerCompressedFrameHeaders(t *testing.T) {
 		if !strings.HasPrefix(trailer, "FXT/1 0 status=ok ts=") {
 			t.Fatalf("encoding %s: unexpected frame trailer: %q", enc, trailer)
 		}
-		if !strings.Contains(trailer, " hash=xxh128:") {
+		if !strings.Contains(trailer, " hash=xxh64:") {
 			t.Fatalf("encoding %s: missing hash token in trailer: %q", enc, trailer)
 		}
 	}
@@ -293,8 +310,8 @@ func TestFileHandlerPartialWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse trailer: %v", err)
 	}
-	expectedHash := xxh128Hex([]byte("ell"))
-	if parsedTrailer.HashToken != "xxh128:"+expectedHash {
+	expectedHash := expectedFrameHashToken(header, payload, trailer)
+	if parsedTrailer.HashToken != expectedHash {
 		t.Fatalf("unexpected hash token: %q", parsedTrailer.HashToken)
 	}
 }
@@ -382,7 +399,8 @@ func TestFileHandlerMultiFrameDefaultChunkSize(t *testing.T) {
 		if frame.trailer.TS <= 0 {
 			t.Fatalf("frame %d: missing trailer ts", i)
 		}
-		if frame.trailer.HashToken != "xxh128:"+xxh128Hex(logical) {
+		expectedHash := expectedFrameHashToken(frame.header, frame.payload, frame.trailerLine)
+		if frame.trailer.HashToken != expectedHash {
 			t.Fatalf("frame %d: invalid hash token %q", i, frame.trailer.HashToken)
 		}
 		offset += frame.meta.Size
@@ -436,7 +454,8 @@ func TestFileHandlerCompressedMultiFrameChecksumsAndNext(t *testing.T) {
 		if int64(len(logical)) != frame.meta.Size {
 			t.Fatalf("frame %d: logical size mismatch", i)
 		}
-		if frame.trailer.HashToken != "xxh128:"+xxh128Hex(logical) {
+		expectedHash := expectedFrameHashToken(frame.header, frame.payload, frame.trailerLine)
+		if frame.trailer.HashToken != expectedHash {
 			t.Fatalf("frame %d: invalid hash token %q", i, frame.trailer.HashToken)
 		}
 		offset += frame.meta.Size

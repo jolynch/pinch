@@ -10,7 +10,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +21,15 @@ import (
 )
 
 const defaultCLIEncodings = "zstd,lz4,identity"
+const defaultVerboseStatusInterval = 10 * time.Second
+
+func defaultClientConcurrency() int {
+	n := runtime.NumCPU() * 2
+	if n < 1 {
+		return 1
+	}
+	return n
+}
 
 func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	if len(args) < 2 {
@@ -69,10 +80,10 @@ func validateServerURL(raw string) error {
 
 func printCLIUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  pinch cli <server-url> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--verbose] [--max-manifest-chunk-size N]")
-	fmt.Fprintln(w, "  pinch cli <server-url> start --tid <id> [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--concurrency N] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>]")
+	fmt.Fprintln(w, "  pinch cli <server-url> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [-v|--verbose] [--max-manifest-chunk-size N]")
+	fmt.Fprintln(w, "  pinch cli <server-url> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--concurrency N] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>] [-v|--verbose]")
 	fmt.Fprintln(w, "  pinch cli <server-url> status --tid <id>")
-	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>]")
+	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>] [-v|--verbose]")
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -85,6 +96,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	fs.StringVar(&sourceDir, "s", "", "absolute source directory to transfer")
 	fs.StringVar(&sourceDir, "source-directory", "", "absolute source directory to transfer")
 	fs.StringVar(&manifestOut, "o", "", "output path for saved manifest")
+	fs.BoolVar(&verbose, "v", false, "disable front-coding")
 	fs.BoolVar(&verbose, "verbose", false, "disable front-coding")
 	fs.IntVar(&maxChunk, "max-manifest-chunk-size", 0, "max chunk bytes for manifest stream")
 	if err := fs.Parse(args); err != nil {
@@ -197,12 +209,15 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var acceptEncoding string
 	var ackEvery int64
 	var syncEvery int64
+	var verbose bool
 	fs.StringVar(&txferID, "tid", "", "transfer id")
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm1)")
 	fs.StringVar(&fileIDRaw, "fd", "", "file id to download")
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
 	fs.StringVar(&outFile, "o", "", "output file path, or '-' for stdout")
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
+	fs.BoolVar(&verbose, "v", false, "verbose progress output")
+	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
 	fs.Int64Var(&ackEvery, "A", defaultClientAckEveryBytes, "bytes between progress acks")
 	fs.Int64Var(&ackEvery, "ack-every", defaultClientAckEveryBytes, "bytes between progress acks")
 	fs.Int64Var(&syncEvery, "S", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
@@ -242,6 +257,11 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	progressUpdates := make(chan DownloadProgressUpdate, 128)
 	stopProgress := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
 	defer stopProgress()
+	var onAck func(AckProgressEvent)
+	if verbose {
+		ackReporter := newAckMilestoneReporter(stderr)
+		onAck = ackReporter.Report
+	}
 
 	client := NewClient(serverURL, nil)
 	start := time.Now()
@@ -250,22 +270,23 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		return 0
 	}
 	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-		Manifest:       manifest,
-		FileID:         fileID,
-		OutRoot:        outRoot,
-		OutFile:        outFile,
-		Stdout:         stdout,
-		AcceptEncoding: acceptEncoding,
-		AckEveryBytes:  ackEvery,
-		SyncEveryBytes: syncEvery,
+		Manifest:        manifest,
+		FileID:          fileID,
+		OutRoot:         outRoot,
+		OutFile:         outFile,
+		Stdout:          stdout,
+		AcceptEncoding:  acceptEncoding,
+		AckEveryBytes:   ackEvery,
+		SyncEveryBytes:  syncEvery,
 		ProgressUpdates: progressUpdates,
+		OnAck:           onAck,
 	})
 	elapsed := time.Since(start)
 	if err != nil {
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1
 	}
-	printFileMetrics(stdout, manifest.TransferID, fileID, downloadResp.DestinationPath, downloadResp.Meta, elapsed)
+	printFileMetrics(stdout, manifest.TransferID, fileID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
 	return 0
 }
 
@@ -279,20 +300,19 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var concurrency int
 	var ackEvery int64
 	var syncEvery int64
+	var verbose bool
 	fs.StringVar(&txferID, "tid", "", "transfer id")
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm1)")
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
-	fs.IntVar(&concurrency, "concurrency", 4, "parallel download workers")
+	fs.BoolVar(&verbose, "v", false, "verbose progress output")
+	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
+	fs.IntVar(&concurrency, "concurrency", defaultClientConcurrency(), "parallel download workers")
 	fs.Int64Var(&ackEvery, "A", defaultClientAckEveryBytes, "bytes between progress acks")
 	fs.Int64Var(&ackEvery, "ack-every", defaultClientAckEveryBytes, "bytes between progress acks")
 	fs.Int64Var(&syncEvery, "S", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
 	fs.Int64Var(&syncEvery, "sync-every", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
 	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	if txferID == "" {
-		fmt.Fprintln(stderr, "start requires --tid")
 		return 2
 	}
 	if concurrency <= 0 {
@@ -307,11 +327,12 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintln(stderr, "--sync-every must be > 0")
 		return 2
 	}
-	manifest, resolvedManifestPath, err := loadManifestForTransfer(txferID, manifestPath)
+	manifest, resolvedManifestPath, resolvedTxferID, err := loadManifestForStart(txferID, manifestPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
 		return 1
 	}
+	txferID = resolvedTxferID
 	progressPath := resolvedManifestPath + ".progress"
 	progressState, err := loadProgressState(progressPath)
 	if err != nil {
@@ -321,6 +342,11 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	progressUpdates := make(chan DownloadProgressUpdate, 1024)
 	stopProgress := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
 	defer stopProgress()
+	var onAck func(AckProgressEvent)
+	if verbose {
+		ackReporter := newAckMilestoneReporter(stderr)
+		onAck = ackReporter.Report
+	}
 	client := NewClient(serverURL, nil)
 
 	startAll := time.Now()
@@ -328,6 +354,12 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	errCh := make(chan error, len(manifest.Entries))
 	var wg sync.WaitGroup
 	var completed atomic.Int64
+	var totalTransferred atomic.Int64
+	var stopStatusPolling func()
+	if verbose {
+		stopStatusPolling = startVerboseStatusPolling(txferID, client, stderr)
+		defer stopStatusPolling()
+	}
 
 	worker := func() {
 		defer wg.Done()
@@ -338,21 +370,23 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 			}
 			startOne := time.Now()
 			downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-				Manifest:       manifest,
-				FileID:         entry.ID,
-				OutRoot:        outRoot,
-				OutFile:        "",
-				AcceptEncoding: acceptEncoding,
-				AckEveryBytes:  ackEvery,
-				SyncEveryBytes: syncEvery,
+				Manifest:        manifest,
+				FileID:          entry.ID,
+				OutRoot:         outRoot,
+				OutFile:         "",
+				AcceptEncoding:  acceptEncoding,
+				AckEveryBytes:   ackEvery,
+				SyncEveryBytes:  syncEvery,
 				ProgressUpdates: progressUpdates,
+				OnAck:           onAck,
 			})
 			if err != nil {
 				errCh <- fmt.Errorf("id=%d: %w", entry.ID, err)
 				continue
 			}
 			completed.Add(1)
-			printFileMetrics(stdout, manifest.TransferID, entry.ID, downloadResp.DestinationPath, downloadResp.Meta, time.Since(startOne))
+			totalTransferred.Add(downloadResp.Meta.Size)
+			printStartFileSummary(stdout, txferID, entry.ID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, time.Since(startOne))
 		}
 	}
 
@@ -373,14 +407,21 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "start error: %v\n", err)
 	}
 
+	elapsedAll := time.Since(startAll)
+	overallSpeed := 0.0
+	if elapsedAll > 0 {
+		overallSpeed = float64(totalTransferred.Load()) / elapsedAll.Seconds()
+	}
 	fmt.Fprintf(
 		stdout,
-		"start complete: tid=%s requested=%d downloaded=%d failed=%d elapsed=%s\n",
-		manifest.TransferID,
+		"start complete: tid=%s requested=%d downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
+		txferID,
 		len(manifest.Entries),
 		completed.Load(),
 		failures,
-		time.Since(startAll).Round(time.Millisecond),
+		humanBytes(totalTransferred.Load()),
+		humanRate(overallSpeed),
+		elapsedAll.Round(time.Millisecond),
 	)
 	if failures > 0 {
 		return 1
@@ -388,28 +429,83 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	return 0
 }
 
+func printStartFileSummary(stdout io.Writer, txferID string, fileID uint64, path string, meta FileFrameMeta, localFileHash string, elapsed time.Duration) {
+	seconds := elapsed.Seconds()
+	if seconds <= 0 {
+		seconds = 0.000001
+	}
+	speed := float64(meta.Size) / seconds
+	compSummary := formatCompSummary(meta)
+	checksum := "[x]"
+	if meta.FileHashToken != "" && localFileHash != "" && strings.EqualFold(meta.FileHashToken, localFileHash) {
+		checksum = "[ok]"
+	}
+	fmt.Fprintf(
+		stdout,
+		"start-file: tid=%s fd=%d path=%s checksum=%s comp=%s rate=%s\n",
+		txferID,
+		fileID,
+		path,
+		checksum,
+		compSummary,
+		humanRate(speed),
+	)
+}
+
+func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(defaultVerboseStatusInterval)
+		defer ticker.Stop()
+		for {
+			statusResp, statusErr := client.GetTransferStatus(ctx, GetTransferStatusRequest{
+				TransferID: txferID,
+			})
+			if statusErr != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				fmt.Fprintf(stderr, "status refresh failed: %v\n", statusErr)
+			} else {
+				fmt.Fprintf(
+					stderr,
+					"transfer-progress: tid=%s files=%.2f%% bytes=%.2f%%\n",
+					txferID,
+					statusResp.Status.PercentFiles,
+					statusResp.Status.PercentBytes,
+				)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
 func parseFileID(raw string) (uint64, error) {
 	return strconv.ParseUint(raw, 10, 64)
 }
 
-func loadManifestForTransfer(txferID string, manifestPath string) (*Manifest, string, error) {
-	if manifestPath == "" {
-		manifestPath = txferID + ".fm1"
-	}
-	manifest, err := LoadManifest(manifestPath)
-	if err != nil {
-		return nil, "", err
-	}
-	if manifest.TransferID != txferID {
-		return nil, "", fmt.Errorf("manifest transfer id mismatch: expected %s got %s", txferID, manifest.TransferID)
-	}
-	return manifest, manifestPath, nil
+func loadManifestForStart(txferID string, manifestPath string) (*Manifest, string, string, error) {
+	return loadManifestWithOptionalTID("start", txferID, manifestPath)
 }
 
 func loadManifestForGet(txferID string, manifestPath string) (*Manifest, string, string, error) {
+	return loadManifestWithOptionalTID("get", txferID, manifestPath)
+}
+
+func loadManifestWithOptionalTID(cmd string, txferID string, manifestPath string) (*Manifest, string, string, error) {
 	if manifestPath == "" {
 		if txferID == "" {
-			return nil, "", "", errors.New("get requires --manifest when --tid is not provided")
+			return nil, "", "", fmt.Errorf("%s requires --manifest when --tid is not provided", cmd)
 		}
 		manifestPath = txferID + ".fm1"
 	}
@@ -558,7 +654,94 @@ func startProgressWriter(progressPath string, initial map[uint64]int64, updates 
 	}
 }
 
-func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path string, meta FileFrameMeta, elapsed time.Duration) {
+type ackMilestoneReporter struct {
+	mu      sync.Mutex
+	stderr  io.Writer
+	nextPct map[string]int64
+	state   map[string]ackProgressState
+}
+
+type ackProgressState struct {
+	lastAck   int64
+	firstAck  int64
+	firstTime time.Time
+}
+
+func newAckMilestoneReporter(stderr io.Writer) *ackMilestoneReporter {
+	return &ackMilestoneReporter{
+		stderr:  stderr,
+		nextPct: make(map[string]int64),
+		state:   make(map[string]ackProgressState),
+	}
+}
+
+func (r *ackMilestoneReporter) Report(evt AckProgressEvent) {
+	if r == nil || r.stderr == nil || evt.TargetBytes <= 0 {
+		return
+	}
+	key := fmt.Sprintf("%s/%d", evt.TransferID, evt.FileID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.state[key]
+	if st.firstTime.IsZero() {
+		st.firstTime = evt.AckTime
+		st.firstAck = evt.AckBytes
+	}
+
+	next := r.nextPct[key]
+	if next == 0 {
+		next = 10
+	}
+	progress := int64((evt.AckBytes * 100) / evt.TargetBytes)
+	if progress > 100 {
+		progress = 100
+	}
+	for next <= 100 && progress >= next {
+		prevAck := st.lastAck
+		deltaBytes := evt.AckBytes - prevAck
+		rateBps := 0.0
+		if !evt.PrevAckTime.IsZero() && evt.AckTime.After(evt.PrevAckTime) && deltaBytes > 0 {
+			rateBps = float64(deltaBytes) / evt.AckTime.Sub(evt.PrevAckTime).Seconds()
+		}
+		if rateBps <= 0 && !st.firstTime.IsZero() && evt.AckTime.After(st.firstTime) {
+			totalBytes := evt.AckBytes - st.firstAck
+			if totalBytes > 0 {
+				rateBps = float64(totalBytes) / evt.AckTime.Sub(st.firstTime).Seconds()
+			}
+		}
+		eta := "n/a"
+		if rateBps > 0 && evt.AckBytes < evt.TargetBytes {
+			remaining := evt.TargetBytes - evt.AckBytes
+			eta = humanETA(time.Duration(float64(remaining) / rateBps * float64(time.Second)))
+		}
+		fmt.Fprintf(
+			r.stderr,
+			"progress: tid=%s fd=%d %d%% (bytes=%d/%d) rate=%s eta=%s\n",
+			evt.TransferID,
+			evt.FileID,
+			next,
+			evt.AckBytes,
+			evt.TargetBytes,
+			humanRate(rateBps),
+			eta,
+		)
+		next += 10
+	}
+	r.nextPct[key] = next
+	if evt.AckBytes > st.lastAck {
+		st.lastAck = evt.AckBytes
+	}
+	r.state[key] = st
+}
+
+func humanETA(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	return d.Round(time.Second).String()
+}
+
+func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path string, meta FileFrameMeta, localFileHash string, elapsed time.Duration) {
 	seconds := elapsed.Seconds()
 	if seconds <= 0 {
 		seconds = 0.000001
@@ -568,10 +751,6 @@ func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path stri
 	if meta.WireSize > 0 {
 		ratio = float64(meta.Size) / float64(meta.WireSize)
 	}
-	var savings float64
-	if meta.Size > 0 {
-		savings = (1.0 - float64(meta.WireSize)/float64(meta.Size)) * 100.0
-	}
 	serverFrameMS := meta.TrailerTS - meta.HeaderTS
 	serverLogicalBps := 0.0
 	serverWireBps := 0.0
@@ -580,19 +759,27 @@ func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path stri
 		serverLogicalBps = float64(meta.Size) / serverSeconds
 		serverWireBps = float64(meta.WireSize) / serverSeconds
 	}
+	serverFileHash := meta.FileHashToken
+	if serverFileHash == "" {
+		serverFileHash = "n/a"
+	}
+	if localFileHash == "" {
+		localFileHash = "n/a"
+	}
+	compSummary := formatCompSummary(meta)
 	fmt.Fprintf(
 		stdout,
-		"file: tid=%s fd=%d\n  path: %s\n  transfer: comp=%s logical=%d wire=%d speed=%s ratio=%.3f savings=%.2f%%\n  checksum: hash=%s\n  timing: elapsed=%s ts0=%d ts1=%d server_frame_ms=%d server_logical=%s server_wire=%s\n\n",
+		"file: tid=%s fd=%d\n  path: %s\n  transfer: comp=%s logical=%d wire=%d speed=%s ratio=%.3f\n  checksum: server=%s client=%s\n  timing: elapsed=%s ts0=%d ts1=%d server_frame_ms=%d server_logical=%s server_wire=%s\n\n",
 		txferID,
 		fileID,
 		path,
-		meta.Comp,
+		compSummary,
 		meta.Size,
 		meta.WireSize,
 		humanRate(speed),
 		ratio,
-		savings,
-		meta.HashToken,
+		serverFileHash,
+		localFileHash,
 		elapsed.Round(time.Millisecond),
 		meta.HeaderTS,
 		meta.TrailerTS,
@@ -600,6 +787,31 @@ func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path stri
 		humanRate(serverLogicalBps),
 		humanRate(serverWireBps),
 	)
+}
+
+func formatCompSummary(meta FileFrameMeta) string {
+	if len(meta.CompCounts) == 0 {
+		return meta.Comp
+	}
+	parts := make([]string, 0, len(meta.CompCounts))
+	preferred := []string{"lz4", "zstd", "none"}
+	used := make(map[string]bool, len(preferred))
+	for _, key := range preferred {
+		if count, ok := meta.CompCounts[key]; ok && count > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", key, count))
+			used[key] = true
+		}
+	}
+	other := make([]string, 0, len(meta.CompCounts))
+	for key, count := range meta.CompCounts {
+		if count <= 0 || used[key] {
+			continue
+		}
+		other = append(other, fmt.Sprintf("%s=%d", key, count))
+	}
+	sort.Strings(other)
+	parts = append(parts, other...)
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 
 func humanRate(bps float64) string {
@@ -616,4 +828,21 @@ func humanRate(bps float64) string {
 		return fmt.Sprintf("%.0f %s", bps, units[unit])
 	}
 	return fmt.Sprintf("%.2f %s", bps, units[unit])
+}
+
+func humanBytes(v int64) string {
+	if v <= 0 {
+		return "0 B"
+	}
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	value := float64(v)
+	unit := 0
+	for value >= 1024 && unit < len(units)-1 {
+		value /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%.0f %s", value, units[unit])
+	}
+	return fmt.Sprintf("%.2f %s", value, units[unit])
 }

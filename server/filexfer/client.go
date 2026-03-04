@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +47,7 @@ type ManifestEntry struct {
 type FileFrameMeta struct {
 	FileID          uint64
 	Comp            string
+	CompCounts      map[string]uint64
 	Enc             string
 	Offset          int64
 	Size            int64
@@ -60,15 +60,16 @@ type FileFrameMeta struct {
 }
 
 type DownloadFileRequest struct {
-	Manifest       *Manifest
-	FileID         uint64
-	OutRoot        string
-	OutFile        string
-	Stdout         io.Writer
-	AcceptEncoding string
-	AckEveryBytes  int64
-	SyncEveryBytes int64
+	Manifest        *Manifest
+	FileID          uint64
+	OutRoot         string
+	OutFile         string
+	Stdout          io.Writer
+	AcceptEncoding  string
+	AckEveryBytes   int64
+	SyncEveryBytes  int64
 	ProgressUpdates chan<- DownloadProgressUpdate
+	OnAck           func(AckProgressEvent)
 }
 
 type DownloadProgressUpdate struct {
@@ -76,9 +77,19 @@ type DownloadProgressUpdate struct {
 	AckBytes int64
 }
 
+type AckProgressEvent struct {
+	TransferID  string
+	FileID      uint64
+	AckBytes    int64
+	TargetBytes int64
+	PrevAckTime time.Time
+	AckTime     time.Time
+}
+
 type DownloadFileResponse struct {
 	DestinationPath string
 	Meta            FileFrameMeta
+	LocalFileHash   string
 }
 
 type FetchManifestRequest struct {
@@ -410,13 +421,14 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	}
 
 	if fileWriter == nil {
+		localHasher := xxh3.New128()
 		reader, meta, err := c.fetchFileWindow(ctx, req.Manifest.TransferID, req.FileID, serverPath, req.AcceptEncoding, 0, -1)
 		if err != nil {
 			return DownloadFileResponse{}, err
 		}
 		frameBufSize := effectiveFrameReadBufferSize(c.FrameBufferBytes, meta.MaxWireSizeHint, c.MaxFrameReadBufferBytes)
 		frameBuf = make([]byte, frameBufSize)
-		copyErr := copyStream(writer, reader, frameBuf, nil)
+		copyErr := copyStream(writer, reader, frameBuf, localHasher)
 		closeReadErr := reader.Close()
 		closeWriteErr := closeWriter()
 		if copyErr != nil {
@@ -428,7 +440,15 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		if closeWriteErr != nil {
 			return DownloadFileResponse{}, fmt.Errorf("close output file: %w", closeWriteErr)
 		}
-		return DownloadFileResponse{DestinationPath: destPath, Meta: *meta}, nil
+		localHash := formatXXH128HashToken(localHasher.Sum128())
+		if meta.FileHashToken != "" && !strings.EqualFold(meta.FileHashToken, localHash) {
+			return DownloadFileResponse{}, fmt.Errorf("file hash mismatch: server=%s client=%s", meta.FileHashToken, localHash)
+		}
+		return DownloadFileResponse{
+			DestinationPath: destPath,
+			Meta:            *meta,
+			LocalFileHash:   localHash,
+		}, nil
 	}
 
 	totalSize := entry.Size
@@ -460,9 +480,11 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	go func() {
 		defer close(ackDone)
 		c.runAckWorker(ackCtx, ackQueue, ackErrCh, ackRequestBase{
-			TransferID: req.Manifest.TransferID,
-			FileID:     req.FileID,
-			FullPath:   serverPath,
+			TransferID:      req.Manifest.TransferID,
+			FileID:          req.FileID,
+			FullPath:        serverPath,
+			TargetBytes:     entry.Size,
+			OnAck:           req.OnAck,
 			ProgressUpdates: req.ProgressUpdates,
 		})
 	}()
@@ -560,6 +582,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 
 		if firstMeta == nil {
 			tmp := *windowMeta
+			tmp.CompCounts = copyCompCounts(windowMeta.CompCounts)
 			firstMeta = &tmp
 			resultMeta = tmp
 		} else {
@@ -570,6 +593,10 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			resultMeta.WireSize += windowMeta.WireSize
 			resultMeta.TrailerTS = windowMeta.TrailerTS
 			resultMeta.HashToken = windowMeta.HashToken
+			mergeCompCounts(resultMeta.CompCounts, windowMeta.CompCounts)
+			if windowMeta.FileHashToken != "" {
+				resultMeta.FileHashToken = windowMeta.FileHashToken
+			}
 		}
 	}
 	if firstMeta == nil {
@@ -621,7 +648,11 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	if closeWriteErr != nil {
 		return DownloadFileResponse{}, fmt.Errorf("close output file: %w", closeWriteErr)
 	}
-	return DownloadFileResponse{DestinationPath: destPath, Meta: resultMeta}, nil
+	return DownloadFileResponse{
+		DestinationPath: destPath,
+		Meta:            resultMeta,
+		LocalFileHash:   fullHash,
+	}, nil
 }
 
 func (c *Client) GetTransferStatus(ctx context.Context, request GetTransferStatusRequest) (GetTransferStatusResponse, error) {
@@ -730,19 +761,21 @@ func buildAckToken(ackBytes int64, serverTS int64, hashToken string) (string, er
 }
 
 type ackEvent struct {
-	AckBytes  int64
-	ServerTS  int64
-	HashToken string
+	AckBytes   int64
+	ServerTS   int64
+	HashToken  string
 	DeltaBytes int64
 	RecvMS     int64
 	SyncMS     int64
-	Final     bool
+	Final      bool
 }
 
 type ackRequestBase struct {
-	TransferID string
-	FileID     uint64
-	FullPath   string
+	TransferID      string
+	FileID          uint64
+	FullPath        string
+	TargetBytes     int64
+	OnAck           func(AckProgressEvent)
 	ProgressUpdates chan<- DownloadProgressUpdate
 }
 
@@ -772,6 +805,7 @@ func waitAckWorker(ackErrCh <-chan error) error {
 }
 
 func (c *Client) runAckWorker(ctx context.Context, ackQueue <-chan ackEvent, ackErrCh chan<- error, base ackRequestBase) {
+	var prevAckTime time.Time
 	for evt := range ackQueue {
 		req := AcknowledgeFileProgressRequest{
 			TransferID: base.TransferID,
@@ -811,6 +845,18 @@ func (c *Client) runAckWorker(ctx context.Context, ackQueue <-chan ackEvent, ack
 			default:
 			}
 		}
+		if evt.AckBytes >= 0 && base.OnAck != nil {
+			ackTime := time.Now()
+			base.OnAck(AckProgressEvent{
+				TransferID:  base.TransferID,
+				FileID:      base.FileID,
+				AckBytes:    evt.AckBytes,
+				TargetBytes: base.TargetBytes,
+				PrevAckTime: prevAckTime,
+				AckTime:     ackTime,
+			})
+			prevAckTime = ackTime
+		}
 	}
 }
 
@@ -841,6 +887,29 @@ func retryAck(ctx context.Context, fn func(context.Context) error) error {
 
 func copyStream(dst io.Writer, src io.Reader, buf []byte, hash *xxh3.Hasher128) error {
 	return copyStreamWithProgress(dst, src, buf, hash, nil)
+}
+
+func copyCompCounts(src map[string]uint64) map[string]uint64 {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]uint64, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func mergeCompCounts(dst map[string]uint64, src map[string]uint64) {
+	if len(src) == 0 {
+		return
+	}
+	if dst == nil {
+		return
+	}
+	for k, v := range src {
+		dst[k] += v
+	}
 }
 
 func copyStreamWithProgress(dst io.Writer, src io.Reader, buf []byte, hash *xxh3.Hasher128, onWrite func(written int64) error) error {
@@ -1179,7 +1248,7 @@ type fileStream struct {
 
 	frameMeta   FileFrameMeta
 	logical     io.ReadCloser
-	hash        *xxh3.Hasher128
+	frameHash   *xxh3.Hasher
 	logicalRead int64
 
 	expectOffset    bool
@@ -1233,7 +1302,6 @@ func (s *fileStream) Read(p []byte) (int, error) {
 
 		n, err := s.logical.Read(p)
 		if n > 0 {
-			_, _ = s.hash.Write(p[:n])
 			s.logicalRead += int64(n)
 		}
 		if err == nil {
@@ -1322,13 +1390,15 @@ func (s *fileStream) openNextFrame() error {
 	}
 
 	payloadReader := io.LimitReader(s.br, meta.WireSize)
+	s.frameHash = xxh3.New()
+	_, _ = s.frameHash.Write([]byte(headerLine))
+	payloadReader = io.TeeReader(payloadReader, s.frameHash)
 	logicalReader, err := decodePayloadReaderByComp(payloadReader, meta.Comp)
 	if err != nil {
 		return fmt.Errorf("decode payload reader: %w", err)
 	}
 	s.frameMeta = meta
 	s.logical = logicalReader
-	s.hash = xxh3.New128()
 	s.logicalRead = 0
 	s.expectOffset = false
 	s.expectNextFrame = false
@@ -1350,8 +1420,11 @@ func (s *fileStream) finishFrame() error {
 	if trailer.FileID != s.frameMeta.FileID {
 		return fmt.Errorf("trailer file id mismatch: header=%d trailer=%d", s.frameMeta.FileID, trailer.FileID)
 	}
-	actual := s.hash.Sum128()
-	if err := validateTrailerHashToken(trailer.HashToken, actual); err != nil {
+	if s.frameHash == nil {
+		return errors.New("missing frame hash state")
+	}
+	_, _ = s.frameHash.Write([]byte(trailer.ChecksumPrefix))
+	if err := validateFrameHashToken(trailer.HashToken, s.frameHash.Sum64()); err != nil {
 		return err
 	}
 
@@ -1371,6 +1444,10 @@ func (s *fileStream) finishFrame() error {
 
 	s.meta.Size += s.frameMeta.Size
 	s.meta.WireSize += s.frameMeta.WireSize
+	if s.meta.CompCounts == nil {
+		s.meta.CompCounts = make(map[string]uint64, 3)
+	}
+	s.meta.CompCounts[s.frameMeta.Comp]++
 	if s.meta.Comp != s.frameMeta.Comp {
 		s.meta.Comp = "mixed"
 	}
@@ -1382,6 +1459,7 @@ func (s *fileStream) finishFrame() error {
 
 	closeErr := s.logical.Close()
 	s.logical = nil
+	s.frameHash = nil
 	return closeErr
 }
 
@@ -1461,15 +1539,20 @@ func parseHeaderInt(raw string, key string) (int64, error) {
 }
 
 type frameTrailer struct {
-	FileID        uint64
-	TS            int64
-	HashToken     string
-	FileHashToken string
-	Next          *int64
+	FileID         uint64
+	TS             int64
+	HashToken      string
+	FileHashToken  string
+	ChecksumPrefix string
+	Next           *int64
 }
 
 func parseFXTrailer(line string) (frameTrailer, error) {
-	fields := strings.Fields(line)
+	prefix, hashToken, err := splitTrailerPrefixAndHash(line)
+	if err != nil {
+		return frameTrailer{}, err
+	}
+	fields := strings.Fields(prefix)
 	if len(fields) < 3 || fields[0] != "FXT/1" {
 		return frameTrailer{}, errors.New("invalid FXT/1 trailer")
 	}
@@ -1478,7 +1561,6 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 		return frameTrailer{}, fmt.Errorf("invalid trailer file id: %w", err)
 	}
 	status := ""
-	var hashToken string
 	var fileHashToken string
 	var ts int64 = -1
 	var nextOffset *int64
@@ -1493,9 +1575,6 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 				return frameTrailer{}, errors.New("invalid trailer ts")
 			}
 			ts = parsedTS
-		}
-		if strings.HasPrefix(token, "hash=") {
-			hashToken = strings.TrimPrefix(token, "hash=")
 		}
 		if strings.HasPrefix(token, "file-hash=") {
 			fileHashToken = strings.TrimPrefix(token, "file-hash=")
@@ -1522,12 +1601,26 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 		return frameTrailer{}, errors.New("trailer invalid file hash token")
 	}
 	return frameTrailer{
-		FileID:        fileID,
-		TS:            ts,
-		HashToken:     hashToken,
-		FileHashToken: fileHashToken,
-		Next:          nextOffset,
+		FileID:         fileID,
+		TS:             ts,
+		HashToken:      hashToken,
+		FileHashToken:  fileHashToken,
+		ChecksumPrefix: prefix,
+		Next:           nextOffset,
 	}, nil
+}
+
+func splitTrailerPrefixAndHash(line string) (string, string, error) {
+	idx := strings.LastIndex(line, " hash=")
+	if idx <= 0 {
+		return "", "", errors.New("trailer missing hash token")
+	}
+	prefix := line[:idx]
+	hashToken := strings.TrimSpace(line[idx+len(" hash="):])
+	if !validHashToken(hashToken) {
+		return "", "", errors.New("trailer missing or invalid hash token")
+	}
+	return prefix, hashToken, nil
 }
 
 func validHashToken(raw string) bool {
@@ -1538,28 +1631,23 @@ func validHashToken(raw string) bool {
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
-func validateTrailerHashToken(token string, actual xxh3.Uint128) error {
+func validateFrameHashToken(token string, actual uint64) error {
 	parts := strings.SplitN(token, ":", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return errors.New("invalid trailer hash token")
+		return errors.New("invalid frame hash token")
 	}
 	algo := strings.ToLower(parts[0])
-	value := strings.ToLower(parts[1])
 	switch algo {
-	case "xxh128":
-		expected := hash128Hex(actual)
+	case "xxh64":
+		expected := fmt.Sprintf("%016x", actual)
+		value := strings.ToLower(parts[1])
 		if value != expected {
-			return fmt.Errorf("xxh128 mismatch: trailer=%s actual=%s", value, expected)
+			return fmt.Errorf("xxh64 mismatch: trailer=%s actual=%s", value, expected)
 		}
 		return nil
 	default:
-		return fmt.Errorf("unsupported trailer hash algorithm: %s", parts[0])
+		return fmt.Errorf("unsupported frame hash algorithm: %s", parts[0])
 	}
-}
-
-func hash128Hex(v xxh3.Uint128) string {
-	b := v.Bytes()
-	return hex.EncodeToString(b[:])
 }
 
 func decodePayloadReaderByComp(payload io.Reader, comp string) (io.ReadCloser, error) {

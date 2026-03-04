@@ -121,7 +121,6 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 			HeaderHash: headerHash,
 			HeaderTS:   headerTS,
 			TrailerTS:  trailerTS,
-			HashTokens: nil,
 			FileHashes: fileHashes,
 			Next:       0,
 			Metadata:   &metadata,
@@ -146,16 +145,12 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 			chunkSize = windowSize
 		}
 
-		chunk128 := xxh3.New128()
-		chunk64 := xxh3.New()
 		reader := io.NewSectionReader(fd, cursor, chunkSize)
 		remaining := chunkSize
 		for remaining > 0 {
 			n, err := reader.Read(buf)
 			if n > 0 {
 				part := buf[:n]
-				_, _ = chunk128.Write(part)
-				_, _ = chunk64.Write(part)
 				_, _ = full128.Write(part)
 				_, _ = full64.Write(part)
 				remaining -= int64(n)
@@ -173,20 +168,19 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		chunkHashes := chunkChecksumTokens(algorithms, chunk128, chunk64)
+		rollingFileHashes := finalChecksumTokens(algorithms, full128, full64)
 		nextOffset := cursor + chunkSize
 		isTerminal := nextOffset == fileSize
 		nextValue := nextOffset
-		var fileHashes []string
+		fileHashes := rollingFileHashes
 		var meta *fileFrameMetadata
 		if isTerminal {
 			nextValue = 0
-			fileHashes = finalChecksumTokens(algorithms, full128, full64)
 			meta = &metadata
 		}
 		headerHash := "none:0"
-		if len(chunkHashes) > 0 {
-			headerHash = chunkHashes[0]
+		if len(fileHashes) > 0 {
+			headerHash = fileHashes[0]
 		}
 
 		headerTS := time.Now().UnixMilli()
@@ -201,7 +195,6 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 			HeaderHash: headerHash,
 			HeaderTS:   headerTS,
 			TrailerTS:  trailerTS,
-			HashTokens: chunkHashes,
 			FileHashes: fileHashes,
 			Next:       nextValue,
 			Metadata:   meta,
@@ -265,19 +258,6 @@ func parseRequestedChecksums(raw []string) ([]string, error) {
 		out = append(out, "xxh64")
 	}
 	return out, nil
-}
-
-func chunkChecksumTokens(algorithms []string, chunk128 *xxh3.Hasher128, chunk64 *xxh3.Hasher) []string {
-	tokens := make([]string, 0, len(algorithms))
-	for _, name := range algorithms {
-		switch name {
-		case "xxh128":
-			tokens = append(tokens, formatXXH128HashToken(chunk128.Sum128()))
-		case "xxh64":
-			tokens = append(tokens, formatXXH64HashToken(chunk64.Sum64()))
-		}
-	}
-	return tokens
 }
 
 func finalChecksumTokens(algorithms []string, full128 *xxh3.Hasher128, full64 *xxh3.Hasher) []string {

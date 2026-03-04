@@ -29,8 +29,8 @@ func TestFileChecksumHandlerDefault(t *testing.T) {
 	if !strings.Contains(body, " wsize=0 ") {
 		t.Fatalf("expected wsize=0 frame output, got %q", body)
 	}
-	if !strings.Contains(body, " hash=xxh128:") {
-		t.Fatalf("expected xxh128 hash token")
+	if !strings.Contains(body, " hash=xxh64:") {
+		t.Fatalf("expected frame xxh64 hash token")
 	}
 	if !strings.Contains(body, " file-hash=xxh128:") {
 		t.Fatalf("expected final file-hash token")
@@ -81,7 +81,13 @@ func TestFileChecksumHandlerWindowAndAlgorithms(t *testing.T) {
 	expected64 := formatXXH64HashToken(xxh3.Hash(content))
 	body := w.Body.String()
 	if !strings.Contains(body, " hash=xxh64:") {
-		t.Fatalf("expected per-window xxh64 hash tokens")
+		t.Fatalf("expected frame xxh64 hash tokens")
+	}
+	if strings.Count(body, " file-hash=xxh128:") < 3 {
+		t.Fatalf("expected rolling file-hash xxh128 snapshots on every frame")
+	}
+	if strings.Count(body, " file-hash=xxh64:") < 3 {
+		t.Fatalf("expected rolling file-hash xxh64 snapshots on every frame")
 	}
 	if !strings.Contains(body, " file-hash="+expected128) {
 		t.Fatalf("missing expected full xxh128 token")

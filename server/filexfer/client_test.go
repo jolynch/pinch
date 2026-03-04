@@ -32,6 +32,16 @@ func xxh128HexTest(data []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
+func frameHash64Token(header string, payload []byte, trailerPrefix string) string {
+	h := xxh3.New()
+	_, _ = h.Write([]byte(header))
+	if len(payload) > 0 {
+		_, _ = h.Write(payload)
+	}
+	_, _ = h.Write([]byte(trailerPrefix))
+	return formatXXH64HashToken(h.Sum64())
+}
+
 func buildFXFrame(t *testing.T, fileID uint64, comp string, offset int64, logical []byte, next *int64) string {
 	t.Helper()
 	payload, err := encodeSingleFramePayload(logical, comp)
@@ -41,12 +51,8 @@ func buildFXFrame(t *testing.T, fileID uint64, comp string, offset int64, logica
 	headerTS := int64(1000 + offset)
 	trailerTS := headerTS + 1
 	xsum := xxh128HexTest(logical)
-	trailer := fmt.Sprintf("FXT/1 %d status=ok ts=%d hash=xxh128:%s", fileID, trailerTS, xsum)
-	if next != nil {
-		trailer += fmt.Sprintf(" next=%d", *next)
-	}
-	return fmt.Sprintf(
-		"FX/1 %d offset=%d size=%d wsize=%d comp=%s enc=none hash=xxh128:%s ts=%d\n%s%s\n",
+	header := fmt.Sprintf(
+		"FX/1 %d offset=%d size=%d wsize=%d comp=%s enc=none hash=xxh128:%s ts=%d\n",
 		fileID,
 		offset,
 		len(logical),
@@ -54,9 +60,13 @@ func buildFXFrame(t *testing.T, fileID uint64, comp string, offset int64, logica
 		comp,
 		xsum,
 		headerTS,
-		string(payload),
-		trailer,
 	)
+	trailerPrefix := fmt.Sprintf("FXT/1 %d status=ok ts=%d", fileID, trailerTS)
+	if next != nil {
+		trailerPrefix += fmt.Sprintf(" next=%d", *next)
+	}
+	trailer := trailerPrefix + " hash=" + frameHash64Token(header, payload, trailerPrefix)
+	return header + string(payload) + trailer + "\n"
 }
 
 func TestParseFXHeaderMaxWSizeHint(t *testing.T) {
@@ -201,13 +211,14 @@ func TestFetchFileRejectsChecksumMismatch(t *testing.T) {
 		t.Fatalf("encode payload: %v", err)
 	}
 	frame := fmt.Sprintf(
-		"FX/1 0 offset=0 size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n%sFXT/1 0 status=ok ts=1001 hash=xxh128:%s\n",
+		"FX/1 0 offset=0 size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n",
 		len(logical),
 		len(payload),
 		"00000000000000000000000000000000",
-		string(payload),
-		"00000000000000000000000000000000",
 	)
+	trailerPrefix := "FXT/1 0 status=ok ts=1001"
+	badHash := "xxh64:0000000000000000"
+	frame += string(payload) + trailerPrefix + " hash=" + badHash + "\n"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(frame))
 	}))
@@ -248,7 +259,10 @@ func TestFetchFileRejectsMalformedTrailer(t *testing.T) {
 }
 
 func TestFetchFileRejectsPayloadLengthMismatch(t *testing.T) {
-	frame := "FX/1 0 offset=0 size=5 wsize=8 comp=none enc=none hash=xxh128:00000000000000000000000000000000 ts=1000\nhelloFXT/1 0 status=ok ts=1001 hash=xxh128:00000000000000000000000000000000\n"
+	header := "FX/1 0 offset=0 size=5 wsize=8 comp=none enc=none hash=xxh128:00000000000000000000000000000000 ts=1000\n"
+	payload := []byte("hello")
+	trailerPrefix := "FXT/1 0 status=ok ts=1001"
+	frame := header + string(payload) + trailerPrefix + " hash=" + frameHash64Token(header, payload, trailerPrefix) + "\n"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(frame))
 	}))
@@ -266,14 +280,14 @@ func TestFetchFileRejectsPayloadLengthMismatch(t *testing.T) {
 
 func TestFetchFileRejectsUnsupportedEnc(t *testing.T) {
 	logical := []byte("hello")
-	frame := fmt.Sprintf(
-		"FX/1 0 offset=0 size=%d wsize=%d comp=none enc=age hash=xxh128:%s ts=1000\n%sFXT/1 0 status=ok ts=1001 hash=xxh128:%s\n",
+	header := fmt.Sprintf(
+		"FX/1 0 offset=0 size=%d wsize=%d comp=none enc=age hash=xxh128:%s ts=1000\n",
 		len(logical),
 		len(logical),
-		xxh128HexTest(logical),
-		string(logical),
 		xxh128HexTest(logical),
 	)
+	trailerPrefix := "FXT/1 0 status=ok ts=1001"
+	frame := header + string(logical) + trailerPrefix + " hash=" + frameHash64Token(header, logical, trailerPrefix) + "\n"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(frame))
 	}))
@@ -423,6 +437,62 @@ func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 	}
 	if !sawDataReq || !sawAckReq {
 		t.Fatalf("expected both data and ack-only requests")
+	}
+}
+
+func TestDownloadFileFromManifestOnAckCallback(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txack",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	logical := []byte("hello")
+	var events []AckProgressEvent
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/fs/file/txack/0" {
+			frame := buildFXFrame(t, 0, "none", 0, logical, nil)
+			_, _ = w.Write([]byte(frame))
+			return
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/fs/file/txack/0/ack" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, nil)
+	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:       manifest,
+		FileID:         0,
+		OutRoot:        outRoot,
+		AcceptEncoding: defaultCLIEncodings,
+		AckEveryBytes:  1,
+		SyncEveryBytes: 1,
+		OnAck: func(evt AckProgressEvent) {
+			events = append(events, evt)
+		},
+	})
+	if err != nil {
+		t.Fatalf("DownloadFileFromManifest failed: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected at least one ack progress event")
+	}
+	last := events[len(events)-1]
+	if last.AckBytes != 5 || last.TargetBytes != 5 {
+		t.Fatalf("unexpected final ack bytes/target: %+v", last)
+	}
+	if last.AckTime.IsZero() {
+		t.Fatalf("expected non-zero ack time")
+	}
+	if len(events) > 1 && last.PrevAckTime.IsZero() {
+		t.Fatalf("expected non-zero previous ack time when multiple events are present")
 	}
 }
 

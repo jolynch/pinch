@@ -21,17 +21,20 @@ func xxh128HexCLI(data []byte) string {
 
 func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 	xsum := xxh128HexCLI(body)
-	return fmt.Sprintf(
-		"FX/1 %d offset=%d size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n%sFXT/1 %d status=ok ts=1001 hash=xxh128:%s\n",
+	header := fmt.Sprintf(
+		"FX/1 %d offset=%d size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n",
 		fileID,
 		offset,
 		len(body),
 		len(body),
 		xsum,
-		string(body),
-		fileID,
-		xsum,
 	)
+	trailerPrefix := fmt.Sprintf("FXT/1 %d status=ok ts=1001", fileID)
+	h := xxh3.New()
+	_, _ = h.Write([]byte(header))
+	_, _ = h.Write(body)
+	_, _ = h.Write([]byte(trailerPrefix))
+	return fmt.Sprintf("%s%s%s hash=xxh64:%016x\n", header, string(body), trailerPrefix, h.Sum64())
 }
 
 func TestRunCLITransferAndGet(t *testing.T) {
@@ -275,7 +278,7 @@ func TestRunCLIGetWritesProgressFile(t *testing.T) {
 	var stderr bytes.Buffer
 	outRoot := filepath.Join(tmp, "out")
 	code := RunCLI(
-		[]string{srv.URL, "get", "--tid", "txp", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot},
+		[]string{srv.URL, "get", "--tid", "txp", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-v"},
 		&stdout,
 		&stderr,
 	)
@@ -289,6 +292,12 @@ func TestRunCLIGetWritesProgressFile(t *testing.T) {
 	}
 	if !strings.Contains(string(progressRaw), "0 5") {
 		t.Fatalf("expected progress file to contain final ack, got %q", string(progressRaw))
+	}
+	if !strings.Contains(stderr.String(), "progress: tid=txp fd=0 10%") {
+		t.Fatalf("expected 10%% progress output, got: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "progress: tid=txp fd=0 100%") {
+		t.Fatalf("expected 100%% progress output, got: %s", stderr.String())
 	}
 }
 

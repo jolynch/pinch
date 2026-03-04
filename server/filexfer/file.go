@@ -218,7 +218,6 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 			HeaderTS:     headerTS,
 			Payload:      framePayload,
 			TrailerTS:    trailerTS,
-			HashTokens:   []string{headerHash},
 			FileHashes:   fileHashes,
 			Next:         nextValue,
 			Metadata:     terminalMD,
@@ -514,10 +513,10 @@ func prepareFramePayload(fd *os.File, compressors *frameCompressor, mode Compres
 }
 
 type frameCompressor struct {
-	buf          bytes.Buffer
-	zstdEnc      *zstd.Encoder
-	zstdFastEnc  *zstd.Encoder
-	lz4Enc       *lz4.Writer
+	buf         bytes.Buffer
+	zstdEnc     *zstd.Encoder
+	zstdFastEnc *zstd.Encoder
+	lz4Enc      *lz4.Writer
 }
 
 func newFrameCompressor() (*frameCompressor, error) {
