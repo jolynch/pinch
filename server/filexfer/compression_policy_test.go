@@ -46,8 +46,8 @@ func TestCompressionPolicyUpgradesStepwise(t *testing.T) {
 			mode = d.Next
 		}
 	}
-	if mode != CompressionModeZstdDefault {
-		t.Fatalf("expected mode to upgrade to zstd default, got %v", mode)
+	if mode != CompressionModeZstdLevel1 {
+		t.Fatalf("expected mode to upgrade to zstd level1, got %v", mode)
 	}
 }
 

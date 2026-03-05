@@ -12,19 +12,19 @@ const (
 )
 
 const (
-	compressionPolicyWindowSize             = 8
-	compressionPolicyHysteresisStreak       = 2
-	compressionPolicyDowngradeRatio         = 0.90
-	compressionPolicyDowngradePrepareOverW  = 1.10
-	compressionPolicyUpgradeRatio           = 1.05
-	compressionPolicyUpgradePrepareOverW    = 0.70
+	compressionPolicyWindowSize            = 8
+	compressionPolicyHysteresisStreak      = 2
+	compressionPolicyDowngradeRatio        = 0.90
+	compressionPolicyDowngradePrepareOverW = 1.10
+	compressionPolicyUpgradeRatio          = 1.05
+	compressionPolicyUpgradePrepareOverW   = 0.70
 )
 
 type CompressionMetrics struct {
-	LogicalSize     int64
-	WireSize        int64
-	PrepareLatency  time.Duration
-	WriteLatency    time.Duration
+	LogicalSize    int64
+	WireSize       int64
+	PrepareLatency time.Duration
+	WriteLatency   time.Duration
 }
 
 type CompressionDecision struct {
@@ -152,10 +152,8 @@ func upgradeMode(current CompressionMode) CompressionMode {
 		return CompressionModeLz4
 	case CompressionModeLz4:
 		return CompressionModeZstdLevel1
-	case CompressionModeZstdLevel1:
-		return CompressionModeZstdDefault
 	default:
-		return CompressionModeZstdDefault
+		return CompressionModeZstdLevel1
 	}
 }
 
@@ -165,7 +163,7 @@ func compressionModeFromStored(raw uint8) CompressionMode {
 	case CompressionModeZstdDefault, CompressionModeZstdLevel1, CompressionModeLz4, CompressionModeNone:
 		return mode
 	default:
-		return CompressionModeLz4
+		return CompressionModeNone
 	}
 }
 

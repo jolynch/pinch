@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -20,6 +21,8 @@ import (
 )
 
 const defaultFileFrameLogicalSize int64 = 8 * 1024 * 1024
+
+var logicalBufferPools sync.Map // map[int]*sync.Pool
 
 func FileHandler(w http.ResponseWriter, req *http.Request) {
 	txferID := req.PathValue("txferid")
@@ -105,16 +108,13 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		windowLen = logicalSizeLimit
 	}
 
-	comp := SelectEncoding(req.Header.Get("Accept-Encoding"))
-	if comp == EncodingIdentity {
-		comp = "none"
+	comp, err := parseRequestedComp(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Add("Vary", "Accept-Encoding")
-	if comp == EncodingZstd || comp == EncodingLz4 {
-		w.Header().Set("Content-Encoding", comp)
-	}
 
 	fd, err := os.Open(fullPath)
 	if err != nil {
@@ -127,23 +127,33 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	defer fd.Close()
 
-	compressors, err := newFrameCompressor()
+	requestChunkMax := min(windowLen, defaultFileFrameLogicalSize)
+	logicalBufferSize := logicalBufferBucketSize(requestChunkMax)
+	logicalBuffer, releaseLogicalBuffer, err := acquireLogicalBuffer(logicalBufferSize)
+	if err != nil {
+		http.Error(w, "failed to acquire logical frame buffer", http.StatusInternalServerError)
+		return
+	}
+	defer releaseLogicalBuffer()
+
+	adaptiveComp := comp == "adapt"
+	activeMode := initialCompressionMode(comp)
+	if mode, ok := GetTransferFileCompressionMode(txferID, fileID); ok {
+		activeMode = clampCompressionModeForAccept(mode, comp)
+	}
+	activeComp := frameCompTokenForMode(activeMode)
+	maxWSizeHint, err := maxRequestWireSizeHintBytes(comp, int64(logicalBufferSize))
+	if err != nil {
+		http.Error(w, "failed to compute frame wire-size hint", http.StatusInternalServerError)
+		return
+	}
+	compressors, err := newFrameCompressor(maxWSizeHint)
 	if err != nil {
 		http.Error(w, "failed to initialize compressors", http.StatusInternalServerError)
 		return
 	}
 	defer compressors.Close()
 
-	activeMode := initialCompressionMode(comp)
-	if mode, ok := GetTransferFileCompressionMode(txferID, fileID); ok {
-		activeMode = clampCompressionModeForAccept(mode, comp)
-	}
-	activeComp := frameCompTokenForMode(activeMode)
-	maxWSizeHint, err := maxFrameWireSizeHintBytes(activeComp, defaultFileFrameLogicalSize)
-	if err != nil {
-		http.Error(w, "failed to compute frame wire-size hint", http.StatusInternalServerError)
-		return
-	}
 	policy := NewCompressionPolicy()
 	cursor := offset
 	windowStart := offset
@@ -157,13 +167,10 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	firstFrame := true
 	for remaining := windowLen; remaining > 0; {
-		chunkLogical := remaining
-		if chunkLogical > defaultFileFrameLogicalSize {
-			chunkLogical = defaultFileFrameLogicalSize
-		}
+		chunkLogical := min(remaining, defaultFileFrameLogicalSize)
 
 		prepareStart := time.Now()
-		logicalChunk, framePayload, wireSize, chunkHash, err := prepareFramePayload(fd, compressors, activeMode, cursor, chunkLogical)
+		logicalChunk, framePayload, wireSize, chunkHash, err := prepareFramePayload(fd, compressors, activeMode, logicalBuffer, cursor, chunkLogical)
 		if err != nil {
 			http.Error(w, "failed to prepare frame payload", http.StatusInternalServerError)
 			return
@@ -228,29 +235,31 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		windowFrames++
 		windowLogicalTotal += chunkLogical
 		windowWireTotal += wireSize
-		decision := policy.Decide(activeMode, CompressionMetrics{
-			LogicalSize:    chunkLogical,
-			WireSize:       wireSize,
-			PrepareLatency: prepareLatency,
-			WriteLatency:   writeStats.WriteLatency,
-		})
-		nextMode := clampCompressionModeForAccept(decision.Next, comp)
-		if nextMode != activeMode {
-			prevComp := frameCompTokenForMode(activeMode)
-			nextComp := frameCompTokenForMode(nextMode)
-			log.Printf(
-				"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f prepare_over_write=%.3f",
-				txferID,
-				fileID,
-				prevComp,
-				nextComp,
-				decision.Reason,
-				decision.Ratio,
-				decision.PrepareOverWrite,
-			)
-			activeMode = nextMode
-			_ = SetTransferFileCompressionMode(txferID, fileID, activeMode)
-			activeComp = frameCompTokenForMode(activeMode)
+		if adaptiveComp {
+			decision := policy.Decide(activeMode, CompressionMetrics{
+				LogicalSize:    chunkLogical,
+				WireSize:       wireSize,
+				PrepareLatency: prepareLatency,
+				WriteLatency:   writeStats.WriteLatency,
+			})
+			nextMode := clampCompressionModeForAccept(decision.Next, comp)
+			if nextMode != activeMode {
+				prevComp := frameCompTokenForMode(activeMode)
+				nextComp := frameCompTokenForMode(nextMode)
+				log.Printf(
+					"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f prepare_over_write=%.3f",
+					txferID,
+					fileID,
+					prevComp,
+					nextComp,
+					decision.Reason,
+					decision.Ratio,
+					decision.PrepareOverWrite,
+				)
+				activeMode = nextMode
+				_ = SetTransferFileCompressionMode(txferID, fileID, activeMode)
+				activeComp = frameCompTokenForMode(activeMode)
+			}
 		}
 
 		cursor = nextOffset
@@ -411,17 +420,42 @@ func compressionRatio(logicalSize int64, wireSize int64) float64 {
 
 func initialCompressionMode(comp string) CompressionMode {
 	switch comp {
+	case EncodingZstd:
+		return CompressionModeZstdLevel1
 	case EncodingLz4:
 		return CompressionModeLz4
 	case "none", EncodingIdentity:
 		return CompressionModeNone
 	default:
-		return CompressionModeLz4
+		return CompressionModeNone
+	}
+}
+
+func parseRequestedComp(req *http.Request) (string, error) {
+	raw := strings.ToLower(strings.TrimSpace(req.URL.Query().Get("comp")))
+	switch raw {
+	case "":
+		// Backward compatibility for older clients.
+		raw = SelectEncoding(req.Header.Get("Accept-Encoding"))
+	}
+	switch raw {
+	case "", "adapt":
+		return "adapt", nil
+	case EncodingZstd:
+		return EncodingZstd, nil
+	case EncodingLz4:
+		return EncodingLz4, nil
+	case "none", EncodingIdentity:
+		return "none", nil
+	default:
+		return "", errors.New("invalid query parameter: comp")
 	}
 }
 
 func clampCompressionModeForAccept(mode CompressionMode, acceptedComp string) CompressionMode {
 	switch acceptedComp {
+	case EncodingZstd:
+		return CompressionModeZstdLevel1
 	case EncodingLz4:
 		if mode == CompressionModeNone {
 			return CompressionModeNone
@@ -488,18 +522,21 @@ func parseAckTelemetryQuery(values url.Values, ackBytes int64) (deltaBytes int64
 	return deltaBytes, recvMS, syncMS, nil
 }
 
-func prepareFramePayload(fd *os.File, compressors *frameCompressor, mode CompressionMode, offset int64, logicalSize int64) ([]byte, []byte, int64, xxh3.Uint128, error) {
+func prepareFramePayload(fd *os.File, compressors *frameCompressor, mode CompressionMode, logicalBuffer []byte, offset int64, logicalSize int64) ([]byte, []byte, int64, xxh3.Uint128, error) {
 	if logicalSize < 0 {
 		return nil, nil, 0, xxh3.Uint128{}, errors.New("negative logical size")
 	}
 	if compressors == nil {
 		return nil, nil, 0, xxh3.Uint128{}, errors.New("nil compressor context")
 	}
+	if logicalSize > int64(len(logicalBuffer)) {
+		return nil, nil, 0, xxh3.Uint128{}, errors.New("logical frame size exceeds reusable buffer")
+	}
 
 	if _, err := fd.Seek(offset, io.SeekStart); err != nil {
 		return nil, nil, 0, xxh3.Uint128{}, err
 	}
-	logical := make([]byte, logicalSize)
+	logical := logicalBuffer[:logicalSize]
 	if _, err := io.ReadFull(fd, logical); err != nil {
 		return nil, nil, 0, xxh3.Uint128{}, err
 	}
@@ -512,6 +549,59 @@ func prepareFramePayload(fd *os.File, compressors *frameCompressor, mode Compres
 	return logical, payload, int64(len(payload)), hash128, nil
 }
 
+func acquireLogicalBuffer(size int) ([]byte, func(), error) {
+	if size <= 0 {
+		return nil, nil, errors.New("invalid logical buffer size")
+	}
+	pool := logicalBufferPool(size)
+	raw := pool.Get()
+	buf, ok := raw.([]byte)
+	if !ok {
+		return nil, nil, errors.New("logical buffer pool returned invalid type")
+	}
+	if cap(buf) < size {
+		buf = make([]byte, size)
+	}
+	buf = buf[:size]
+	return buf, func() {
+		pool.Put(buf[:size])
+	}, nil
+}
+
+func logicalBufferPool(size int) *sync.Pool {
+	if existing, ok := logicalBufferPools.Load(size); ok {
+		return existing.(*sync.Pool)
+	}
+	sz := size
+	created := &sync.Pool{
+		New: func() any {
+			return make([]byte, sz)
+		},
+	}
+	actual, _ := logicalBufferPools.LoadOrStore(size, created)
+	return actual.(*sync.Pool)
+}
+
+func logicalBufferBucketSize(maxChunk int64) int {
+	if maxChunk <= 4*1024 {
+		return 4 * 1024
+	}
+	for _, bucket := range []int{
+		16 * 1024,
+		64 * 1024,
+		256 * 1024,
+		1 * 1024 * 1024,
+		2 * 1024 * 1024,
+		4 * 1024 * 1024,
+		8 * 1024 * 1024,
+	} {
+		if maxChunk <= int64(bucket) {
+			return bucket
+		}
+	}
+	return 8 * 1024 * 1024
+}
+
 type frameCompressor struct {
 	buf         bytes.Buffer
 	zstdEnc     *zstd.Encoder
@@ -519,8 +609,12 @@ type frameCompressor struct {
 	lz4Enc      *lz4.Writer
 }
 
-func newFrameCompressor() (*frameCompressor, error) {
-	return &frameCompressor{}, nil
+func newFrameCompressor(maxWireSizeHint int64) (*frameCompressor, error) {
+	c := &frameCompressor{}
+	if maxWireSizeHint > 0 && maxWireSizeHint <= int64(^uint(0)>>1) {
+		c.buf.Grow(int(maxWireSizeHint))
+	}
+	return c, nil
 }
 
 func (c *frameCompressor) Close() error {
@@ -652,4 +746,21 @@ func pathWithinRoot(root string, p string) bool {
 		return false
 	}
 	return !filepath.IsAbs(rel)
+}
+
+func maxRequestWireSizeHintBytes(requestedComp string, logicalSize int64) (int64, error) {
+	if requestedComp != "adapt" {
+		return maxFrameWireSizeHintBytes(requestedComp, logicalSize)
+	}
+	maxWire := int64(0)
+	for _, comp := range []string{"none", EncodingLz4, EncodingZstd} {
+		size, err := maxEncodedFrameSizeBytes(comp, logicalSize)
+		if err != nil {
+			return 0, err
+		}
+		if size > maxWire {
+			maxWire = size
+		}
+	}
+	return ceilingMaxWSizeBucketBytes(maxWire), nil
 }

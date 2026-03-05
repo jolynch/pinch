@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,7 +25,7 @@ import (
 
 type Client struct {
 	BaseURL                 string
-	HTTP                    *http.Client
+	FileClient              *http.Client
 	FileRequestWindowBytes  int64
 	FrameBufferBytes        int
 	MaxFrameReadBufferBytes int
@@ -158,10 +159,15 @@ const (
 	defaultClientSyncEveryBytes          int64 = 256 * 1024 * 1024
 )
 
+var frameReadBufferPools sync.Map // map[int]*sync.Pool
+
 func NewClient(baseURL string, hc *http.Client) *Client {
+	if hc == nil {
+		hc = &http.Client{}
+	}
 	return &Client{
 		BaseURL:                 strings.TrimRight(baseURL, "/"),
-		HTTP:                    hc,
+		FileClient:              hc,
 		FileRequestWindowBytes:  defaultClientRequestWindowBytes,
 		FrameBufferBytes:        defaultClientFrameBufferBytes,
 		MaxFrameReadBufferBytes: defaultClientMaxFrameReadBufferBytes,
@@ -323,17 +329,15 @@ func (c *Client) fetchFileWindow(
 	if size >= 0 {
 		q.Set("size", strconv.FormatInt(size, 10))
 	}
+	q.Set("comp", normalizeRequestedComp(acceptEncoding))
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("build file request: %w", err)
 	}
-	if acceptEncoding != "" {
-		req.Header.Set("Accept-Encoding", acceptEncoding)
-	}
 
-	resp, err := c.fileHTTPClient().Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("request file: %w", err)
 	}
@@ -405,7 +409,15 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		closeWriter = fd.Close
 		fileWriter = fd
 	}
-	var frameBuf []byte
+	var (
+		frameBuf        []byte
+		releaseFrameBuf func()
+	)
+	defer func() {
+		if releaseFrameBuf != nil {
+			releaseFrameBuf()
+		}
+	}()
 
 	windowSize := c.FileRequestWindowBytes
 	if windowSize <= 0 {
@@ -427,7 +439,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			return DownloadFileResponse{}, err
 		}
 		frameBufSize := effectiveFrameReadBufferSize(c.FrameBufferBytes, meta.MaxWireSizeHint, c.MaxFrameReadBufferBytes)
-		frameBuf = make([]byte, frameBufSize)
+		frameBuf, releaseFrameBuf = acquireFrameReadBuffer(frameBufSize)
 		copyErr := copyStream(writer, reader, frameBuf, localHasher)
 		closeReadErr := reader.Close()
 		closeWriteErr := closeWriter()
@@ -524,9 +536,9 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			_ = closeWriter()
 			return DownloadFileResponse{}, err
 		}
-		targetBufSize := effectiveFrameReadBufferSize(c.FrameBufferBytes, windowMeta.MaxWireSizeHint, c.MaxFrameReadBufferBytes)
-		if len(frameBuf) != targetBufSize {
-			frameBuf = make([]byte, targetBufSize)
+		if frameBuf == nil {
+			targetBufSize := effectiveFrameReadBufferSize(c.FrameBufferBytes, windowMeta.MaxWireSizeHint, c.MaxFrameReadBufferBytes)
+			frameBuf, releaseFrameBuf = acquireFrameReadBuffer(targetBufSize)
 		}
 		getTrailerTS := func() int64 {
 			if tsReader, ok := windowReader.(interface{ LastTrailerTS() int64 }); ok {
@@ -728,7 +740,7 @@ func (c *Client) AcknowledgeFileProgress(ctx context.Context, request Acknowledg
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("build progress-ack request: %w", err)
 	}
-	resp, err := c.fileHTTPClient().Do(httpReq)
+	resp, err := c.httpClient().Do(httpReq)
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("progress-ack request failed: %w", err)
 	}
@@ -960,6 +972,7 @@ func effectiveFrameReadBufferSize(baseSize int, maxWireHint int64, capSize int) 
 			target = int(maxWireHint)
 		}
 	}
+	target = frameReadBucketSize(target)
 	if target < minClientFrameReadBufferBytes {
 		target = minClientFrameReadBufferBytes
 	}
@@ -967,6 +980,51 @@ func effectiveFrameReadBufferSize(baseSize int, maxWireHint int64, capSize int) 
 		target = capSize
 	}
 	return target
+}
+
+func frameReadBucketSize(target int) int {
+	const mib = 1024 * 1024
+	for _, bucket := range []int{
+		1 * mib,
+		2 * mib,
+		4 * mib,
+		8 * mib,
+		16 * mib,
+		32 * mib,
+		64 * mib,
+	} {
+		if target <= bucket {
+			return bucket
+		}
+	}
+	return 64 * mib
+}
+
+func acquireFrameReadBuffer(size int) ([]byte, func()) {
+	pool := frameReadBufferPool(size)
+	raw := pool.Get()
+	buf, ok := raw.([]byte)
+	if !ok || cap(buf) < size {
+		buf = make([]byte, size)
+	}
+	buf = buf[:size]
+	return buf, func() {
+		pool.Put(buf[:size])
+	}
+}
+
+func frameReadBufferPool(size int) *sync.Pool {
+	if existing, ok := frameReadBufferPools.Load(size); ok {
+		return existing.(*sync.Pool)
+	}
+	sz := size
+	created := &sync.Pool{
+		New: func() any {
+			return make([]byte, sz)
+		},
+	}
+	actual, _ := frameReadBufferPools.LoadOrStore(size, created)
+	return actual.(*sync.Pool)
 }
 
 func dataSyncFile(fd *os.File) error {
@@ -977,28 +1035,29 @@ func dataSyncFile(fd *os.File) error {
 }
 
 func (c *Client) httpClient() *http.Client {
-	if c.HTTP != nil {
-		return c.HTTP
+	if c.FileClient != nil {
+		return c.FileClient
 	}
 	return &http.Client{}
 }
 
-func (c *Client) fileHTTPClient() *http.Client {
-	base := c.httpClient()
-	clone := *base
-
-	if base.Transport == nil {
-		t := http.DefaultTransport.(*http.Transport).Clone()
-		t.DisableCompression = true
-		clone.Transport = t
-		return &clone
+func normalizeRequestedComp(raw string) string {
+	comp := strings.ToLower(strings.TrimSpace(raw))
+	switch comp {
+	case "", "adapt":
+		return "adapt"
+	case EncodingZstd:
+		return EncodingZstd
+	case EncodingLz4:
+		return EncodingLz4
+	case "none", EncodingIdentity:
+		return "none"
 	}
-	if t, ok := base.Transport.(*http.Transport); ok {
-		tc := t.Clone()
-		tc.DisableCompression = true
-		clone.Transport = tc
+	// Legacy CSV Accept-Encoding style values map to adaptive mode.
+	if strings.Contains(comp, ",") || strings.Contains(comp, ";") {
+		return "adapt"
 	}
-	return &clone
+	return "adapt"
 }
 
 func parseManifest(raw []byte) (*Manifest, error) {

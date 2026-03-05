@@ -386,7 +386,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 			}
 			completed.Add(1)
 			totalTransferred.Add(downloadResp.Meta.Size)
-			printStartFileSummary(stdout, txferID, entry.ID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, time.Since(startOne))
+			printStartFileSummary(stdout, entry.ID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, time.Since(startOne))
 		}
 	}
 
@@ -429,7 +429,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	return 0
 }
 
-func printStartFileSummary(stdout io.Writer, txferID string, fileID uint64, path string, meta FileFrameMeta, localFileHash string, elapsed time.Duration) {
+func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta FileFrameMeta, localFileHash string, elapsed time.Duration) {
 	seconds := elapsed.Seconds()
 	if seconds <= 0 {
 		seconds = 0.000001
@@ -442,8 +442,7 @@ func printStartFileSummary(stdout io.Writer, txferID string, fileID uint64, path
 	}
 	fmt.Fprintf(
 		stdout,
-		"start-file: tid=%s fd=%d path=%s checksum=%s comp=%s rate=%s\n",
-		txferID,
+		"start-file: fd=%d path=%s checksum=%s comp=%s rate=%s\n",
 		fileID,
 		path,
 		checksum,

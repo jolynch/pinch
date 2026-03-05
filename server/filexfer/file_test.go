@@ -231,7 +231,7 @@ func TestFileHandlerIdentityFrame(t *testing.T) {
 	if !strings.HasPrefix(header, "FX/1 0 offset=0 size=5 wsize=5 comp=none enc=none hash=xxh128:"+xxh128Hex([]byte("hello"))+" max-wsize=") {
 		t.Fatalf("unexpected frame header: %q", header)
 	}
-	if got, ok := headerProp(header, "max-wsize"); !ok || got != "8388608" {
+	if got, ok := headerProp(header, "max-wsize"); !ok || got != "1048576" {
 		t.Fatalf("unexpected max-wsize: %q (present=%v)", got, ok)
 	}
 	if string(payload) != "hello" {
@@ -256,8 +256,7 @@ func TestFileHandlerIdentityFrame(t *testing.T) {
 func TestFileHandlerCompressedFrameHeaders(t *testing.T) {
 	txferID, fullPath := setupSingleFileTransfer(t)
 	for _, enc := range []string{EncodingZstd, EncodingLz4} {
-		req := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath))
-		req.Header.Set("Accept-Encoding", enc)
+		req := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)+"&comp="+url.QueryEscape(enc))
 		w := httptest.NewRecorder()
 
 		FileHandler(w, req)
@@ -266,14 +265,11 @@ func TestFileHandlerCompressedFrameHeaders(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("encoding %s: expected 200, got %d", enc, resp.StatusCode)
 		}
-		if got := resp.Header.Get("Content-Encoding"); got != enc {
-			t.Fatalf("encoding %s: expected content-encoding %q, got %q", enc, enc, got)
-		}
 		header, _, trailer, ok := splitFrame(w.Body.Bytes())
 		if !ok {
 			t.Fatalf("encoding %s: expected frame header/payload/trailer", enc)
 		}
-		if !strings.Contains(header, " comp="+EncodingLz4+" ") {
+		if !strings.Contains(header, " comp="+enc+" ") {
 			t.Fatalf("encoding %s: unexpected frame header: %q", enc, header)
 		}
 		if !strings.HasPrefix(trailer, "FXT/1 0 status=ok ts=") {
@@ -420,8 +416,7 @@ func TestFileHandlerMultiFrameDefaultChunkSize(t *testing.T) {
 func TestFileHandlerCompressedMultiFrameChecksumsAndNext(t *testing.T) {
 	content := bytes.Repeat([]byte("0123456789ABCDEF"), int((17*1024*1024)/16))
 	txferID, fullPath := setupTransferWithContent(t, content)
-	req := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath))
-	req.Header.Set("Accept-Encoding", EncodingZstd)
+	req := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)+"&comp="+EncodingZstd)
 	w := httptest.NewRecorder()
 
 	FileHandler(w, req)
