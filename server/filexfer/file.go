@@ -22,9 +22,15 @@ import (
 
 const defaultFileFrameLogicalSize int64 = 8 * 1024 * 1024
 
-var logicalBufferPools sync.Map // map[int]*sync.Pool
+var logicalBufferPools sync.Map   // map[int]*sync.Pool
+var frameCompressorPools sync.Map // map[int64]*sync.Pool
 
 func FileHandler(w http.ResponseWriter, req *http.Request) {
+	rawWriter := w
+	limitState := currentFileStreamLimitState()
+	limitedWriter := wrapLimitedResponseWriter(w, req.Context(), limitState)
+	w = limitedWriter
+
 	txferID := req.PathValue("txferid")
 	if txferID == "" {
 		http.Error(w, "missing required path parameter: txferid", http.StatusBadRequest)
@@ -57,40 +63,17 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	transfer, ok := GetTransfer(txferID)
-	if !ok {
-		http.Error(w, "transfer not found", http.StatusNotFound)
+	fd, fileRef, err := GetFile(txferID, fileID, fullPathRaw)
+	if err != nil {
+		writeLookupErr(w, err)
 		return
 	}
-	if fileID >= uint64(len(transfer.State)) {
-		http.Error(w, "file id out of range", http.StatusNotFound)
-		return
-	}
-
-	fullPath := filepath.Clean(fullPathRaw)
-	if !filepath.IsAbs(fullPath) {
-		http.Error(w, "path must be absolute", http.StatusBadRequest)
-		return
-	}
-	if !pathWithinRoot(transfer.Directory, fullPath) {
-		http.Error(w, "path must be within transfer root", http.StatusForbidden)
-		return
-	}
-
-	computedDigest := xxh3.Hash128([]byte(fullPath))
-	if transfer.PathHash[fileID] != computedDigest {
-		http.Error(w, "file path digest mismatch", http.StatusForbidden)
-		return
-	}
+	defer fd.Close()
 
 	_ = SetTransferFileState(txferID, fileID, TransferStateRunning)
 
-	fileInfo, err := os.Stat(fullPath)
+	fileInfo, err := fd.Stat()
 	if err != nil {
-		if os.IsNotExist(err) {
-			http.Error(w, "file not found", http.StatusNotFound)
-			return
-		}
 		http.Error(w, "failed to stat file", http.StatusInternalServerError)
 		return
 	}
@@ -116,17 +99,6 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 
-	fd, err := os.Open(fullPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			http.Error(w, "file not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "failed to open file", http.StatusInternalServerError)
-		return
-	}
-	defer fd.Close()
-
 	requestChunkMax := min(windowLen, defaultFileFrameLogicalSize)
 	logicalBufferSize := logicalBufferBucketSize(requestChunkMax)
 	logicalBuffer, releaseLogicalBuffer, err := acquireLogicalBuffer(logicalBufferSize)
@@ -147,12 +119,12 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "failed to compute frame wire-size hint", http.StatusInternalServerError)
 		return
 	}
-	compressors, err := newFrameCompressor(maxWSizeHint)
+	compressors, releaseCompressors, err := acquireFrameCompressor(maxWSizeHint)
 	if err != nil {
 		http.Error(w, "failed to initialize compressors", http.StatusInternalServerError)
 		return
 	}
-	defer compressors.Close()
+	defer releaseCompressors()
 
 	policy := NewCompressionPolicy()
 	cursor := offset
@@ -206,7 +178,7 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 			fileHashes = []string{fileHashToken}
 		}
 		if isTerminalResponseChunk {
-			md := collectFileFrameMetadata(fullPath, fileInfo)
+			md := collectFileFrameMetadata(fileRef.Path, fileInfo)
 			terminalMD = &md
 		}
 		var maxHint *int64
@@ -230,6 +202,9 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 			Metadata:     terminalMD,
 		})
 		if err != nil {
+			if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
+				http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+			}
 			return
 		}
 		windowFrames++
@@ -324,32 +299,13 @@ func FileAckHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	transfer, ok := GetTransfer(txferID)
-	if !ok {
-		http.Error(w, "transfer not found", http.StatusNotFound)
-		return
-	}
-	if fileID >= uint64(len(transfer.State)) {
-		http.Error(w, "file id out of range", http.StatusNotFound)
+	fileRef, err := GetFileRef(txferID, fileID, fullPathRaw)
+	if err != nil {
+		writeLookupErr(w, err)
 		return
 	}
 
-	fullPath := filepath.Clean(fullPathRaw)
-	if !filepath.IsAbs(fullPath) {
-		http.Error(w, "path must be absolute", http.StatusBadRequest)
-		return
-	}
-	if !pathWithinRoot(transfer.Directory, fullPath) {
-		http.Error(w, "path must be within transfer root", http.StatusForbidden)
-		return
-	}
-	computedDigest := xxh3.Hash128([]byte(fullPath))
-	if transfer.PathHash[fileID] != computedDigest {
-		http.Error(w, "file path digest mismatch", http.StatusForbidden)
-		return
-	}
-
-	maxAck := transfer.FileSize[fileID]
+	maxAck := fileRef.FileSize
 	ackTarget := ackBytes
 	if ackTarget > maxAck {
 		ackTarget = maxAck
@@ -607,27 +563,62 @@ type frameCompressor struct {
 	zstdEnc     *zstd.Encoder
 	zstdFastEnc *zstd.Encoder
 	lz4Enc      *lz4.Writer
+	poolKey     int64
 }
 
-func newFrameCompressor(maxWireSizeHint int64) (*frameCompressor, error) {
-	c := &frameCompressor{}
-	if maxWireSizeHint > 0 && maxWireSizeHint <= int64(^uint(0)>>1) {
-		c.buf.Grow(int(maxWireSizeHint))
+func acquireFrameCompressor(maxWireSizeHint int64) (*frameCompressor, func(), error) {
+	poolKey := compressorPoolKey(maxWireSizeHint)
+	pool := frameCompressorPool(poolKey)
+	raw := pool.Get()
+	c, ok := raw.(*frameCompressor)
+	if !ok || c == nil {
+		c = &frameCompressor{}
 	}
-	return c, nil
+	c.poolKey = poolKey
+	c.buf.Reset()
+	if poolKey > 0 && poolKey <= int64(^uint(0)>>1) {
+		wantCap := int(poolKey)
+		if c.buf.Cap() < wantCap {
+			c.buf.Grow(wantCap - c.buf.Cap())
+		}
+	}
+	release := func() {
+		c.resetForPool()
+		pool.Put(c)
+	}
+	return c, release, nil
 }
 
-func (c *frameCompressor) Close() error {
+func compressorPoolKey(maxWireSizeHint int64) int64 {
+	if maxWireSizeHint <= 0 {
+		return 0
+	}
+	return ceilingMaxWSizeBucketBytes(maxWireSizeHint)
+}
+
+func frameCompressorPool(poolKey int64) *sync.Pool {
+	if existing, ok := frameCompressorPools.Load(poolKey); ok {
+		return existing.(*sync.Pool)
+	}
+	key := poolKey
+	created := &sync.Pool{
+		New: func() any {
+			c := &frameCompressor{poolKey: key}
+			if key > 0 && key <= int64(^uint(0)>>1) {
+				c.buf.Grow(int(key))
+			}
+			return c
+		},
+	}
+	actual, _ := frameCompressorPools.LoadOrStore(poolKey, created)
+	return actual.(*sync.Pool)
+}
+
+func (c *frameCompressor) resetForPool() {
 	if c == nil {
-		return nil
+		return
 	}
-	if c.zstdEnc != nil {
-		_ = c.zstdEnc.Close()
-	}
-	if c.zstdFastEnc != nil {
-		_ = c.zstdFastEnc.Close()
-	}
-	return nil
+	c.buf.Reset()
 }
 
 func (c *frameCompressor) Compress(data []byte, mode CompressionMode) ([]byte, error) {

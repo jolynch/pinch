@@ -253,6 +253,30 @@ func TestFileHandlerIdentityFrame(t *testing.T) {
 	}
 }
 
+func TestFileHandlerTimeLimitReturns504BeforeBody(t *testing.T) {
+	t.Cleanup(func() {
+		if err := configureFileStreamLimits(fileStreamLimitConfig{}); err != nil {
+			t.Fatalf("reset stream limits: %v", err)
+		}
+	})
+	if err := configureFileStreamLimits(fileStreamLimitConfig{
+		TimeLimit: time.Nanosecond,
+	}); err != nil {
+		t.Fatalf("configure stream limits: %v", err)
+	}
+
+	txferID, fullPath := setupSingleFileTransfer(t)
+	req := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath))
+	w := httptest.NewRecorder()
+	time.Sleep(time.Millisecond)
+
+	FileHandler(w, req)
+	resp := w.Result()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("unexpected status: got=%d want=%d", resp.StatusCode, http.StatusGatewayTimeout)
+	}
+}
+
 func TestFileHandlerCompressedFrameHeaders(t *testing.T) {
 	txferID, fullPath := setupSingleFileTransfer(t)
 	for _, enc := range []string{EncodingZstd, EncodingLz4} {

@@ -5,6 +5,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
@@ -15,6 +16,40 @@ const (
 	EncodingZstd     = "zstd"
 	EncodingLz4      = "lz4"
 )
+
+type zstdMaxEncodedSizeCache struct {
+	once sync.Once
+	mu   sync.Mutex
+	enc  *zstd.Encoder
+	err  error
+	size map[int]int
+}
+
+var zstdMaxSizer zstdMaxEncodedSizeCache
+
+func (c *zstdMaxEncodedSizeCache) maxEncodedSize(n int) (int, error) {
+	c.once.Do(func() {
+		c.enc, c.err = zstd.NewWriter(io.Discard)
+		if c.err == nil {
+			c.size = make(map[int]int)
+		}
+	})
+	if c.err != nil {
+		return 0, c.err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cached, ok := c.size[n]; ok {
+		return cached, nil
+	}
+	maxSize := c.enc.MaxEncodedSize(n)
+	if maxSize <= 0 {
+		return 0, errors.New("invalid zstd max encoded size")
+	}
+	c.size[n] = maxSize
+	return maxSize, nil
+}
 
 const (
 	maxWSizeBucket1MiB  int64 = 1 * 1024 * 1024
@@ -174,14 +209,9 @@ func maxEncodedFrameSizeBytes(comp string, logicalSize int64) (int64, error) {
 	case EncodingLz4:
 		return int64(lz4.CompressBlockBound(n)), nil
 	case EncodingZstd:
-		enc, err := zstd.NewWriter(io.Discard)
+		maxSize, err := zstdMaxSizer.maxEncodedSize(n)
 		if err != nil {
 			return 0, err
-		}
-		defer enc.Close()
-		maxSize := enc.MaxEncodedSize(n)
-		if maxSize <= 0 {
-			return 0, errors.New("invalid zstd max encoded size")
 		}
 		return int64(maxSize), nil
 	default:

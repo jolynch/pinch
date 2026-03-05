@@ -3,7 +3,11 @@ package filexfer
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -47,6 +51,26 @@ type TransferFileStateUpdate struct {
 	FileSize int64
 }
 
+type FileRef struct {
+	TransferID string
+	FileID     uint64
+	Path       string
+	Directory  string
+	FileSize   int64
+}
+
+type FileLookupError struct {
+	Code int
+	Msg  string
+}
+
+func (e *FileLookupError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Msg
+}
+
 type transferStore struct {
 	mu         sync.RWMutex
 	transfers  map[string]Transfer
@@ -59,14 +83,14 @@ type fileHashKey struct {
 }
 
 type fileHashState struct {
-	hasher     *xxh3.Hasher128
-	hashedSize int64
-	hashToken  string
-	valid      bool
-	finalized  bool
-	latestComp  uint8
+	hasher        *xxh3.Hasher128
+	hashedSize    int64
+	hashToken     string
+	valid         bool
+	finalized     bool
+	latestComp    uint8
 	hasLatestComp bool
-	expiresAt  time.Time
+	expiresAt     time.Time
 }
 
 var (
@@ -324,6 +348,45 @@ func (s *transferStore) getFileStates(txferID string) ([]TransferFileState, bool
 	return states, true
 }
 
+func (s *transferStore) resolveFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
+	fullPath := filepath.Clean(fullPathRaw)
+	if !filepath.IsAbs(fullPath) {
+		return FileRef{}, &FileLookupError{Code: http.StatusBadRequest, Msg: "path must be absolute"}
+	}
+
+	s.mu.RLock()
+	transfer, ok := s.transfers[txferID]
+	if !ok {
+		s.mu.RUnlock()
+		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "transfer not found"}
+	}
+	if fileID >= uint64(len(transfer.State)) {
+		s.mu.RUnlock()
+		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file id out of range"}
+	}
+	directory := transfer.Directory
+	expectedDigest := transfer.PathHash[fileID]
+	fileSize := transfer.FileSize[fileID]
+	s.mu.RUnlock()
+
+	if !pathWithinRoot(directory, fullPath) {
+		return FileRef{}, &FileLookupError{Code: http.StatusForbidden, Msg: "path must be within transfer root"}
+	}
+
+	computedDigest := xxh3.Hash128([]byte(fullPath))
+	if expectedDigest != computedDigest {
+		return FileRef{}, &FileLookupError{Code: http.StatusForbidden, Msg: "file path digest mismatch"}
+	}
+
+	return FileRef{
+		TransferID: txferID,
+		FileID:     fileID,
+		Path:       fullPath,
+		Directory:  directory,
+		FileSize:   fileSize,
+	}, nil
+}
+
 func (s *transferStore) resetForTest() {
 	s.mu.Lock()
 	s.transfers = make(map[string]Transfer)
@@ -555,6 +618,37 @@ func DeleteTransfer(txferID string) bool {
 
 func GetTransfer(txferID string) (Transfer, bool) {
 	return manager.get(txferID)
+}
+
+func GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
+	return manager.resolveFileRef(txferID, fileID, fullPathRaw)
+}
+
+func GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
+	ref, err := manager.resolveFileRef(txferID, fileID, fullPathRaw)
+	if err != nil {
+		return nil, FileRef{}, err
+	}
+	fd, err := os.Open(ref.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file not found"}
+		}
+		return nil, FileRef{}, &FileLookupError{Code: http.StatusInternalServerError, Msg: "failed to open file"}
+	}
+	return fd, ref, nil
+}
+
+func writeLookupErr(w http.ResponseWriter, err error) {
+	if err == nil {
+		return
+	}
+	var lookupErr *FileLookupError
+	if errors.As(err, &lookupErr) {
+		http.Error(w, lookupErr.Msg, lookupErr.Code)
+		return
+	}
+	http.Error(w, "internal server error", http.StatusInternalServerError)
 }
 
 func GetTransferFileStates(txferID string) ([]TransferFileState, bool) {

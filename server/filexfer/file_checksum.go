@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -38,38 +36,9 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	transfer, ok := GetTransfer(txferID)
-	if !ok {
-		http.Error(w, "transfer not found", http.StatusNotFound)
-		return
-	}
-	if fileID >= uint64(len(transfer.State)) {
-		http.Error(w, "file id out of range", http.StatusNotFound)
-		return
-	}
-
-	fullPath := filepath.Clean(fullPathRaw)
-	if !filepath.IsAbs(fullPath) {
-		http.Error(w, "path must be absolute", http.StatusBadRequest)
-		return
-	}
-	if !pathWithinRoot(transfer.Directory, fullPath) {
-		http.Error(w, "path must be within transfer root", http.StatusForbidden)
-		return
-	}
-	computedDigest := xxh3.Hash128([]byte(fullPath))
-	if transfer.PathHash[fileID] != computedDigest {
-		http.Error(w, "file path digest mismatch", http.StatusForbidden)
-		return
-	}
-
-	fd, err := os.Open(fullPath)
+	fd, fileRef, err := GetFile(txferID, fileID, fullPathRaw)
 	if err != nil {
-		if os.IsNotExist(err) {
-			http.Error(w, "file not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "failed to open file", http.StatusInternalServerError)
+		writeLookupErr(w, err)
 		return
 	}
 	defer fd.Close()
@@ -99,7 +68,7 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Add("Vary", "Accept-Encoding")
 
-	metadata := collectFileFrameMetadata(fullPath, fileInfo)
+	metadata := collectFileFrameMetadata(fileRef.Path, fileInfo)
 	full128 := xxh3.New128()
 	full64 := xxh3.New()
 

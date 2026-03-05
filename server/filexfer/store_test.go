@@ -1,6 +1,9 @@
 package filexfer
 
 import (
+	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -371,5 +374,123 @@ func TestAcknowledgeTransferFileMissing(t *testing.T) {
 	}
 	if stored.Done != 1 {
 		t.Fatalf("expected done=1 for missing file, got %d", stored.Done)
+	}
+}
+
+func setupLookupFixture(t *testing.T, fileName string, content []byte) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	fullPath := filepath.Join(root, fileName)
+	if content != nil {
+		if err := os.WriteFile(fullPath, content, 0o644); err != nil {
+			t.Fatalf("write fixture file: %v", err)
+		}
+	}
+	transfer, err := NewTransfer(root, 1, int64(len(content)))
+	if err != nil {
+		t.Fatalf("NewTransfer failed: %v", err)
+	}
+	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
+		{
+			FileID:   0,
+			PathHash: xxh3.Hash128([]byte(filepath.Clean(fullPath))),
+			FileSize: int64(len(content)),
+		},
+	}, TransferStateStarted)
+	return transfer.ID, fullPath
+}
+
+func mustLookupErr(t *testing.T, err error) *FileLookupError {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected lookup error, got nil")
+	}
+	lookupErr, ok := err.(*FileLookupError)
+	if !ok {
+		t.Fatalf("expected *FileLookupError, got %T (%v)", err, err)
+	}
+	return lookupErr
+}
+
+func TestGetFileRefTransferNotFound(t *testing.T) {
+	resetTransferStore()
+	_, err := GetFileRef("missing", 0, "/tmp/x")
+	lookupErr := mustLookupErr(t, err)
+	if lookupErr.Code != http.StatusNotFound || lookupErr.Msg != "transfer not found" {
+		t.Fatalf("unexpected lookup error: %+v", lookupErr)
+	}
+}
+
+func TestGetFileRefFileIDOutOfRange(t *testing.T) {
+	resetTransferStore()
+	txferID, fullPath := setupLookupFixture(t, "a.txt", []byte("hello"))
+	_, err := GetFileRef(txferID, 1, fullPath)
+	lookupErr := mustLookupErr(t, err)
+	if lookupErr.Code != http.StatusNotFound || lookupErr.Msg != "file id out of range" {
+		t.Fatalf("unexpected lookup error: %+v", lookupErr)
+	}
+}
+
+func TestGetFileRefRejectsNonAbsolutePath(t *testing.T) {
+	resetTransferStore()
+	txferID, _ := setupLookupFixture(t, "a.txt", []byte("hello"))
+	_, err := GetFileRef(txferID, 0, "a.txt")
+	lookupErr := mustLookupErr(t, err)
+	if lookupErr.Code != http.StatusBadRequest || lookupErr.Msg != "path must be absolute" {
+		t.Fatalf("unexpected lookup error: %+v", lookupErr)
+	}
+}
+
+func TestGetFileRefRejectsOutsideRoot(t *testing.T) {
+	resetTransferStore()
+	txferID, _ := setupLookupFixture(t, "a.txt", []byte("hello"))
+	_, err := GetFileRef(txferID, 0, "/tmp/not-in-root.txt")
+	lookupErr := mustLookupErr(t, err)
+	if lookupErr.Code != http.StatusForbidden || lookupErr.Msg != "path must be within transfer root" {
+		t.Fatalf("unexpected lookup error: %+v", lookupErr)
+	}
+}
+
+func TestGetFileRefRejectsDigestMismatch(t *testing.T) {
+	resetTransferStore()
+	txferID, fullPath := setupLookupFixture(t, "a.txt", []byte("hello"))
+	altPath := filepath.Join(filepath.Dir(fullPath), "b.txt")
+	_, err := GetFileRef(txferID, 0, altPath)
+	lookupErr := mustLookupErr(t, err)
+	if lookupErr.Code != http.StatusForbidden || lookupErr.Msg != "file path digest mismatch" {
+		t.Fatalf("unexpected lookup error: %+v", lookupErr)
+	}
+}
+
+func TestGetFileReturnsNotFoundWhenMissing(t *testing.T) {
+	resetTransferStore()
+	txferID, fullPath := setupLookupFixture(t, "missing.txt", nil)
+	fd, _, err := GetFile(txferID, 0, fullPath)
+	if fd != nil {
+		_ = fd.Close()
+		t.Fatalf("expected nil fd for missing file")
+	}
+	lookupErr := mustLookupErr(t, err)
+	if lookupErr.Code != http.StatusNotFound || lookupErr.Msg != "file not found" {
+		t.Fatalf("unexpected lookup error: %+v", lookupErr)
+	}
+}
+
+func TestGetFileSuccess(t *testing.T) {
+	resetTransferStore()
+	txferID, fullPath := setupLookupFixture(t, "a.txt", []byte("hello"))
+	fd, ref, err := GetFile(txferID, 0, fullPath)
+	if err != nil {
+		t.Fatalf("GetFile failed: %v", err)
+	}
+	defer fd.Close()
+	if ref.TransferID != txferID || ref.FileID != 0 {
+		t.Fatalf("unexpected ref IDs: %+v", ref)
+	}
+	if ref.Path != filepath.Clean(fullPath) {
+		t.Fatalf("unexpected ref path: %q", ref.Path)
+	}
+	if ref.FileSize != 5 {
+		t.Fatalf("unexpected ref size: %d", ref.FileSize)
 	}
 }

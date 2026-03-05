@@ -33,6 +33,8 @@ var (
 	tokenLength  = 8
 	bufSizeBytes = 128 * 1024 // Usually pipes are 64KiB, we bump it slightly
 	serverKey    *age.X25519Identity
+	fsFileRate   = ""
+	fsFileBurst  = "1MiB"
 )
 
 func compress(
@@ -656,9 +658,16 @@ func main() {
 	flag.StringVar(&keysDir, "keys", keysDir, "The directory to create output pipes in")
 	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
 	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should buffers be")
+	flag.StringVar(&fsFileRate, "fs-file-rate", fsFileRate, "Global /fs/file rate limit (examples: 100MiB, 1000mbps). Empty/0 disables limiting")
+	flag.StringVar(&fsFileBurst, "fs-file-rate-burst", fsFileBurst, "Token-bucket burst for /fs/file rate limit (examples: 1MiB, 4MB)")
+	fsFileTimeLimit := flag.Duration("fs-file-time-limit", 0, "Per-request wall-clock limit for GET /fs/file (0 disables)")
 	dieAfter := flag.Duration("die-after", 0, "Die after this duration. Zero seconds indicates live forever")
 
 	flag.Parse()
+
+	if err := filexfer.ConfigureFileStreamLimiter(fsFileRate, fsFileBurst, *fsFileTimeLimit); err != nil {
+		log.Fatalf("Invalid file stream limiter configuration: %v", err)
+	}
 
 	if !makeDirs(inputDir) {
 		log.Fatalf("Could not setup input directory, dying")
@@ -669,8 +678,7 @@ func main() {
 	if !makeDirs(keysDir) {
 		log.Fatalf("Could not setup key directory, dying")
 	}
-	var err error
-	serverKey, err = age.GenerateX25519Identity()
+	serverKey, err := age.GenerateX25519Identity()
 	if err != nil {
 		log.Fatalf("AGE could not generate private and public keys for this node")
 	} else {
@@ -722,8 +730,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
-	err = server.ListenAndServe()
-	if err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Failed to bind, is another server listening at this address? error=%v", err)
 	} else {
 		log.Printf("Success!")
