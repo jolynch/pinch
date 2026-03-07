@@ -23,6 +23,17 @@ import (
 const defaultCLIEncodings = "zstd,lz4,identity"
 const defaultVerboseStatusInterval = 10 * time.Second
 
+type synchronizedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (sw *synchronizedWriter) Write(p []byte) (int, error) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.w.Write(p)
+}
+
 func defaultClientConcurrency() int {
 	n := runtime.NumCPU() * 2
 	if n < 1 {
@@ -292,6 +303,10 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 }
 
 func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
+	outputMu := &sync.Mutex{}
+	stdout = &synchronizedWriter{mu: outputMu, w: stdout}
+	stderr = &synchronizedWriter{mu: outputMu, w: stderr}
+
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var txferID string

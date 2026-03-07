@@ -18,12 +18,32 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 	"github.com/zeebo/xxh3"
+	"golang.org/x/sys/unix"
 )
 
 const defaultFileFrameLogicalSize int64 = 8 * 1024 * 1024
+const maxConcurrentFramePrepares = 8
 
 var logicalBufferPools sync.Map   // map[int]*sync.Pool
 var frameCompressorPools sync.Map // map[int64]*sync.Pool
+
+type framePrepareTask struct {
+	Index       int
+	Offset      int64
+	LogicalSize int64
+	Mode        CompressionMode
+}
+
+type preparedFrame struct {
+	Task           framePrepareTask
+	LogicalChunk   []byte
+	FramePayload   []byte
+	WireSize       int64
+	ChunkHash      xxh3.Uint128
+	PrepareLatency time.Duration
+	Err            error
+	release        func()
+}
 
 func FileHandler(w http.ResponseWriter, req *http.Request) {
 	rawWriter := w
@@ -90,6 +110,9 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 	if logicalSizeLimit >= 0 && logicalSizeLimit < windowLen {
 		windowLen = logicalSizeLimit
 	}
+	// Try to hint to the kernel we might want to read this data
+	// in short order.
+	maybeFadviseSequential(fd, offset, windowLen)
 
 	comp, err := parseRequestedComp(req)
 	if err != nil {
@@ -101,31 +124,16 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 
 	requestChunkMax := min(windowLen, defaultFileFrameLogicalSize)
 	logicalBufferSize := logicalBufferBucketSize(requestChunkMax)
-	logicalBuffer, releaseLogicalBuffer, err := acquireLogicalBuffer(logicalBufferSize)
-	if err != nil {
-		http.Error(w, "failed to acquire logical frame buffer", http.StatusInternalServerError)
-		return
-	}
-	defer releaseLogicalBuffer()
-
 	adaptiveComp := comp == "adapt"
 	activeMode := initialCompressionMode(comp)
 	if mode, ok := GetTransferFileCompressionMode(txferID, fileID); ok {
 		activeMode = clampCompressionModeForAccept(mode, comp)
 	}
-	activeComp := frameCompTokenForMode(activeMode)
 	maxWSizeHint, err := maxRequestWireSizeHintBytes(comp, int64(logicalBufferSize))
 	if err != nil {
 		http.Error(w, "failed to compute frame wire-size hint", http.StatusInternalServerError)
 		return
 	}
-	compressors, releaseCompressors, err := acquireFrameCompressor(maxWSizeHint)
-	if err != nil {
-		http.Error(w, "failed to initialize compressors", http.StatusInternalServerError)
-		return
-	}
-	defer releaseCompressors()
-
 	policy := NewCompressionPolicy()
 	cursor := offset
 	windowStart := offset
@@ -139,107 +147,186 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	firstFrame := true
 	for remaining := windowLen; remaining > 0; {
-		chunkLogical := min(remaining, defaultFileFrameLogicalSize)
+		workers := int((remaining + defaultFileFrameLogicalSize - 1) / defaultFileFrameLogicalSize)
+		if workers > maxConcurrentFramePrepares {
+			workers = maxConcurrentFramePrepares
+		}
+		if cursor < 4*defaultFileFrameLogicalSize {
+			workers = 1
+		}
+		workers = max(1, workers)
 
-		prepareStart := time.Now()
-		logicalChunk, framePayload, wireSize, chunkHash, err := prepareFramePayload(fd, compressors, activeMode, logicalBuffer, cursor, chunkLogical)
-		if err != nil {
-			http.Error(w, "failed to prepare frame payload", http.StatusInternalServerError)
-			return
-		}
-		prepareLatency := time.Since(prepareStart)
-		if !UpdateTransferFileHash(txferID, fileID, cursor, logicalChunk) {
-			http.Error(w, "failed to update file hash state", http.StatusInternalServerError)
-			return
+		batchMode := activeMode
+		batchComp := frameCompTokenForMode(batchMode)
+		tasks := make([]framePrepareTask, 0, workers)
+		taskOffset := cursor
+		taskRemaining := remaining
+		for i := 0; i < workers && taskRemaining > 0; i++ {
+			chunkLogical := min(taskRemaining, defaultFileFrameLogicalSize)
+			tasks = append(tasks, framePrepareTask{
+				Index:       i,
+				Offset:      taskOffset,
+				LogicalSize: chunkLogical,
+				Mode:        batchMode,
+			})
+			taskOffset += chunkLogical
+			taskRemaining -= chunkLogical
 		}
 
-		headerTS := time.Now().UnixMilli()
-		hash128Bytes := chunkHash.Bytes()
-		hashHex := hex.EncodeToString(hash128Bytes[:])
-		headerHash := "xxh128:" + hashHex
-		nextOffset := cursor + chunkLogical
-		isTerminalResponseChunk := remaining == chunkLogical
-		isTerminalFileChunk := nextOffset == fileInfo.Size()
-		nextValue := nextOffset
-		if isTerminalResponseChunk {
-			nextValue = 0
+		prepared := make([]preparedFrame, len(tasks))
+		var wg sync.WaitGroup
+		for _, task := range tasks {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				frame := preparedFrame{Task: task}
+				logicalBuffer, releaseLogicalBuffer, err := acquireLogicalBuffer(logicalBufferSize)
+				if err != nil {
+					frame.Err = err
+					prepared[task.Index] = frame
+					return
+				}
+				compressors, releaseCompressors, err := acquireFrameCompressor(maxWSizeHint)
+				if err != nil {
+					releaseLogicalBuffer()
+					frame.Err = err
+					prepared[task.Index] = frame
+					return
+				}
+
+				prepareStart := time.Now()
+				logicalChunk, framePayload, wireSize, chunkHash, err := prepareFramePayloadAt(fd, compressors, task.Mode, logicalBuffer, task.Offset, task.LogicalSize)
+				if err != nil {
+					releaseCompressors()
+					releaseLogicalBuffer()
+					frame.Err = err
+					prepared[task.Index] = frame
+					return
+				}
+				frame.PrepareLatency = time.Since(prepareStart)
+				frame.LogicalChunk = logicalChunk
+				frame.FramePayload = framePayload
+				frame.WireSize = wireSize
+				frame.ChunkHash = chunkHash
+				frame.release = func() {
+					releaseCompressors()
+					releaseLogicalBuffer()
+				}
+				prepared[task.Index] = frame
+			}()
 		}
-		trailerTS := time.Now().UnixMilli()
-		var (
-			fileHashes []string
-			terminalMD *fileFrameMetadata
-		)
-		if isTerminalFileChunk {
-			fileHashToken, ok := FinalizeTransferFileHash(txferID, fileID)
-			if !ok {
-				http.Error(w, "failed to finalize file hash state", http.StatusInternalServerError)
+		wg.Wait()
+
+		nextBatchMode := batchMode
+		for i := range prepared {
+			frame := prepared[i]
+			if frame.Err != nil {
+				releasePreparedFrames(prepared)
+				http.Error(w, "failed to prepare frame payload", http.StatusInternalServerError)
 				return
 			}
-			fileHashes = []string{fileHashToken}
-		}
-		if isTerminalResponseChunk {
-			md := collectFileFrameMetadata(fileRef.Path, fileInfo)
-			terminalMD = &md
-		}
-		var maxHint *int64
-		if firstFrame {
-			maxHint = &maxWSizeHint
-		}
-		writeStats, err := writeFrame(w, frameWriteArgs{
-			FileID:       fileID,
-			Offset:       cursor,
-			Size:         chunkLogical,
-			WSize:        wireSize,
-			Comp:         activeComp,
-			Enc:          "none",
-			HeaderHash:   headerHash,
-			MaxWSizeHint: maxHint,
-			HeaderTS:     headerTS,
-			Payload:      framePayload,
-			TrailerTS:    trailerTS,
-			FileHashes:   fileHashes,
-			Next:         nextValue,
-			Metadata:     terminalMD,
-		})
-		if err != nil {
-			if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
-				http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+			if !UpdateTransferFileHash(txferID, fileID, frame.Task.Offset, frame.LogicalChunk) {
+				releasePreparedFrames(prepared)
+				http.Error(w, "failed to update file hash state", http.StatusInternalServerError)
+				return
 			}
-			return
-		}
-		windowFrames++
-		windowLogicalTotal += chunkLogical
-		windowWireTotal += wireSize
-		if adaptiveComp {
-			decision := policy.Decide(activeMode, CompressionMetrics{
-				LogicalSize:    chunkLogical,
-				WireSize:       wireSize,
-				PrepareLatency: prepareLatency,
-				WriteLatency:   writeStats.WriteLatency,
-			})
-			nextMode := clampCompressionModeForAccept(decision.Next, comp)
-			if nextMode != activeMode {
-				prevComp := frameCompTokenForMode(activeMode)
-				nextComp := frameCompTokenForMode(nextMode)
-				log.Printf(
-					"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f read_over_write=%.3f",
-					txferID,
-					fileID,
-					prevComp,
-					nextComp,
-					decision.Reason,
-					decision.Ratio,
-					decision.ReadOverWrite,
-				)
-				activeMode = nextMode
-				_ = SetTransferFileCompressionMode(txferID, fileID, activeMode)
-				activeComp = frameCompTokenForMode(activeMode)
-			}
-		}
 
-		cursor = nextOffset
-		remaining -= chunkLogical
-		firstFrame = false
+			headerTS := time.Now().UnixMilli()
+			hash128Bytes := frame.ChunkHash.Bytes()
+			hashHex := hex.EncodeToString(hash128Bytes[:])
+			headerHash := "xxh128:" + hashHex
+			nextOffset := frame.Task.Offset + frame.Task.LogicalSize
+			isTerminalResponseChunk := nextOffset == offset+windowLen
+			isTerminalFileChunk := nextOffset == fileInfo.Size()
+			nextValue := nextOffset
+			if isTerminalResponseChunk {
+				nextValue = 0
+			}
+			trailerTS := time.Now().UnixMilli()
+			var (
+				fileHashes []string
+				terminalMD *fileFrameMetadata
+			)
+			if isTerminalFileChunk {
+				fileHashToken, ok := FinalizeTransferFileHash(txferID, fileID)
+				if !ok {
+					releasePreparedFrames(prepared)
+					http.Error(w, "failed to finalize file hash state", http.StatusInternalServerError)
+					return
+				}
+				fileHashes = []string{fileHashToken}
+			}
+			if isTerminalResponseChunk {
+				md := collectFileFrameMetadata(fileRef.Path, fileInfo)
+				terminalMD = &md
+			}
+			var maxHint *int64
+			if firstFrame {
+				maxHint = &maxWSizeHint
+			}
+			writeStats, err := writeFrame(w, frameWriteArgs{
+				FileID:       fileID,
+				Offset:       frame.Task.Offset,
+				Size:         frame.Task.LogicalSize,
+				WSize:        frame.WireSize,
+				Comp:         batchComp,
+				Enc:          "none",
+				HeaderHash:   headerHash,
+				MaxWSizeHint: maxHint,
+				HeaderTS:     headerTS,
+				Payload:      frame.FramePayload,
+				TrailerTS:    trailerTS,
+				FileHashes:   fileHashes,
+				Next:         nextValue,
+				Metadata:     terminalMD,
+			})
+			if err != nil {
+				releasePreparedFrames(prepared)
+				if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
+					http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+				}
+				return
+			}
+			windowFrames++
+			windowLogicalTotal += frame.Task.LogicalSize
+			windowWireTotal += frame.WireSize
+			if adaptiveComp {
+				decision := policy.Decide(batchMode, CompressionMetrics{
+					LogicalSize:    frame.Task.LogicalSize,
+					WireSize:       frame.WireSize,
+					PrepareLatency: frame.PrepareLatency,
+					WriteLatency:   writeStats.WriteLatency,
+				})
+				candidate := clampCompressionModeForAccept(decision.Next, comp)
+				if candidate != batchMode {
+					prevComp := frameCompTokenForMode(batchMode)
+					nextComp := frameCompTokenForMode(candidate)
+					log.Printf(
+						"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f read_over_write=%.3f",
+						txferID,
+						fileID,
+						prevComp,
+						nextComp,
+						decision.Reason,
+						decision.Ratio,
+						decision.ReadOverWrite,
+					)
+					nextBatchMode = candidate
+				}
+			}
+
+			cursor = nextOffset
+			remaining -= frame.Task.LogicalSize
+			firstFrame = false
+			if frame.release != nil {
+				frame.release()
+				prepared[i].release = nil
+			}
+		}
+		if adaptiveComp && nextBatchMode != activeMode {
+			activeMode = nextBatchMode
+			_ = SetTransferFileCompressionMode(txferID, fileID, activeMode)
+		}
 	}
 	windowTS1 := time.Now().UnixMilli()
 	windowMS := windowTS1 - windowTS0
@@ -507,6 +594,42 @@ func prepareFramePayload(fd *os.File, compressors *frameCompressor, mode Compres
 	return logical, payload, int64(len(payload)), hash128, nil
 }
 
+func prepareFramePayloadAt(fd *os.File, compressors *frameCompressor, mode CompressionMode, logicalBuffer []byte, offset int64, logicalSize int64) ([]byte, []byte, int64, xxh3.Uint128, error) {
+	if logicalSize < 0 {
+		return nil, nil, 0, xxh3.Uint128{}, errors.New("negative logical size")
+	}
+	if compressors == nil {
+		return nil, nil, 0, xxh3.Uint128{}, errors.New("nil compressor context")
+	}
+	if logicalSize > int64(len(logicalBuffer)) {
+		return nil, nil, 0, xxh3.Uint128{}, errors.New("logical frame size exceeds reusable buffer")
+	}
+	if fd == nil {
+		return nil, nil, 0, xxh3.Uint128{}, errors.New("nil file descriptor")
+	}
+
+	logical := logicalBuffer[:logicalSize]
+	if _, err := fd.ReadAt(logical, offset); err != nil {
+		return nil, nil, 0, xxh3.Uint128{}, err
+	}
+	hash128 := xxh3.Hash128(logical)
+
+	payload, err := compressors.Compress(logical, mode)
+	if err != nil {
+		return nil, nil, 0, xxh3.Uint128{}, err
+	}
+	return logical, payload, int64(len(payload)), hash128, nil
+}
+
+func releasePreparedFrames(prepared []preparedFrame) {
+	for i := range prepared {
+		if prepared[i].release != nil {
+			prepared[i].release()
+			prepared[i].release = nil
+		}
+	}
+}
+
 func acquireLogicalBuffer(size int) ([]byte, func(), error) {
 	if size <= 0 {
 		return nil, nil, errors.New("invalid logical buffer size")
@@ -630,7 +753,7 @@ func (c *frameCompressor) Compress(data []byte, mode CompressionMode) ([]byte, e
 	case CompressionModeZstdDefault:
 		c.buf.Reset()
 		if c.zstdEnc == nil {
-			enc, err := zstd.NewWriter(&c.buf)
+			enc, err := zstd.NewWriter(&c.buf, zstd.WithEncoderConcurrency(1))
 			if err != nil {
 				return nil, err
 			}
@@ -648,7 +771,7 @@ func (c *frameCompressor) Compress(data []byte, mode CompressionMode) ([]byte, e
 	case CompressionModeZstdLevel1:
 		c.buf.Reset()
 		if c.zstdFastEnc == nil {
-			enc, err := zstd.NewWriter(&c.buf, zstd.WithEncoderLevel(zstd.SpeedFastest))
+			enc, err := zstd.NewWriter(&c.buf, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
 			if err != nil {
 				return nil, err
 			}
@@ -756,4 +879,11 @@ func maxRequestWireSizeHintBytes(requestedComp string, logicalSize int64) (int64
 		}
 	}
 	return ceilingMaxWSizeBucketBytes(maxWire), nil
+}
+
+func maybeFadviseSequential(fd *os.File, offset int64, length int64) {
+	if fd == nil || length <= 0 {
+		return
+	}
+	_ = unix.Fadvise(int(fd.Fd()), offset, length, unix.FADV_SEQUENTIAL)
 }
