@@ -1,4 +1,4 @@
-package filexfer
+package limit
 
 import (
 	"context"
@@ -17,6 +17,8 @@ var (
 	errFileStreamTimeLimitExceeded = errors.New("file stream time limit exceeded")
 )
 
+var ErrFileStreamTimeLimitExceeded = errFileStreamTimeLimitExceeded
+
 type fileStreamLimitState struct {
 	cfg    fileStreamLimitConfig
 	bucket *rate.Limiter
@@ -27,6 +29,9 @@ type fileStreamLimitConfig struct {
 	BurstBytes int64
 	TimeLimit  time.Duration
 }
+
+type FileStreamLimitState = fileStreamLimitState
+type FileStreamLimitConfig = fileStreamLimitConfig
 
 var fileStreamLimiterState atomic.Pointer[fileStreamLimitState]
 
@@ -71,6 +76,10 @@ func configureFileStreamLimits(cfg fileStreamLimitConfig) error {
 	return nil
 }
 
+func ConfigureFileStreamLimits(cfg FileStreamLimitConfig) error {
+	return configureFileStreamLimits(cfg)
+}
+
 func currentFileStreamLimitState() fileStreamLimitState {
 	if state := fileStreamLimiterState.Load(); state != nil {
 		return *state
@@ -78,6 +87,10 @@ func currentFileStreamLimitState() fileStreamLimitState {
 	return fileStreamLimitState{
 		cfg: fileStreamLimitConfig{},
 	}
+}
+
+func CurrentFileStreamLimitState() FileStreamLimitState {
+	return currentFileStreamLimitState()
 }
 
 type limitedResponseWriter struct {
@@ -88,6 +101,8 @@ type limitedResponseWriter struct {
 	hasDL     bool
 	wroteBody bool
 }
+
+type LimitedResponseWriter = limitedResponseWriter
 
 func wrapLimitedResponseWriter(w http.ResponseWriter, ctx context.Context, state fileStreamLimitState) *limitedResponseWriter {
 	lw := &limitedResponseWriter{
@@ -100,6 +115,10 @@ func wrapLimitedResponseWriter(w http.ResponseWriter, ctx context.Context, state
 		lw.hasDL = true
 	}
 	return lw
+}
+
+func WrapLimitedResponseWriter(w http.ResponseWriter, ctx context.Context, state FileStreamLimitState) *LimitedResponseWriter {
+	return wrapLimitedResponseWriter(w, ctx, state)
 }
 
 func (w *limitedResponseWriter) Header() http.Header {
@@ -137,6 +156,10 @@ func (w *limitedResponseWriter) Flush() {
 
 func (w *limitedResponseWriter) wroteAnyBody() bool {
 	return w.wroteBody
+}
+
+func (w *limitedResponseWriter) WroteAnyBody() bool {
+	return w.wroteAnyBody()
 }
 
 func waitRateLimited(ctx context.Context, limiter *rate.Limiter, n int) error {
@@ -228,6 +251,10 @@ func parseByteSize(raw string) (int64, error) {
 		return 0, fmt.Errorf("unsupported size unit: %s", unit)
 	}
 	return floatToInt64(value * mult)
+}
+
+func ParseByteSize(raw string) (int64, error) {
+	return parseByteSize(raw)
 }
 
 func parseHumanValueAndUnit(raw string) (float64, string, error) {

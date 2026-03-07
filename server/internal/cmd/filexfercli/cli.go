@@ -1,4 +1,4 @@
-package filexfer
+package filexfercli
 
 import (
 	"bufio"
@@ -18,10 +18,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	. "github.com/jolynch/pinch/filexfer"
 )
 
 const defaultCLIEncodings = "zstd,lz4,identity"
 const defaultVerboseStatusInterval = 10 * time.Second
+const defaultCLIAckEveryBytes int64 = 256 * 1024 * 1024
 
 type synchronizedWriter struct {
 	mu *sync.Mutex
@@ -229,7 +232,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
-	ackEveryRaw = humanBytes(defaultClientAckEveryBytes)
+	ackEveryRaw = humanBytes(defaultCLIAckEveryBytes)
 	fs.StringVar(&ackEveryRaw, "A", ackEveryRaw, "bytes between progress acks")
 	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
 	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")
@@ -324,7 +327,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
 	fs.IntVar(&concurrency, "concurrency", defaultClientConcurrency(), "parallel download workers")
-	ackEveryRaw = humanBytes(defaultClientAckEveryBytes)
+	ackEveryRaw = humanBytes(defaultCLIAckEveryBytes)
 	fs.StringVar(&ackEveryRaw, "A", ackEveryRaw, "bytes between progress acks")
 	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
 	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")

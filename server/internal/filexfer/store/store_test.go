@@ -1,4 +1,4 @@
-package filexfer
+package store
 
 import (
 	"net/http"

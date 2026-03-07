@@ -1,15 +1,13 @@
-package filexfer
+package fhttp
 
 import (
 	"bytes"
 	"encoding/hex"
 	"errors"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -567,33 +565,6 @@ func parseAckTelemetryQuery(values url.Values, ackBytes int64) (deltaBytes int64
 	return deltaBytes, recvMS, syncMS, nil
 }
 
-func prepareFramePayload(fd *os.File, compressors *frameCompressor, mode CompressionMode, logicalBuffer []byte, offset int64, logicalSize int64) ([]byte, []byte, int64, xxh3.Uint128, error) {
-	if logicalSize < 0 {
-		return nil, nil, 0, xxh3.Uint128{}, errors.New("negative logical size")
-	}
-	if compressors == nil {
-		return nil, nil, 0, xxh3.Uint128{}, errors.New("nil compressor context")
-	}
-	if logicalSize > int64(len(logicalBuffer)) {
-		return nil, nil, 0, xxh3.Uint128{}, errors.New("logical frame size exceeds reusable buffer")
-	}
-
-	if _, err := fd.Seek(offset, io.SeekStart); err != nil {
-		return nil, nil, 0, xxh3.Uint128{}, err
-	}
-	logical := logicalBuffer[:logicalSize]
-	if _, err := io.ReadFull(fd, logical); err != nil {
-		return nil, nil, 0, xxh3.Uint128{}, err
-	}
-	hash128 := xxh3.Hash128(logical)
-
-	payload, err := compressors.Compress(logical, mode)
-	if err != nil {
-		return nil, nil, 0, xxh3.Uint128{}, err
-	}
-	return logical, payload, int64(len(payload)), hash128, nil
-}
-
 func prepareFramePayloadAt(fd *os.File, compressors *frameCompressor, mode CompressionMode, logicalBuffer []byte, offset int64, logicalSize int64) ([]byte, []byte, int64, xxh3.Uint128, error) {
 	if logicalSize < 0 {
 		return nil, nil, 0, xxh3.Uint128{}, errors.New("negative logical size")
@@ -846,22 +817,6 @@ func encodeSingleFramePayload(data []byte, comp string) ([]byte, error) {
 	default:
 		return nil, errors.New("unsupported compression mode")
 	}
-}
-
-func pathWithinRoot(root string, p string) bool {
-	root = filepath.Clean(root)
-	p = filepath.Clean(p)
-	rel, err := filepath.Rel(root, p)
-	if err != nil {
-		return false
-	}
-	if rel == "." {
-		return true
-	}
-	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
-		return false
-	}
-	return !filepath.IsAbs(rel)
 }
 
 func maxRequestWireSizeHintBytes(requestedComp string, logicalSize int64) (int64, error) {

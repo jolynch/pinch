@@ -1,6 +1,7 @@
-package filexfer
+package codec
 
 import (
+	"encoding/hex"
 	"errors"
 	"io"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
+	"github.com/zeebo/xxh3"
 )
 
 const (
@@ -146,47 +148,7 @@ func WrapDecompressedReader(src io.Reader, contentEncoding string) (io.ReadClose
 	}
 }
 
-func CompressZstd(dst io.Writer, src io.Reader, compressor *zstd.Encoder) (int64, error) {
-	if dst == nil {
-		return 0, errors.New("nil destination writer")
-	}
-	if src == nil {
-		return 0, errors.New("nil source reader")
-	}
-	if compressor == nil {
-		return 0, errors.New("nil zstd compressor")
-	}
-
-	compressor.Reset(dst)
-	n, copyErr := io.Copy(compressor, src)
-	closeErr := compressor.Close()
-	if copyErr != nil {
-		return n, copyErr
-	}
-	if closeErr != nil {
-		return n, closeErr
-	}
-	return n, nil
-}
-
-func DecompressZstd(dst io.Writer, src io.Reader, decompressor *zstd.Decoder) (int64, error) {
-	if dst == nil {
-		return 0, errors.New("nil destination writer")
-	}
-	if src == nil {
-		return 0, errors.New("nil source reader")
-	}
-	if decompressor == nil {
-		return 0, errors.New("nil zstd decompressor")
-	}
-
-	if err := decompressor.Reset(src); err != nil {
-		return 0, err
-	}
-	return io.Copy(dst, decompressor)
-}
-
-func maxFrameWireSizeHintBytes(comp string, logicalSize int64) (int64, error) {
+func MaxFrameWireSizeHintBytes(comp string, logicalSize int64) (int64, error) {
 	maxWire, err := maxEncodedFrameSizeBytes(comp, logicalSize)
 	if err != nil {
 		return 0, err
@@ -194,7 +156,7 @@ func maxFrameWireSizeHintBytes(comp string, logicalSize int64) (int64, error) {
 	return ceilingMaxWSizeBucketBytes(maxWire), nil
 }
 
-func maxEncodedFrameSizeBytes(comp string, logicalSize int64) (int64, error) {
+func MaxEncodedFrameSizeBytes(comp string, logicalSize int64) (int64, error) {
 	if logicalSize <= 0 {
 		return 0, errors.New("logical size must be positive")
 	}
@@ -239,4 +201,34 @@ func ceilingMaxWSizeBucketBytes(size int64) int64 {
 		return maxWSizeBucket32MiB
 	}
 	return maxWSizeBucket64MiB
+}
+
+func maxFrameWireSizeHintBytes(comp string, logicalSize int64) (int64, error) {
+	return MaxFrameWireSizeHintBytes(comp, logicalSize)
+}
+
+func maxEncodedFrameSizeBytes(comp string, logicalSize int64) (int64, error) {
+	return MaxEncodedFrameSizeBytes(comp, logicalSize)
+}
+
+func CeilingMaxWSizeBucketBytes(size int64) int64 {
+	return ceilingMaxWSizeBucketBytes(size)
+}
+
+func FormatXXH128HashToken(v xxh3.Uint128) string {
+	b := v.Bytes()
+	return "xxh128:" + hex.EncodeToString(b[:])
+}
+
+func FormatXXH64HashToken(v uint64) string {
+	return "xxh64:" + hex.EncodeToString([]byte{
+		byte(v >> 56),
+		byte(v >> 48),
+		byte(v >> 40),
+		byte(v >> 32),
+		byte(v >> 24),
+		byte(v >> 16),
+		byte(v >> 8),
+		byte(v),
+	})
 }

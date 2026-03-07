@@ -21,8 +21,34 @@ import (
 	"syscall"
 	"time"
 
+	intcodec "github.com/jolynch/pinch/internal/filexfer/codec"
 	"github.com/zeebo/xxh3"
 )
+
+const (
+	EncodingIdentity = "identity"
+	EncodingZstd     = "zstd"
+	EncodingLz4      = "lz4"
+)
+
+type DownloadStatus struct {
+	Started int `json:"started"`
+	Running int `json:"running"`
+	Done    int `json:"done"`
+	Missing int `json:"missing"`
+}
+
+type TransferStatus struct {
+	TransferID     string         `json:"transfer_id"`
+	Directory      string         `json:"directory"`
+	NumFiles       int            `json:"num_files"`
+	TotalSize      int64          `json:"total_size"`
+	Done           uint64         `json:"done"`
+	DoneSize       int64          `json:"done_size"`
+	PercentFiles   float64        `json:"percent_files"`
+	PercentBytes   float64        `json:"percent_bytes"`
+	DownloadStatus DownloadStatus `json:"download_status"`
+}
 
 type Client struct {
 	BaseURL                 string
@@ -263,7 +289,7 @@ func (c *Client) FetchManifest(ctx context.Context, request FetchManifestRequest
 		return FetchManifestResponse{}, fmt.Errorf("manifest request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 
-	reader, err := WrapDecompressedReader(resp.Body, resp.Header.Get("Content-Encoding"))
+	reader, err := intcodec.WrapDecompressedReader(resp.Body, resp.Header.Get("Content-Encoding"))
 	if err != nil {
 		return FetchManifestResponse{}, fmt.Errorf("decode manifest body: %w", err)
 	}
@@ -495,7 +521,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		if closeWriteErr != nil {
 			return DownloadFileResponse{}, fmt.Errorf("close output file: %w", closeWriteErr)
 		}
-		localHash := formatXXH128HashToken(localHasher.Sum128())
+		localHash := intcodec.FormatXXH128HashToken(localHasher.Sum128())
 		if meta.FileHashToken != "" && !strings.EqualFold(meta.FileHashToken, localHash) {
 			return DownloadFileResponse{}, fmt.Errorf("file hash mismatch: server=%s client=%s", meta.FileHashToken, localHash)
 		}
@@ -683,7 +709,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		finalSyncMS = time.Since(finalSyncStart).Milliseconds()
 	}
 	synced = offset
-	fullHash := formatXXH128HashToken(fileHasher.Sum128())
+	fullHash := intcodec.FormatXXH128HashToken(fileHasher.Sum128())
 	if resultMeta.FileHashToken != "" && !strings.EqualFold(resultMeta.FileHashToken, fullHash) {
 		_ = closeWriter()
 		return DownloadFileResponse{}, fmt.Errorf("file hash mismatch: server=%s client=%s", resultMeta.FileHashToken, fullHash)
@@ -1762,7 +1788,7 @@ func decodePayloadReaderByComp(payload io.Reader, comp string) (io.ReadCloser, e
 	case "none":
 		return io.NopCloser(payload), nil
 	case EncodingZstd, EncodingLz4:
-		reader, err := WrapDecompressedReader(payload, comp)
+		reader, err := intcodec.WrapDecompressedReader(payload, comp)
 		if err != nil {
 			return nil, err
 		}

@@ -1,4 +1,4 @@
-package filexfer
+package filexfercli
 
 import (
 	"bytes"
@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	. "github.com/jolynch/pinch/filexfer"
 	"github.com/zeebo/xxh3"
 )
 

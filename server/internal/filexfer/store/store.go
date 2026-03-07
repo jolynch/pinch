@@ -1,4 +1,4 @@
-package filexfer
+package store
 
 import (
 	"crypto/rand"
@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jolynch/pinch/internal/filexfer/codec"
+	"github.com/jolynch/pinch/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 )
 
@@ -23,6 +25,15 @@ const (
 	TransferStateRunning
 	TransferStateDone
 	TransferStateMissing
+)
+
+type CompressionMode = policy.CompressionMode
+
+const (
+	CompressionModeZstdDefault = policy.CompressionModeZstdDefault
+	CompressionModeZstdLevel1  = policy.CompressionModeZstdLevel1
+	CompressionModeLz4         = policy.CompressionModeLz4
+	CompressionModeNone        = policy.CompressionModeNone
 )
 
 type Transfer struct {
@@ -257,7 +268,7 @@ func (s *transferStore) getFileCompressionMode(txferID string, fileID uint64) (C
 	if !ok || !state.hasLatestComp {
 		return CompressionModeLz4, false
 	}
-	return compressionModeFromStored(state.latestComp), true
+	return policy.CompressionModeFromStored(state.latestComp), true
 }
 
 func (s *transferStore) setFileCompressionMode(txferID string, fileID uint64, mode CompressionMode) bool {
@@ -699,6 +710,18 @@ func listTransfersForTest() []Transfer {
 	return manager.listForTest()
 }
 
+func ResetTransferStoreForTest() {
+	resetTransferStoreForTest()
+}
+
+func TransferCountForTest() int {
+	return transferCountForTest()
+}
+
+func ListTransfersForTest() []Transfer {
+	return listTransfersForTest()
+}
+
 func transferID() (string, error) {
 	buf := make([]byte, 4)
 	if _, err := rand.Read(buf); err != nil {
@@ -708,6 +731,21 @@ func transferID() (string, error) {
 }
 
 func formatXXH128HashToken(v xxh3.Uint128) string {
-	b := v.Bytes()
-	return "xxh128:" + hex.EncodeToString(b[:])
+	return codec.FormatXXH128HashToken(v)
+}
+
+func pathWithinRoot(root string, p string) bool {
+	root = filepath.Clean(root)
+	p = filepath.Clean(p)
+	rel, err := filepath.Rel(root, p)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return false
+	}
+	return !filepath.IsAbs(rel)
 }

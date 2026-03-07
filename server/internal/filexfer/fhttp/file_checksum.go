@@ -1,4 +1,4 @@
-package filexfer
+package fhttp
 
 import (
 	"fmt"
@@ -240,8 +240,4 @@ func finalChecksumTokens(algorithms []string, full128 *xxh3.Hasher128, full64 *x
 		}
 	}
 	return tokens
-}
-
-func formatXXH64HashToken(v uint64) string {
-	return fmt.Sprintf("xxh64:%016x", v)
 }

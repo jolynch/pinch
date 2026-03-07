@@ -14,8 +14,33 @@ import (
 	"strings"
 	"testing"
 
+	intcodec "github.com/jolynch/pinch/internal/filexfer/codec"
 	"github.com/zeebo/xxh3"
 )
+
+const defaultCLIEncodings = "zstd,lz4,identity"
+
+func encodeSingleFramePayload(data []byte, comp string) ([]byte, error) {
+	switch comp {
+	case "none":
+		return data, nil
+	case EncodingZstd, EncodingLz4:
+		var buf bytes.Buffer
+		out, closeEncoded, _, err := intcodec.WrapCompressedWriter(&buf, comp)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := out.Write(data); err != nil {
+			return nil, err
+		}
+		if err := closeEncoded(); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	default:
+		return nil, errors.New("unsupported compression mode")
+	}
+}
 
 func readAndClose(t *testing.T, r io.ReadCloser) ([]byte, error) {
 	t.Helper()
@@ -39,7 +64,7 @@ func frameHash64Token(header string, payload []byte, trailerPrefix string) strin
 		_, _ = h.Write(payload)
 	}
 	_, _ = h.Write([]byte(trailerPrefix))
-	return formatXXH64HashToken(h.Sum64())
+	return intcodec.FormatXXH64HashToken(h.Sum64())
 }
 
 func buildFXFrame(t *testing.T, fileID uint64, comp string, offset int64, logical []byte, next *int64) string {

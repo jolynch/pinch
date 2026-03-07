@@ -1,4 +1,4 @@
-package filexfer
+package codec
 
 import (
 	"fmt"

@@ -22,7 +22,9 @@ import (
 
 	"filippo.io/age"
 
-	"github.com/jolynch/pinch/filexfer"
+	"github.com/jolynch/pinch/internal/cmd/filexfercli"
+	"github.com/jolynch/pinch/internal/filexfer/fhttp"
+	"github.com/jolynch/pinch/internal/filexfer/limit"
 	"github.com/jolynch/pinch/state"
 	"github.com/jolynch/pinch/utils"
 )
@@ -668,7 +670,7 @@ func shouldRunCLI(args []string) bool {
 
 func main() {
 	if shouldRunCLI(os.Args) {
-		os.Exit(filexfer.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
+		os.Exit(filexfercli.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
 	flag.StringVar(&listen, "listen", listen, "The address to listen on")
@@ -684,7 +686,7 @@ func main() {
 
 	flag.Parse()
 
-	if err := filexfer.ConfigureFileStreamLimiter(fsFileRate, fsFileBurst, *fsFileTimeLimit); err != nil {
+	if err := limit.ConfigureFileStreamLimiter(fsFileRate, fsFileBurst, *fsFileTimeLimit); err != nil {
 		log.Fatalf("Invalid file stream limiter configuration: %v", err)
 	}
 
@@ -732,11 +734,11 @@ func main() {
 	mux.HandleFunc("/status/", getStatus)
 
 	// Filesystem API
-	mux.HandleFunc("PUT /fs/transfer", filexfer.TransferHandler)
-	mux.HandleFunc("GET /fs/transfer/{txferid}/status", filexfer.TransferStatusHandler)
-	mux.HandleFunc("GET /fs/file/{txferid}/{fid}", filexfer.FileHandler)
-	mux.HandleFunc("PUT /fs/file/{txferid}/{fid}/ack", filexfer.FileAckHandler)
-	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/checksum", filexfer.FileChecksumHandler)
+	mux.HandleFunc("PUT /fs/transfer", fhttp.TransferHandler)
+	mux.HandleFunc("GET /fs/transfer/{txferid}/status", fhttp.TransferStatusHandler)
+	mux.HandleFunc("GET /fs/file/{txferid}/{fid}", fhttp.FileHandler)
+	mux.HandleFunc("PUT /fs/file/{txferid}/{fid}/ack", fhttp.FileAckHandler)
+	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/checksum", fhttp.FileChecksumHandler)
 
 	if *dieAfter > 0 {
 		go die(*dieAfter)

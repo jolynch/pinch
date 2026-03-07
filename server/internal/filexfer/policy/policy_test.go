@@ -1,4 +1,4 @@
-package filexfer
+package policy
 
 import (
 	"math"

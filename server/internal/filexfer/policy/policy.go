@@ -1,6 +1,10 @@
-package filexfer
+package policy
 
-import "time"
+import (
+	"time"
+
+	"github.com/jolynch/pinch/internal/filexfer/codec"
+)
 
 type CompressionMode uint8
 
@@ -150,7 +154,7 @@ func upgradeMode(current CompressionMode) CompressionMode {
 	}
 }
 
-func compressionModeFromStored(raw uint8) CompressionMode {
+func CompressionModeFromStored(raw uint8) CompressionMode {
 	mode := CompressionMode(raw)
 	switch mode {
 	case CompressionModeZstdDefault, CompressionModeZstdLevel1, CompressionModeLz4, CompressionModeNone:
@@ -160,13 +164,20 @@ func compressionModeFromStored(raw uint8) CompressionMode {
 	}
 }
 
-func frameCompTokenForMode(mode CompressionMode) string {
+func FrameCompTokenForMode(mode CompressionMode) string {
 	switch mode {
 	case CompressionModeLz4:
-		return EncodingLz4
+		return codec.EncodingLz4
 	case CompressionModeNone:
 		return "none"
 	default:
-		return EncodingZstd
+		return codec.EncodingZstd
 	}
+}
+
+func compressionRatio(logicalSize int64, wireSize int64) float64 {
+	if wireSize <= 0 {
+		return 0
+	}
+	return float64(logicalSize) / float64(wireSize)
 }

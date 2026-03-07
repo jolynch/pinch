@@ -1,4 +1,4 @@
-package filexfer
+package limit
 
 import (
 	"context"
