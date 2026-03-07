@@ -30,12 +30,13 @@ FM/1 <transfer_id> <root>
 Format:
 
 ```text
-<id> <size> <mtime> <path>
+<id> <size> <mtime> <mode> <path>
 ```
 
 - `<id>`: unsigned integer file ID.
 - `<size>`: file size in bytes (unsigned integer).
 - `<mtime>`: front-coded mtime token using `<prefix_len>:<suffix_data>` format.
+- `<mode>`: octal Unix permission/mode bits (`0000`-`7777`), including setuid/setgid/sticky when present.
 - `<path>`: front-coded path token using `<prefix_len>:<suffix_len>:<suffix_data>` format.
 
 Fields are separated by a single ASCII space.
@@ -93,9 +94,9 @@ Path token format:
 Example:
 
 ```text
-0 100 1735771000 0:9:dir/a.txt
-1 200 1735771001 4:5:b.txt
-2 300 1735771002 5:9:sub/c.txt
+0 100 1735771000 0644 0:9:dir/a.txt
+1 200 1735771001 0600 4:5:b.txt
+2 300 1735771002 0755 5:9:sub/c.txt
 ```
 
 Resolves to:
@@ -118,11 +119,12 @@ Resolved path safety rules:
 - IDs should be monotonically increasing.
 - `size` must parse as unsigned integer.
 - `mtime` field must parse as `<prefix_len>:<suffix_data>`.
+- `mode` must parse as octal and be <= `07777`.
 - For first entry mtime, `prefix_len` must be `0`.
 - For later entries mtime, `prefix_len` must be <= byte length of previous resolved mtime string.
 - Mtime `suffix_data` must be decimal digits.
 - Decoded mtime must parse as unsigned integer Unix nanoseconds.
-- Each entry must have exactly 4 fields.
+- Each entry must have exactly 5 fields.
 - Path field must parse as `<prefix_len>:<suffix_len>:<suffix_data>`.
 - For first entry, `prefix_len` must be `0`.
 - For later entries, `prefix_len` must be <= byte length of previous resolved path.
@@ -133,8 +135,8 @@ Resolved path safety rules:
 
 ```text
 FM/1 9f83ab12 8:repo-root
-0 4096 0:1735771234567890123 0:14:data/chunk-000
-1 4096 14:90123 11:3:001
-2 1024 15:1350 11:3:002
-3 88 0:1736000000000000000 0:15:logs/result.txt
+0 4096 0:1735771234567890123 0644 0:14:data/chunk-000
+1 4096 14:90123 0644 11:3:001
+2 1024 15:1350 0644 11:3:002
+3 88 0:1736000000000000000 0600 0:15:logs/result.txt
 ```

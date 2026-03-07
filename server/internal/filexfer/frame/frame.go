@@ -32,7 +32,7 @@ func CollectFileFrameMetadata(path string, info os.FileInfo) FileFrameMetadata {
 	meta := FileFrameMetadata{
 		Size:    info.Size(),
 		MtimeNS: info.ModTime().UnixNano(),
-		Mode:    info.Mode().String(),
+		Mode:    fmt.Sprintf("%04o", info.Mode().Perm()|(info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky))),
 		UID:     "unknown",
 		GID:     "unknown",
 		User:    "unknown",
@@ -60,7 +60,7 @@ func (m FileFrameMetadata) trailerTokens() []string {
 	return []string{
 		fmt.Sprintf("meta:size=%d", m.Size),
 		fmt.Sprintf("meta:mtime_ns=%d", m.MtimeNS),
-		fmt.Sprintf("meta:mode=%s", strings.ReplaceAll(m.Mode, " ", "_")),
+		fmt.Sprintf("meta:mode=%s", m.Mode),
 		fmt.Sprintf("meta:uid=%s", m.UID),
 		fmt.Sprintf("meta:gid=%s", m.GID),
 		fmt.Sprintf("meta:user=%s", strings.ReplaceAll(m.User, " ", "_")),

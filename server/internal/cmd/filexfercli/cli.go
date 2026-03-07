@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -270,7 +271,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		return 1
 	}
 	progressUpdates := make(chan DownloadProgressUpdate, 128)
-	stopProgress := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
+	stopProgress, markMetadataDone := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
 	defer stopProgress()
 	var onAck func(AckProgressEvent)
 	if verbose {
@@ -280,8 +281,17 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 
 	client := NewClient(serverURL, nil)
 	start := time.Now()
-	if ack, ok := progressState[fileID]; ok && ack >= manifestEntrySize(manifest, fileID) {
-		fmt.Fprintf(stderr, "get skipped: already complete fd=%d ack=%d\n", fileID, ack)
+	if st, ok := progressState[fileID]; ok && st.AckBytes >= manifestEntrySize(manifest, fileID) {
+		if !st.MetadataDone {
+			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, fileID, outRoot, outFile); err != nil {
+				fmt.Fprintf(stderr, "get metadata refresh failed: %v\n", err)
+				return 1
+			}
+			markMetadataDone(fileID)
+			fmt.Fprintf(stderr, "get metadata refreshed: fd=%d\n", fileID)
+			return 0
+		}
+		fmt.Fprintf(stderr, "get skipped: already complete fd=%d ack=%d\n", fileID, st.AckBytes)
 		return 0
 	}
 	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
@@ -301,6 +311,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1
 	}
+	markMetadataDone(fileID)
 	printFileMetrics(stdout, manifest.TransferID, fileID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
 	return 0
 }
@@ -360,7 +371,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		return 1
 	}
 	progressUpdates := make(chan DownloadProgressUpdate, 1024)
-	stopProgress := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
+	stopProgress, markMetadataDone := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
 	defer stopProgress()
 	var onAck func(AckProgressEvent)
 	if verbose {
@@ -384,7 +395,16 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	worker := func() {
 		defer wg.Done()
 		for entry := range workCh {
-			if ack, ok := progressState[entry.ID]; ok && ack >= entry.Size {
+			if st, ok := progressState[entry.ID]; ok && st.AckBytes >= entry.Size {
+				if st.MetadataDone {
+					completed.Add(1)
+					continue
+				}
+				if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, ""); err != nil {
+					errCh <- fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err)
+					continue
+				}
+				markMetadataDone(entry.ID)
 				completed.Add(1)
 				continue
 			}
@@ -404,6 +424,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 				errCh <- fmt.Errorf("id=%d: %w", entry.ID, err)
 				continue
 			}
+			markMetadataDone(entry.ID)
 			completed.Add(1)
 			totalTransferred.Add(downloadResp.Meta.Size)
 			printStartFileSummary(stdout, entry.ID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, time.Since(startOne))
@@ -552,8 +573,13 @@ func manifestEntrySize(manifest *Manifest, fileID uint64) int64 {
 	return entry.Size
 }
 
-func loadProgressState(progressPath string) (map[uint64]int64, error) {
-	state := make(map[uint64]int64)
+type progressStateEntry struct {
+	AckBytes     int64
+	MetadataDone bool
+}
+
+func loadProgressState(progressPath string) (map[uint64]progressStateEntry, error) {
+	state := make(map[uint64]progressStateEntry)
 	fd, err := os.Open(progressPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -570,7 +596,7 @@ func loadProgressState(progressPath string) (map[uint64]int64, error) {
 			continue
 		}
 		parts := strings.Fields(line)
-		if len(parts) != 2 {
+		if len(parts) != 2 && len(parts) != 3 {
 			return nil, fmt.Errorf("invalid progress line: %q", line)
 		}
 		fileID, err := strconv.ParseUint(parts[0], 10, 64)
@@ -581,8 +607,23 @@ func loadProgressState(progressPath string) (map[uint64]int64, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid progress ack %q: %w", parts[1], err)
 		}
-		if prev, ok := state[fileID]; !ok || ack > prev {
-			state[fileID] = ack
+		metadataDone := false
+		if len(parts) == 3 {
+			switch parts[2] {
+			case "0":
+				metadataDone = false
+			case "1":
+				metadataDone = true
+			default:
+				return nil, fmt.Errorf("invalid progress metadata flag %q", parts[2])
+			}
+		}
+		prev, ok := state[fileID]
+		if !ok || ack > prev.AckBytes || (ack == prev.AckBytes && metadataDone && !prev.MetadataDone) {
+			state[fileID] = progressStateEntry{
+				AckBytes:     ack,
+				MetadataDone: metadataDone,
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -591,13 +632,19 @@ func loadProgressState(progressPath string) (map[uint64]int64, error) {
 	return state, nil
 }
 
-func startProgressWriter(progressPath string, initial map[uint64]int64, updates <-chan DownloadProgressUpdate, stderr io.Writer) func() {
-	state := make(map[uint64]int64, len(initial))
-	for fileID, ack := range initial {
-		state[fileID] = ack
+type metadataProgressUpdate struct {
+	FileID uint64
+	Ack    chan struct{}
+}
+
+func startProgressWriter(progressPath string, initial map[uint64]progressStateEntry, updates <-chan DownloadProgressUpdate, stderr io.Writer) (func(), func(uint64)) {
+	state := make(map[uint64]progressStateEntry, len(initial))
+	for fileID, entry := range initial {
+		state[fileID] = entry
 	}
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
+	metadataDoneCh := make(chan metadataProgressUpdate, 1024)
 
 	writeSnapshot := func() error {
 		dir := filepath.Dir(progressPath)
@@ -617,7 +664,12 @@ func startProgressWriter(progressPath string, initial map[uint64]int64, updates 
 		}
 		slices.Sort(ids)
 		for _, fileID := range ids {
-			if _, err := fmt.Fprintf(fd, "%d %d\n", fileID, state[fileID]); err != nil {
+			entry := state[fileID]
+			metaDone := 0
+			if entry.MetadataDone {
+				metaDone = 1
+			}
+			if _, err := fmt.Fprintf(fd, "%d %d %d\n", fileID, entry.AckBytes, metaDone); err != nil {
 				_ = fd.Close()
 				return err
 			}
@@ -651,10 +703,20 @@ func startProgressWriter(progressPath string, initial map[uint64]int64, updates 
 					}
 					return
 				}
-				if prev, ok := state[update.FileID]; !ok || update.AckBytes > prev {
-					state[update.FileID] = update.AckBytes
+				prev := state[update.FileID]
+				if update.AckBytes > prev.AckBytes {
+					prev.AckBytes = update.AckBytes
+					state[update.FileID] = prev
 					dirty = true
 				}
+			case update := <-metadataDoneCh:
+				prev := state[update.FileID]
+				if !prev.MetadataDone {
+					prev.MetadataDone = true
+					state[update.FileID] = prev
+					dirty = true
+				}
+				close(update.Ack)
 			case <-ticker.C:
 				if dirty {
 					if err := writeSnapshot(); err != nil {
@@ -667,10 +729,225 @@ func startProgressWriter(progressPath string, initial map[uint64]int64, updates 
 		}
 	}()
 
-	return func() {
+	stop := func() {
 		close(stopCh)
 		<-doneCh
 	}
+	markMetadataDone := func(fileID uint64) {
+		ack := make(chan struct{})
+		select {
+		case <-doneCh:
+			return
+		case metadataDoneCh <- metadataProgressUpdate{FileID: fileID, Ack: ack}:
+		}
+		select {
+		case <-doneCh:
+		case <-ack:
+		}
+	}
+	return stop, markMetadataDone
+}
+
+func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest *Manifest, fileID uint64, outRoot string, outFile string) error {
+	if manifest == nil {
+		return errors.New("nil manifest")
+	}
+	entry, ok := manifest.EntryByID(fileID)
+	if !ok {
+		return fmt.Errorf("file id %d not in manifest", fileID)
+	}
+	destPath := outFile
+	if destPath == "" {
+		if outRoot == "" {
+			outRoot = "."
+		}
+		destPath = filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
+	}
+	if destPath == "-" {
+		return nil
+	}
+	serverPath := filepath.Clean(filepath.Join(manifest.Root, filepath.FromSlash(entry.Path)))
+	if !filepath.IsAbs(serverPath) {
+		return fmt.Errorf("resolved file path is not absolute: %s", serverPath)
+	}
+	meta, err := fetchTerminalTrailerMetadataFromChecksum(ctx, client, manifest.TransferID, fileID, serverPath, entry.Size)
+	if err != nil {
+		return err
+	}
+	if meta == nil {
+		return errors.New("checksum response missing terminal trailer metadata")
+	}
+	return applyTrailerMetadataToPath(destPath, meta)
+}
+
+func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Client, transferID string, fileID uint64, serverPath string, fileSize int64) (*FileTrailerMetadata, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d/checksum", client.BaseURL, url.PathEscape(transferID), fileID))
+	if err != nil {
+		return nil, fmt.Errorf("build checksum url: %w", err)
+	}
+	q := u.Query()
+	q.Set("path", serverPath)
+	if fileSize > 0 {
+		q.Set("window-size", strconv.FormatInt(fileSize, 10))
+	}
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build checksum request: %w", err)
+	}
+	resp, err := client.FileClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("checksum request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+		return nil, fmt.Errorf("checksum request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	br := bufio.NewReader(resp.Body)
+	var terminal *FileTrailerMetadata
+	for {
+		headerLine, readErr := br.ReadString('\n')
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) && strings.TrimSpace(headerLine) == "" {
+				break
+			}
+			return nil, fmt.Errorf("read checksum frame header: %w", readErr)
+		}
+		wsize, err := parseFrameWireSize(strings.TrimRight(headerLine, "\r\n"))
+		if err != nil {
+			return nil, err
+		}
+		if wsize > 0 {
+			if _, err := io.CopyN(io.Discard, br, wsize); err != nil {
+				return nil, fmt.Errorf("discard checksum frame payload: %w", err)
+			}
+		}
+		trailerLine, err := br.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("read checksum frame trailer: %w", err)
+		}
+		meta, isTerminal, err := parseTrailerMetadata(strings.TrimRight(trailerLine, "\r\n"))
+		if err != nil {
+			return nil, err
+		}
+		if isTerminal && meta != nil {
+			terminal = meta
+		}
+	}
+	return terminal, nil
+}
+
+func parseFrameWireSize(line string) (int64, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 || fields[0] != "FX/1" {
+		return 0, errors.New("invalid checksum frame header")
+	}
+	for _, token := range fields[2:] {
+		if strings.HasPrefix(token, "wsize=") {
+			v, err := strconv.ParseInt(strings.TrimPrefix(token, "wsize="), 10, 64)
+			if err != nil || v < 0 {
+				return 0, errors.New("invalid checksum frame wsize")
+			}
+			return v, nil
+		}
+	}
+	return 0, errors.New("checksum frame missing wsize")
+}
+
+func parseTrailerMetadata(line string) (*FileTrailerMetadata, bool, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 || fields[0] != "FXT/1" {
+		return nil, false, errors.New("invalid checksum frame trailer")
+	}
+	isTerminal := false
+	meta := &FileTrailerMetadata{}
+	hasMeta := false
+	for _, token := range fields[2:] {
+		if strings.HasPrefix(token, "next=") {
+			nextRaw := strings.TrimPrefix(token, "next=")
+			next, err := strconv.ParseInt(nextRaw, 10, 64)
+			if err != nil || next < 0 {
+				return nil, false, errors.New("invalid checksum frame trailer next offset")
+			}
+			isTerminal = next == 0
+			continue
+		}
+		if strings.HasPrefix(token, "meta:") {
+			parts := strings.SplitN(token, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimPrefix(parts[0], "meta:")
+			val := parts[1]
+			switch key {
+			case "mode":
+				meta.Mode = val
+				hasMeta = true
+			case "uid":
+				meta.UID = val
+				hasMeta = true
+			case "gid":
+				meta.GID = val
+				hasMeta = true
+			case "user":
+				meta.User = val
+			case "group":
+				meta.Group = val
+			case "size":
+				meta.Size, _ = strconv.ParseInt(val, 10, 64)
+			case "mtime_ns":
+				meta.MtimeNS, _ = strconv.ParseInt(val, 10, 64)
+			}
+		}
+	}
+	if !hasMeta {
+		meta = nil
+	}
+	return meta, isTerminal, nil
+}
+
+func applyTrailerMetadataToPath(path string, meta *FileTrailerMetadata) error {
+	if meta == nil {
+		return nil
+	}
+	fd, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open destination for metadata apply: %w", err)
+	}
+	defer fd.Close()
+
+	modeRaw := strings.TrimSpace(meta.Mode)
+	if modeRaw != "" {
+		modeBits, err := strconv.ParseUint(modeRaw, 8, 32)
+		if err != nil || modeBits > 0o7777 {
+			return fmt.Errorf("invalid trailer mode %q", modeRaw)
+		}
+		if err := fd.Chmod(os.FileMode(modeBits)); err != nil {
+			return fmt.Errorf("chmod destination to %s: %w", modeRaw, err)
+		}
+	}
+	uidRaw := strings.TrimSpace(meta.UID)
+	gidRaw := strings.TrimSpace(meta.GID)
+	if uidRaw == "" && gidRaw == "" {
+		return nil
+	}
+	if uidRaw == "" || gidRaw == "" {
+		return errors.New("trailer uid/gid must both be set")
+	}
+	uid, err := strconv.Atoi(uidRaw)
+	if err != nil {
+		return fmt.Errorf("invalid trailer uid %q: %w", uidRaw, err)
+	}
+	gid, err := strconv.Atoi(gidRaw)
+	if err != nil {
+		return fmt.Errorf("invalid trailer gid %q: %w", gidRaw, err)
+	}
+	if err := fd.Chown(uid, gid); err != nil {
+		return fmt.Errorf("chown destination uid=%d gid=%d: %w", uid, gid, err)
+	}
+	return nil
 }
 
 type ackMilestoneReporter struct {

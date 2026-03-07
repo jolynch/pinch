@@ -21,6 +21,7 @@ type manifestEntry struct {
 	path  string
 	size  int64
 	mtime string
+	mode  string
 }
 
 func TransferHandler(w http.ResponseWriter, req *http.Request) {
@@ -200,10 +201,11 @@ func encodeManifest(w io.Writer, transferID string, root string, maxChunkSize in
 			path:  filepath.ToSlash(rel),
 			size:  info.Size(),
 			mtime: strconv.FormatInt(info.ModTime().UnixNano(), 10),
+			mode:  formatManifestMode(info.Mode()),
 		}
 		pathToken := frontToken(prevPath, entry.path, verbose)
 		mtimeToken := mtimeFrontToken(prevMtime, entry.mtime, verbose)
-		line := fmt.Sprintf("%d %d %s %s\n", fileID, entry.size, mtimeToken, pathToken)
+		line := fmt.Sprintf("%d %d %s %s %s\n", fileID, entry.size, mtimeToken, entry.mode, pathToken)
 
 		if maxChunkSize > 0 && chunkBytes+len(line) > maxChunkSize {
 			if chunkBytes == len(header) {
@@ -218,7 +220,7 @@ func encodeManifest(w io.Writer, transferID string, root string, maxChunkSize in
 
 			pathToken = frontToken("", entry.path, verbose)
 			mtimeToken = mtimeFrontToken("", entry.mtime, verbose)
-			line = fmt.Sprintf("%d %d %s %s\n", fileID, entry.size, mtimeToken, pathToken)
+			line = fmt.Sprintf("%d %d %s %s %s\n", fileID, entry.size, mtimeToken, entry.mode, pathToken)
 			if chunkBytes+len(line) > maxChunkSize {
 				return errors.New("max-manifest-chunk-size is too small for manifest entry")
 			}
@@ -274,6 +276,11 @@ func mtimeFrontToken(prev string, curr string, verbose bool) string {
 	}
 	suffix := curr[prefix:]
 	return fmt.Sprintf("%d:%s", prefix, suffix)
+}
+
+func formatManifestMode(mode os.FileMode) string {
+	bits := mode.Perm() | (mode & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
+	return fmt.Sprintf("%04o", bits)
 }
 
 type countingWriter struct {

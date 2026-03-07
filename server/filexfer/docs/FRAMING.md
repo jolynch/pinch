@@ -106,7 +106,7 @@ Receiver behavior:
 
 ## Semantics
 
-- `mtime` and full-file `size` are manifest properties, not framing properties.
+- `mtime`, mode/permissions, and full-file `size` are manifest properties, not framing properties.
 - `offset` allows resumable/partial writes.
 - `size` is the logical uncompressed bytes covered by this frame.
 - `wsize` is the exact payload byte count that follows the header newline.
@@ -230,6 +230,8 @@ The final trailer uses `next=0` as a terminal marker.
 `file-hash` is emitted on final trailer as the full-file checksum token for the served file window.
 The final trailer also includes file metadata tokens:
 `meta:size`, `meta:mtime_ns`, `meta:mode`, `meta:uid`, `meta:gid`, `meta:user`, `meta:group`.
+Clients may use `meta:mode`, `meta:uid`, and `meta:gid` to mirror ownership/permissions
+only after payload integrity verification succeeds.
 
 `hash=<algo>:<value>` is the canonical checksum token for `/fs/file` trailers.
 For `/fs/file`, trailer hash is `hash=xxh64:<hex16>` and covers:

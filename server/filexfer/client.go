@@ -72,7 +72,18 @@ type ManifestEntry struct {
 	ID    uint64
 	Size  int64
 	Mtime int64
+	Mode  os.FileMode
 	Path  string
+}
+
+type FileTrailerMetadata struct {
+	Size    int64
+	MtimeNS int64
+	Mode    string
+	UID     string
+	GID     string
+	User    string
+	Group   string
 }
 
 type FileFrameMeta struct {
@@ -88,19 +99,21 @@ type FileFrameMeta struct {
 	TrailerTS       int64
 	HashToken       string
 	FileHashToken   string
+	TrailerMetadata *FileTrailerMetadata
 }
 
 type DownloadFileRequest struct {
-	Manifest        *Manifest
-	FileID          uint64
-	OutRoot         string
-	OutFile         string
-	Stdout          io.Writer
-	AcceptEncoding  string
-	AckEveryBytes   int64
-	NoSync          bool
-	ProgressUpdates chan<- DownloadProgressUpdate
-	OnAck           func(AckProgressEvent)
+	Manifest                *Manifest
+	FileID                  uint64
+	OutRoot                 string
+	OutFile                 string
+	Stdout                  io.Writer
+	AcceptEncoding          string
+	AckEveryBytes           int64
+	NoSync                  bool
+	MetadataApplyBestEffort bool
+	ProgressUpdates         chan<- DownloadProgressUpdate
+	OnAck                   func(AckProgressEvent)
 }
 
 type DownloadProgressUpdate struct {
@@ -667,6 +680,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		if firstMeta == nil {
 			tmp := *windowMeta
 			tmp.CompCounts = copyCompCounts(windowMeta.CompCounts)
+			tmp.TrailerMetadata = cloneTrailerMetadata(windowMeta.TrailerMetadata)
 			firstMeta = &tmp
 			resultMeta = tmp
 		} else {
@@ -680,6 +694,9 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			mergeCompCounts(resultMeta.CompCounts, windowMeta.CompCounts)
 			if windowMeta.FileHashToken != "" {
 				resultMeta.FileHashToken = windowMeta.FileHashToken
+			}
+			if windowMeta.TrailerMetadata != nil {
+				resultMeta.TrailerMetadata = cloneTrailerMetadata(windowMeta.TrailerMetadata)
 			}
 		}
 	}
@@ -713,6 +730,10 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	if resultMeta.FileHashToken != "" && !strings.EqualFold(resultMeta.FileHashToken, fullHash) {
 		_ = closeWriter()
 		return DownloadFileResponse{}, fmt.Errorf("file hash mismatch: server=%s client=%s", resultMeta.FileHashToken, fullHash)
+	}
+	if err := applyVerifiedFileMetadata(fileWriter, resultMeta.TrailerMetadata, req.MetadataApplyBestEffort); err != nil {
+		_ = closeWriter()
+		return DownloadFileResponse{}, err
 	}
 	if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{
 		AckBytes:   synced,
@@ -1215,6 +1236,73 @@ func resolveManifestEntryPath(manifest *Manifest, fileID uint64) (ManifestEntry,
 	return entry, serverPath, nil
 }
 
+func cloneTrailerMetadata(meta *FileTrailerMetadata) *FileTrailerMetadata {
+	if meta == nil {
+		return nil
+	}
+	cloned := *meta
+	return &cloned
+}
+
+func applyVerifiedFileMetadata(fileWriter *os.File, meta *FileTrailerMetadata, bestEffort bool) error {
+	if fileWriter == nil || meta == nil {
+		return nil
+	}
+	if modeRaw := strings.TrimSpace(meta.Mode); modeRaw != "" {
+		mode, err := parseManifestModeToken(modeRaw)
+		if err != nil {
+			if bestEffort {
+				log.Printf("filexfer client: unable to parse trailer mode %q: %v", modeRaw, err)
+			} else {
+				return fmt.Errorf("parse trailer mode %q: %w", modeRaw, err)
+			}
+		} else if err := fileWriter.Chmod(mode); err != nil {
+			if bestEffort {
+				log.Printf("filexfer client: chmod failed mode=%s err=%v", modeRaw, err)
+			} else {
+				return fmt.Errorf("chmod output file to %s: %w", modeRaw, err)
+			}
+		}
+	}
+	uidRaw := strings.TrimSpace(meta.UID)
+	gidRaw := strings.TrimSpace(meta.GID)
+	if uidRaw == "" && gidRaw == "" {
+		return nil
+	}
+	if uidRaw == "" || gidRaw == "" {
+		err := errors.New("trailer uid/gid must both be set")
+		if bestEffort {
+			log.Printf("filexfer client: skipping chown: %v uid=%q gid=%q", err, uidRaw, gidRaw)
+			return nil
+		}
+		return err
+	}
+	uid, err := strconv.Atoi(uidRaw)
+	if err != nil {
+		if bestEffort {
+			log.Printf("filexfer client: invalid trailer uid %q: %v", uidRaw, err)
+			return nil
+		}
+		return fmt.Errorf("invalid trailer uid %q: %w", uidRaw, err)
+	}
+	gid, err := strconv.Atoi(gidRaw)
+	if err != nil {
+		if bestEffort {
+			log.Printf("filexfer client: invalid trailer gid %q: %v", gidRaw, err)
+			return nil
+		}
+		return fmt.Errorf("invalid trailer gid %q: %w", gidRaw, err)
+	}
+	if err := fileWriter.Chown(uid, gid); err != nil {
+		if bestEffort {
+			log.Printf("filexfer client: chown failed uid=%d gid=%d err=%v", uid, gid, err)
+			return nil
+		}
+		return fmt.Errorf("chown output file uid=%d gid=%d: %w", uid, gid, err)
+	}
+	return nil
+}
+
 func parseManifestHeader(line string) (string, string, error) {
 	rest := strings.TrimPrefix(line, "FM/1 ")
 	sep := strings.IndexByte(rest, ' ')
@@ -1245,11 +1333,17 @@ func parseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 		return ManifestEntry{}, "", "", errors.New("invalid manifest entry")
 	}
 	third += second + 1
+	fourth := strings.IndexByte(line[third+1:], ' ')
+	if fourth < 0 {
+		return ManifestEntry{}, "", "", errors.New("invalid manifest entry")
+	}
+	fourth += third + 1
 
 	idRaw := line[:first]
 	sizeRaw := line[first+1 : second]
 	mtimeToken := line[second+1 : third]
-	pathToken := line[third+1:]
+	modeRaw := line[third+1 : fourth]
+	pathToken := line[fourth+1:]
 
 	id, err := strconv.ParseUint(idRaw, 10, 64)
 	if err != nil {
@@ -1274,6 +1368,10 @@ func parseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 	if mtimeNanos > uint64(^uint64(0)>>1) {
 		return ManifestEntry{}, "", "", errors.New("manifest mtime overflows int64")
 	}
+	mode, err := parseManifestModeToken(modeRaw)
+	if err != nil {
+		return ManifestEntry{}, "", "", err
+	}
 
 	pathResolved, err := decodePathToken(prevPath, pathToken)
 	if err != nil {
@@ -1294,9 +1392,29 @@ func parseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 		ID:    id,
 		Size:  int64(sizeU),
 		Mtime: int64(mtimeNanos),
+		Mode:  mode,
 		Path:  pathResolved,
 	}
 	return entry, pathResolved, mtimeResolved, nil
+}
+
+func parseManifestModeToken(raw string) (os.FileMode, error) {
+	if raw == "" {
+		return 0, errors.New("manifest mode is required")
+	}
+	for _, ch := range raw {
+		if ch < '0' || ch > '7' {
+			return 0, errors.New("manifest mode must be octal")
+		}
+	}
+	v, err := strconv.ParseUint(raw, 8, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid manifest mode: %w", err)
+	}
+	if v > 0o7777 {
+		return 0, errors.New("manifest mode must be <= 07777")
+	}
+	return os.FileMode(v), nil
 }
 
 func parseLenPrefixed(token string) (string, error) {
@@ -1589,6 +1707,9 @@ func (s *fileStream) finishFrame() error {
 	if trailer.FileHashToken != "" {
 		s.meta.FileHashToken = trailer.FileHashToken
 	}
+	if trailer.Metadata != nil {
+		s.meta.TrailerMetadata = cloneTrailerMetadata(trailer.Metadata)
+	}
 
 	closeErr := s.logical.Close()
 	s.logical = nil
@@ -1678,6 +1799,7 @@ type frameTrailer struct {
 	FileHashToken  string
 	ChecksumPrefix string
 	Next           *int64
+	Metadata       *FileTrailerMetadata
 }
 
 func parseFXTrailer(line string) (frameTrailer, error) {
@@ -1697,6 +1819,11 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 	var fileHashToken string
 	var ts int64 = -1
 	var nextOffset *int64
+	meta := FileTrailerMetadata{
+		Size:    -1,
+		MtimeNS: -1,
+	}
+	hasMeta := false
 	for _, token := range fields[2:] {
 		if strings.HasPrefix(token, "status=") {
 			status = strings.TrimPrefix(token, "status=")
@@ -1720,6 +1847,45 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 			}
 			nextOffset = &nextValue
 		}
+		if strings.HasPrefix(token, "meta:") {
+			parts := strings.SplitN(token, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimPrefix(parts[0], "meta:")
+			val := parts[1]
+			switch key {
+			case "size":
+				sizeVal, parseErr := strconv.ParseInt(val, 10, 64)
+				if parseErr != nil || sizeVal < 0 {
+					return frameTrailer{}, errors.New("invalid trailer meta:size")
+				}
+				meta.Size = sizeVal
+				hasMeta = true
+			case "mtime_ns":
+				mtimeVal, parseErr := strconv.ParseInt(val, 10, 64)
+				if parseErr != nil || mtimeVal < 0 {
+					return frameTrailer{}, errors.New("invalid trailer meta:mtime_ns")
+				}
+				meta.MtimeNS = mtimeVal
+				hasMeta = true
+			case "mode":
+				meta.Mode = val
+				hasMeta = true
+			case "uid":
+				meta.UID = val
+				hasMeta = true
+			case "gid":
+				meta.GID = val
+				hasMeta = true
+			case "user":
+				meta.User = val
+				hasMeta = true
+			case "group":
+				meta.Group = val
+				hasMeta = true
+			}
+		}
 	}
 	if status != "ok" {
 		return frameTrailer{}, fmt.Errorf("trailer status not ok: %s", status)
@@ -1733,6 +1899,16 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 	if fileHashToken != "" && !validHashToken(fileHashToken) {
 		return frameTrailer{}, errors.New("trailer invalid file hash token")
 	}
+	var metaPtr *FileTrailerMetadata
+	if hasMeta {
+		if meta.Size < 0 {
+			meta.Size = 0
+		}
+		if meta.MtimeNS < 0 {
+			meta.MtimeNS = 0
+		}
+		metaPtr = &meta
+	}
 	return frameTrailer{
 		FileID:         fileID,
 		TS:             ts,
@@ -1740,6 +1916,7 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 		FileHashToken:  fileHashToken,
 		ChecksumPrefix: prefix,
 		Next:           nextOffset,
+		Metadata:       metaPtr,
 	}, nil
 }
 

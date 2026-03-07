@@ -68,6 +68,10 @@ func frameHash64Token(header string, payload []byte, trailerPrefix string) strin
 }
 
 func buildFXFrame(t *testing.T, fileID uint64, comp string, offset int64, logical []byte, next *int64) string {
+	return buildFXFrameWithTrailerTokens(t, fileID, comp, offset, logical, next)
+}
+
+func buildFXFrameWithTrailerTokens(t *testing.T, fileID uint64, comp string, offset int64, logical []byte, next *int64, trailerTokens ...string) string {
 	t.Helper()
 	payload, err := encodeSingleFramePayload(logical, comp)
 	if err != nil {
@@ -90,6 +94,12 @@ func buildFXFrame(t *testing.T, fileID uint64, comp string, offset int64, logica
 	if next != nil {
 		trailerPrefix += fmt.Sprintf(" next=%d", *next)
 	}
+	for _, token := range trailerTokens {
+		if strings.TrimSpace(token) == "" {
+			continue
+		}
+		trailerPrefix += " " + token
+	}
 	trailer := trailerPrefix + " hash=" + frameHash64Token(header, payload, trailerPrefix)
 	return header + string(payload) + trailer + "\n"
 }
@@ -110,6 +120,22 @@ func TestParseFXHeaderInvalidMaxWSizeHint(t *testing.T) {
 	}
 	if _, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none enc=none hash=xxh128:abc max-wsize=nope ts=1000"); err == nil {
 		t.Fatalf("expected parse error for malformed max-wsize")
+	}
+}
+
+func TestParseFXTrailerParsesMetadata(t *testing.T) {
+	trailer, err := parseFXTrailer("FXT/1 7 status=ok ts=1001 next=0 meta:mode=0640 meta:uid=123 meta:gid=456 meta:user=alice meta:group=dev meta:unknown=x hash=xxh64:0123456789abcdef")
+	if err != nil {
+		t.Fatalf("parseFXTrailer failed: %v", err)
+	}
+	if trailer.Metadata == nil {
+		t.Fatalf("expected metadata")
+	}
+	if trailer.Metadata.Mode != "0640" || trailer.Metadata.UID != "123" || trailer.Metadata.GID != "456" {
+		t.Fatalf("unexpected metadata: %+v", trailer.Metadata)
+	}
+	if trailer.Metadata.User != "alice" || trailer.Metadata.Group != "dev" {
+		t.Fatalf("unexpected user/group metadata: %+v", trailer.Metadata)
 	}
 }
 
@@ -138,8 +164,8 @@ func TestEffectiveFrameReadBufferSize(t *testing.T) {
 func TestParseManifestSingleChunk(t *testing.T) {
 	raw := strings.Join([]string{
 		"FM/1 tx123 5:/root",
-		"0 5 0:100 0:5:a.txt",
-		"1 7 2:1 0:9:dir/b.txt",
+		"0 5 0:100 0644 0:5:a.txt",
+		"1 7 2:1 0600 0:9:dir/b.txt",
 		"",
 	}, "\n")
 
@@ -159,15 +185,18 @@ func TestParseManifestSingleChunk(t *testing.T) {
 	if manifest.Entries[1].Mtime != 101 {
 		t.Fatalf("expected decoded mtime 101, got %d", manifest.Entries[1].Mtime)
 	}
+	if manifest.Entries[1].Mode != 0o600 {
+		t.Fatalf("expected parsed mode 0600, got %04o", manifest.Entries[1].Mode)
+	}
 }
 
 func TestParseManifestMultiChunk(t *testing.T) {
 	raw := strings.Join([]string{
 		"FM/1 tx456 6:/root2",
-		"0 5 0:100 0:5:a.txt",
+		"0 5 0:100 0644 0:5:a.txt",
 		"",
 		"FM/1 tx456 6:/root2",
-		"1 3 0:200 0:5:b.txt",
+		"1 3 0:200 0600 0:5:b.txt",
 		"",
 	}, "\n")
 
@@ -183,11 +212,22 @@ func TestParseManifestMultiChunk(t *testing.T) {
 func TestParseManifestMalformed(t *testing.T) {
 	raw := strings.Join([]string{
 		"FM/1 tx789 5:/root",
-		"0 5 0:abc 0:5:a.txt",
+		"0 5 0:abc 0644 0:5:a.txt",
 		"",
 	}, "\n")
 	if _, err := parseManifest([]byte(raw)); err == nil {
 		t.Fatalf("expected parseManifest error")
+	}
+}
+
+func TestParseManifestLegacyEntryRejected(t *testing.T) {
+	raw := strings.Join([]string{
+		"FM/1 tx789 5:/root",
+		"0 5 0:100 0:5:a.txt",
+		"",
+	}, "\n")
+	if _, err := parseManifest([]byte(raw)); err == nil {
+		t.Fatalf("expected legacy manifest format to be rejected")
 	}
 }
 
@@ -462,6 +502,159 @@ func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 	}
 	if !sawDataReq || !sawAckReq {
 		t.Fatalf("expected both data and ack-only requests")
+	}
+}
+
+func TestDownloadFileFromManifestAppliesModeAfterVerify(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txmode",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "dir/a.txt"},
+		},
+	}
+	logical := []byte("hello")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/fs/file/txmode/0" {
+			frame := buildFXFrameWithTrailerTokens(t, 0, "none", 0, logical, nil, "meta:mode=0600")
+			_, _ = w.Write([]byte(frame))
+			return
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/fs/file/txmode/0/ack" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, nil)
+	resp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:       manifest,
+		FileID:         0,
+		OutRoot:        outRoot,
+		AcceptEncoding: defaultCLIEncodings,
+	})
+	if err != nil {
+		t.Fatalf("DownloadFileFromManifest failed: %v", err)
+	}
+	info, err := os.Stat(resp.DestinationPath)
+	if err != nil {
+		t.Fatalf("stat output file: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected mode 0600, got %04o", info.Mode().Perm())
+	}
+}
+
+func TestDownloadFileFromManifestMetadataStrictFailure(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txstrict",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	logical := []byte("hello")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/fs/file/txstrict/0" {
+			frame := buildFXFrameWithTrailerTokens(t, 0, "none", 0, logical, nil, "meta:uid=not-a-number", "meta:gid=123")
+			_, _ = w.Write([]byte(frame))
+			return
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/fs/file/txstrict/0/ack" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, nil)
+	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:       manifest,
+		FileID:         0,
+		OutRoot:        outRoot,
+		AcceptEncoding: defaultCLIEncodings,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid trailer uid") {
+		t.Fatalf("expected strict metadata failure, got %v", err)
+	}
+}
+
+func TestDownloadFileFromManifestMetadataBestEffort(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txbest",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	logical := []byte("hello")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/fs/file/txbest/0" {
+			frame := buildFXFrameWithTrailerTokens(t, 0, "none", 0, logical, nil, "meta:uid=not-a-number", "meta:gid=123")
+			_, _ = w.Write([]byte(frame))
+			return
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/fs/file/txbest/0/ack" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, nil)
+	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:                manifest,
+		FileID:                  0,
+		OutRoot:                 outRoot,
+		AcceptEncoding:          defaultCLIEncodings,
+		MetadataApplyBestEffort: true,
+	})
+	if err != nil {
+		t.Fatalf("expected best-effort metadata apply success, got %v", err)
+	}
+}
+
+func TestDownloadFileFromManifestVerifiesBeforeMetadataApply(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txverify",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	logical := []byte("hello")
+	const badFileHash = "xxh128:00000000000000000000000000000000"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/fs/file/txverify/0" {
+			frame := buildFXFrameWithTrailerTokens(t, 0, "none", 0, logical, nil, "file-hash="+badFileHash, "meta:uid=not-a-number", "meta:gid=123")
+			_, _ = w.Write([]byte(frame))
+			return
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/fs/file/txverify/0/ack" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, nil)
+	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:       manifest,
+		FileID:         0,
+		OutRoot:        outRoot,
+		AcceptEncoding: defaultCLIEncodings,
+	})
+	if err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
+		t.Fatalf("expected hash verification failure before metadata apply, got %v", err)
 	}
 }
 

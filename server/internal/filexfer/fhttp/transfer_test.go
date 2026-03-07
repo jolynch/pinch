@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -144,4 +145,28 @@ func TestTransferHandlerRegistersFullPathHash(t *testing.T) {
 		t.Fatalf("expected one file state, got %d", len(states))
 	}
 	t.Fatalf("expected hash %v, got %v", expected, states[0].PathHash)
+}
+
+func TestTransferHandlerManifestIncludesModeField(t *testing.T) {
+	resetTransferStore()
+	dir := createManifestFixtureDir(t)
+	req := httptest.NewRequest(http.MethodGet, "/transfer?directory="+url.QueryEscape(dir), nil)
+	w := httptest.NewRecorder()
+
+	TransferHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 response, got %d body=%s", w.Code, w.Body.String())
+	}
+	lines := strings.Split(strings.TrimSpace(w.Body.String()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected header and entry in manifest, got %q", w.Body.String())
+	}
+	fields := strings.SplitN(lines[1], " ", 5)
+	if len(fields) != 5 {
+		t.Fatalf("expected 5 manifest fields, got %d line=%q", len(fields), lines[1])
+	}
+	if gotMode := fields[3]; gotMode != "0644" {
+		t.Fatalf("expected mode field 0644, got %q", gotMode)
+	}
 }

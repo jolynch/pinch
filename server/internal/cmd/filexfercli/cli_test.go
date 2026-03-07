@@ -38,11 +38,31 @@ func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 	return fmt.Sprintf("%s%s%s hash=xxh64:%016x\n", header, string(body), trailerPrefix, h.Sum64())
 }
 
+func buildCLIChecksumFrame(fileID uint64, size int64, mode string, uid int, gid int) string {
+	header := fmt.Sprintf(
+		"FX/1 %d offset=0 size=%d wsize=0 comp=none enc=none hash=xxh128:00 ts=1000\n",
+		fileID,
+		size,
+	)
+	trailerPrefix := fmt.Sprintf(
+		"FXT/1 %d status=ok ts=1001 next=0 meta:size=%d meta:mtime_ns=100 meta:mode=%s meta:uid=%d meta:gid=%d",
+		fileID,
+		size,
+		mode,
+		uid,
+		gid,
+	)
+	h := xxh3.New()
+	_, _ = h.Write([]byte(header))
+	_, _ = h.Write([]byte(trailerPrefix))
+	return fmt.Sprintf("%s%s hash=xxh64:%016x\n", header, trailerPrefix, h.Sum64())
+}
+
 func TestRunCLITransferAndGet(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
 		"FM/1 txcli 7:/remote",
-		"0 5 0:100 0:5:a.txt",
+		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 	fileBody := []byte("hello")
@@ -121,7 +141,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 func TestRunCLITransferDefaultsToStdoutManifest(t *testing.T) {
 	manifestRaw := strings.Join([]string{
 		"FM/1 txstdout 7:/remote",
-		"0 5 0:100 0:5:a.txt",
+		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 
@@ -151,7 +171,7 @@ func TestRunCLITransferDefaultsToStdoutManifest(t *testing.T) {
 func TestRunCLITransferDashOutputWritesManifestToStdout(t *testing.T) {
 	manifestRaw := strings.Join([]string{
 		"FM/1 txstdoutdash 7:/remote",
-		"0 5 0:100 0:5:a.txt",
+		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 
@@ -183,8 +203,8 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	manifestPath := filepath.Join(tmp, "txstart.fm1")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txstart 7:/remote",
-		"0 5 0:100 0:5:a.txt",
-		"1 4 0:101 0:5:b.txt",
+		"0 5 0:100 0644 0:5:a.txt",
+		"1 4 0:101 0644 0:5:b.txt",
 		"",
 	}, "\n")
 	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
@@ -255,7 +275,7 @@ func TestRunCLIGetWritesProgressFile(t *testing.T) {
 	manifestPath := filepath.Join(tmp, "txp.fm1")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txp 7:/remote",
-		"0 5 0:100 0:5:a.txt",
+		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
@@ -294,6 +314,9 @@ func TestRunCLIGetWritesProgressFile(t *testing.T) {
 	if !strings.Contains(string(progressRaw), "0 5") {
 		t.Fatalf("expected progress file to contain final ack, got %q", string(progressRaw))
 	}
+	if !strings.Contains(string(progressRaw), "0 5 1") {
+		t.Fatalf("expected progress file to contain metadata completion marker, got %q", string(progressRaw))
+	}
 	if !strings.Contains(stderr.String(), "progress: tid=txp fd=0 10%") {
 		t.Fatalf("expected 10%% progress output, got: %s", stderr.String())
 	}
@@ -307,7 +330,7 @@ func TestRunCLIGetInfersTransferIDFromManifest(t *testing.T) {
 	manifestPath := filepath.Join(tmp, "txinfer.fm1")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txinfer 7:/remote",
-		"0 5 0:100 0:5:a.txt",
+		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
@@ -348,7 +371,7 @@ func TestRunCLIGetRejectsManifestTransferIDMismatch(t *testing.T) {
 	manifestPath := filepath.Join(tmp, "txmismatch.fm1")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txmanifest 7:/remote",
-		"0 5 0:100 0:5:a.txt",
+		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
@@ -390,14 +413,14 @@ func TestRunCLIStartSkipsCompletedFromProgress(t *testing.T) {
 	manifestPath := filepath.Join(tmp, "txskip.fm1")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txskip 7:/remote",
-		"0 5 0:100 0:5:a.txt",
-		"1 4 0:101 0:5:b.txt",
+		"0 5 0:100 0644 0:5:a.txt",
+		"1 4 0:101 0644 0:5:b.txt",
 		"",
 	}, "\n")
 	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
-	if err := os.WriteFile(manifestPath+".progress", []byte("0 5\n"), 0o644); err != nil {
+	if err := os.WriteFile(manifestPath+".progress", []byte("0 5 1\n"), 0o644); err != nil {
 		t.Fatalf("write progress: %v", err)
 	}
 
@@ -435,6 +458,80 @@ func TestRunCLIStartSkipsCompletedFromProgress(t *testing.T) {
 	}
 	if !servedID1 {
 		t.Fatalf("expected file id 1 to be downloaded")
+	}
+}
+
+func TestRunCLIStartRefreshesMetadataWhenProgressMissingMarker(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txrefresh.fm1")
+	manifestRaw := strings.Join([]string{
+		"FM/1 txrefresh 7:/remote",
+		"0 5 0:100 0644 0:5:a.txt",
+		"1 4 0:101 0644 0:5:b.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	// Legacy progress entry: ack complete but metadata marker missing.
+	if err := os.WriteFile(manifestPath+".progress", []byte("0 5\n"), 0o644); err != nil {
+		t.Fatalf("write progress: %v", err)
+	}
+	outRoot := filepath.Join(tmp, "out")
+	if err := os.MkdirAll(outRoot, 0o755); err != nil {
+		t.Fatalf("mkdir out root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outRoot, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write existing file: %v", err)
+	}
+
+	var servedID0 bool
+	var checksumID0 bool
+	var servedID1 bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fs/file/txrefresh/0":
+			servedID0 = true
+			_, _ = w.Write([]byte(buildCLIFrame(0, []byte("hello"), 0)))
+		case "/fs/file/txrefresh/0/checksum":
+			checksumID0 = true
+			_, _ = w.Write([]byte(buildCLIChecksumFrame(0, 5, "0644", os.Getuid(), os.Getgid())))
+		case "/fs/file/txrefresh/1":
+			servedID1 = true
+			_, _ = w.Write([]byte(buildCLIFrame(1, []byte("test"), 0)))
+		case "/fs/file/txrefresh/1/ack":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI(
+		[]string{srv.URL, "start", "--tid", "txrefresh", "--manifest", manifestPath, "--out-root", outRoot, "--concurrency", "1"},
+		&stdout,
+		&stderr,
+	)
+	if code != 0 {
+		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if servedID0 {
+		t.Fatalf("expected file id 0 to avoid full data download")
+	}
+	if !checksumID0 {
+		t.Fatalf("expected checksum refresh call for file id 0")
+	}
+	if !servedID1 {
+		t.Fatalf("expected file id 1 to be downloaded")
+	}
+	progressRaw, err := os.ReadFile(manifestPath + ".progress")
+	if err != nil {
+		t.Fatalf("read progress: %v", err)
+	}
+	if !strings.Contains(string(progressRaw), "0 5 1") {
+		t.Fatalf("expected refreshed metadata marker for file 0, got %q", string(progressRaw))
 	}
 }
 
