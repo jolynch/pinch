@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,6 +38,23 @@ var (
 	fsFileRate   = ""
 	fsFileBurst  = "1MiB"
 )
+
+func maxSocketWriteBufferBytes() int {
+	// 4MiB baseline if kernel cap cannot be read.
+	const baseline = 4 * 1024 * 1024
+	raw, err := os.ReadFile("/proc/sys/net/core/wmem_max")
+	if err != nil {
+		return baseline
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || v <= 0 {
+		return baseline
+	}
+	if v > baseline {
+		return v
+	}
+	return baseline
+}
 
 func compress(
 	fifos utils.FifoPair,
@@ -724,11 +743,20 @@ func main() {
 	}
 
 	log.Printf("Listening at %s/pinch", listen)
+	socketWriteBufBytes := maxSocketWriteBufferBytes()
+	log.Printf("Detected ideal socket write buffer of size %d", socketWriteBufBytes)
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+				_ = tc.SetWriteBuffer(socketWriteBufBytes)
+			}
+			return ctx
+		},
 	}
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Failed to bind, is another server listening at this address? error=%v", err)

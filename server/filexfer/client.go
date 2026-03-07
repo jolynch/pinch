@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -161,9 +162,54 @@ const (
 	defaultClientAckEveryBytes           int64 = 256 * 1024 * 1024
 )
 
+func maxSocketReadBufferBytes() int {
+	return maxSocketBufferBytes("/proc/sys/net/core/rmem_max")
+}
+
+func maxSocketBufferBytes(sysctlPath string) int {
+	// 4MiB baseline if kernel cap cannot be read.
+	const baseline = 4 * 1024 * 1024
+	raw, err := os.ReadFile(sysctlPath)
+	if err != nil {
+		return baseline
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || v <= 0 {
+		return baseline
+	}
+	if v > baseline {
+		return v
+	}
+	return baseline
+}
+
+func newTunedHTTPClient(readBufBytes int) *http.Client {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || base == nil {
+		return &http.Client{}
+	}
+	transport := base.Clone()
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetReadBuffer(readBufBytes)
+			_ = tc.SetNoDelay(true)
+		}
+		return conn, nil
+	}
+	return &http.Client{Transport: transport}
+}
+
 func NewClient(baseURL string, hc *http.Client) *Client {
 	if hc == nil {
-		hc = &http.Client{}
+		hc = newTunedHTTPClient(maxSocketReadBufferBytes())
 	}
 	c := &Client{
 		BaseURL:                 strings.TrimRight(baseURL, "/"),
@@ -1040,7 +1086,7 @@ func (c *Client) httpClient() *http.Client {
 	if c.FileClient != nil {
 		return c.FileClient
 	}
-	return &http.Client{}
+	return newTunedHTTPClient(maxSocketReadBufferBytes())
 }
 
 func normalizeRequestedComp(raw string) string {
