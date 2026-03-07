@@ -40,6 +40,11 @@ func TransferHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	ageRecipient, err := parseAgePublicKey(req.URL.Query().Get("age-public-key"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	if err := validateDirectory(directory); err != nil {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
@@ -61,15 +66,30 @@ func TransferHandler(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Add("Vary", "Accept-Encoding")
-
 	cw := &countingWriter{w: w}
-	out, closeEncoded, contentEncoding, err := WrapCompressedWriter(cw, req.Header.Get("Accept-Encoding"))
-	if err != nil {
-		http.Error(w, "failed to initialize compressed response", http.StatusInternalServerError)
-		return
-	}
-	if contentEncoding != "" {
-		w.Header().Set("Content-Encoding", contentEncoding)
+	out := io.Writer(cw)
+	closeOut := func() error { return nil }
+	if ageRecipient != nil {
+		w.Header().Set("X-Manifest-Enc", "age")
+		encryptedRW, closeEnc, encErr := wrapAgeEncryptedResponseWriter(w, ageRecipient)
+		if encErr != nil {
+			http.Error(w, "failed to initialize encrypted response", http.StatusInternalServerError)
+			return
+		}
+		cw = &countingWriter{w: encryptedRW}
+		out = cw
+		closeOut = closeEnc
+	} else {
+		encodedWriter, closeEncoded, contentEncoding, wrapErr := WrapCompressedWriter(cw, req.Header.Get("Accept-Encoding"))
+		if wrapErr != nil {
+			http.Error(w, "failed to initialize compressed response", http.StatusInternalServerError)
+			return
+		}
+		out = encodedWriter
+		closeOut = closeEncoded
+		if contentEncoding != "" {
+			w.Header().Set("Content-Encoding", contentEncoding)
+		}
 	}
 
 	if err := encodeManifest(out, transfer.ID, root, maxChunkSize, verbose); err != nil {
@@ -87,7 +107,7 @@ func TransferHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if err := closeEncoded(); err != nil {
+	if err := closeOut(); err != nil {
 		if isBrokenPipe(err) {
 			cleanupTransfer = true
 			log.Printf("[filexfer][transfer] broken pipe while closing after %d bytes: %v", cw.n, err)

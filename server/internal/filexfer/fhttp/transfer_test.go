@@ -1,6 +1,7 @@
 package fhttp
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/age"
 	"github.com/zeebo/xxh3"
 )
 
@@ -168,5 +170,36 @@ func TestTransferHandlerManifestIncludesModeField(t *testing.T) {
 	}
 	if gotMode := fields[3]; gotMode != "0644" {
 		t.Fatalf("expected mode field 0644, got %q", gotMode)
+	}
+}
+
+func TestTransferHandlerEncryptsEntireManifestResponse(t *testing.T) {
+	resetTransferStore()
+	dir := createManifestFixtureDir(t)
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate age identity: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/transfer?directory="+url.QueryEscape(dir)+"&age-public-key="+url.QueryEscape(identity.Recipient().String()), nil)
+	w := httptest.NewRecorder()
+
+	TransferHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 response, got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Manifest-Enc"); got != "age" {
+		t.Fatalf("expected X-Manifest-Enc=age, got %q", got)
+	}
+	decrypted, err := age.Decrypt(bytes.NewReader(w.Body.Bytes()), identity)
+	if err != nil {
+		t.Fatalf("decrypt manifest failed: %v", err)
+	}
+	plain, err := io.ReadAll(decrypted)
+	if err != nil {
+		t.Fatalf("read decrypted manifest failed: %v", err)
+	}
+	if !strings.Contains(string(plain), "FM/1 ") {
+		t.Fatalf("expected decrypted manifest header, got %q", string(plain))
 	}
 }

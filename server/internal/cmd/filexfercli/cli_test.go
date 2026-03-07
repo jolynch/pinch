@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
 	"github.com/zeebo/xxh3"
 )
@@ -56,6 +57,22 @@ func buildCLIChecksumFrame(fileID uint64, size int64, mode string, uid int, gid 
 	_, _ = h.Write([]byte(header))
 	_, _ = h.Write([]byte(trailerPrefix))
 	return fmt.Sprintf("%s%s hash=xxh64:%016x\n", header, trailerPrefix, h.Sum64())
+}
+
+func encryptCLIBytes(t *testing.T, payload []byte, recipient age.Recipient) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := age.Encrypt(&buf, recipient)
+	if err != nil {
+		t.Fatalf("age encrypt setup failed: %v", err)
+	}
+	if _, err := w.Write(payload); err != nil {
+		t.Fatalf("age encrypt write failed: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("age encrypt close failed: %v", err)
+	}
+	return buf.Bytes()
 }
 
 func TestRunCLITransferAndGet(t *testing.T) {
@@ -135,6 +152,52 @@ func TestRunCLITransferAndGet(t *testing.T) {
 	}
 	if string(got) != "hello" {
 		t.Fatalf("unexpected output: %q", string(got))
+	}
+}
+
+func TestRunCLITransferWithEncryptAge(t *testing.T) {
+	tmp := t.TempDir()
+	manifestRaw := strings.Join([]string{
+		"FM/1 txenccli 7:/remote",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/fs/transfer" {
+			http.NotFound(w, r)
+			return
+		}
+		pub := strings.TrimSpace(r.URL.Query().Get("age-public-key"))
+		if pub == "" {
+			t.Fatalf("expected age-public-key query param")
+		}
+		recipient, err := age.ParseX25519Recipient(pub)
+		if err != nil {
+			t.Fatalf("parse recipient: %v", err)
+		}
+		w.Header().Set("X-Manifest-Enc", "age")
+		_, _ = w.Write(encryptCLIBytes(t, []byte(manifestRaw), recipient))
+	}))
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	manifestPath := filepath.Join(tmp, "txenccli.fm1")
+	code := RunCLI(
+		[]string{srv.URL, "transfer", "-s", "/remote", "--encrypt", "age", "-o", manifestPath},
+		&stdout,
+		&stderr,
+	)
+	if code != 0 {
+		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if string(raw) != manifestRaw {
+		t.Fatalf("unexpected decrypted manifest: %q", string(raw))
 	}
 }
 
@@ -566,6 +629,13 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	}
 	if code := RunCLI([]string{"http://x", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for legacy --directory flag, got %d", code)
+	}
+	stderr.Reset()
+	if code := RunCLI([]string{"http://x", "transfer", "-s", "/tmp", "--encrypt", "aes"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for unsupported --encrypt mode, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --encrypt") {
+		t.Fatalf("expected invalid --encrypt error, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"--tid", "tx", "get"}, &stdout, &stderr); code != 2 {

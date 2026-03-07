@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
 )
 
@@ -95,10 +96,26 @@ func validateServerURL(raw string) error {
 
 func printCLIUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  pinch cli <server-url> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [-v|--verbose] [--max-manifest-chunk-size N]")
-	fmt.Fprintln(w, "  pinch cli <server-url> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--concurrency N] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <server-url> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--encrypt age] [-v|--verbose] [--max-manifest-chunk-size N]")
+	fmt.Fprintln(w, "  pinch cli <server-url> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--encrypt age] [--concurrency N] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
 	fmt.Fprintln(w, "  pinch cli <server-url> status --tid <id>")
-	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [--encrypt age] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
+}
+
+func resolveEncryptionOptions(mode string) (string, string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "", "none":
+		return "", "", nil
+	case "age":
+		identity, err := age.GenerateX25519Identity()
+		if err != nil {
+			return "", "", fmt.Errorf("generate age identity: %w", err)
+		}
+		return identity.Recipient().String(), identity.String(), nil
+	default:
+		return "", "", fmt.Errorf("unsupported --encrypt value %q (only \"age\" is supported)", mode)
+	}
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -106,11 +123,13 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	fs.SetOutput(stderr)
 	var sourceDir string
 	var manifestOut string
+	var encryptMode string
 	var verbose bool
 	var maxChunk int
 	fs.StringVar(&sourceDir, "s", "", "absolute source directory to transfer")
 	fs.StringVar(&sourceDir, "source-directory", "", "absolute source directory to transfer")
 	fs.StringVar(&manifestOut, "o", "", "output path for saved manifest")
+	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
 	fs.BoolVar(&verbose, "v", false, "disable front-coding")
 	fs.BoolVar(&verbose, "verbose", false, "disable front-coding")
 	fs.IntVar(&maxChunk, "max-manifest-chunk-size", 0, "max chunk bytes for manifest stream")
@@ -125,6 +144,11 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		fmt.Fprintln(stderr, "--max-manifest-chunk-size must be >= 0")
 		return 2
 	}
+	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
+		return 2
+	}
 
 	client := NewClient(serverURL, nil)
 	start := time.Now()
@@ -133,6 +157,8 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		Verbose:        verbose,
 		MaxChunkSize:   maxChunk,
 		AcceptEncoding: defaultCLIEncodings,
+		AgePublicKey:   agePublicKey,
+		AgeIdentity:    ageIdentity,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "transfer failed: %v\n", err)
@@ -222,6 +248,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var outRoot string
 	var outFile string
 	var acceptEncoding string
+	var encryptMode string
 	var ackEveryRaw string
 	var noSync bool
 	var verbose bool
@@ -231,6 +258,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
 	fs.StringVar(&outFile, "o", "", "output file path, or '-' for stdout")
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
+	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
 	ackEveryRaw = humanBytes(defaultCLIAckEveryBytes)
@@ -251,6 +279,11 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	}
 	if ackEvery <= 0 {
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
+		return 2
+	}
+	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
 	}
 	fileID, err := parseFileID(fileIDRaw)
@@ -283,7 +316,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	start := time.Now()
 	if st, ok := progressState[fileID]; ok && st.AckBytes >= manifestEntrySize(manifest, fileID) {
 		if !st.MetadataDone {
-			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, fileID, outRoot, outFile); err != nil {
+			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, fileID, outRoot, outFile, agePublicKey, ageIdentity); err != nil {
 				fmt.Fprintf(stderr, "get metadata refresh failed: %v\n", err)
 				return 1
 			}
@@ -301,6 +334,8 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		OutFile:         outFile,
 		Stdout:          stdout,
 		AcceptEncoding:  acceptEncoding,
+		AgePublicKey:    agePublicKey,
+		AgeIdentity:     ageIdentity,
 		AckEveryBytes:   ackEvery,
 		NoSync:          noSync,
 		ProgressUpdates: progressUpdates,
@@ -327,6 +362,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var manifestPath string
 	var outRoot string
 	var acceptEncoding string
+	var encryptMode string
 	var concurrency int
 	var ackEveryRaw string
 	var noSync bool
@@ -335,6 +371,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm1)")
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
+	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
 	fs.IntVar(&concurrency, "concurrency", defaultClientConcurrency(), "parallel download workers")
@@ -356,6 +393,11 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	if ackEvery <= 0 {
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
+		return 2
+	}
+	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
 	}
 	manifest, resolvedManifestPath, resolvedTxferID, err := loadManifestForStart(txferID, manifestPath)
@@ -400,7 +442,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 					completed.Add(1)
 					continue
 				}
-				if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, ""); err != nil {
+				if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, "", agePublicKey, ageIdentity); err != nil {
 					errCh <- fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err)
 					continue
 				}
@@ -415,6 +457,8 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 				OutRoot:         outRoot,
 				OutFile:         "",
 				AcceptEncoding:  acceptEncoding,
+				AgePublicKey:    agePublicKey,
+				AgeIdentity:     ageIdentity,
 				AckEveryBytes:   ackEvery,
 				NoSync:          noSync,
 				ProgressUpdates: progressUpdates,
@@ -748,7 +792,7 @@ func startProgressWriter(progressPath string, initial map[uint64]progressStateEn
 	return stop, markMetadataDone
 }
 
-func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest *Manifest, fileID uint64, outRoot string, outFile string) error {
+func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest *Manifest, fileID uint64, outRoot string, outFile string, agePublicKey string, ageIdentity string) error {
 	if manifest == nil {
 		return errors.New("nil manifest")
 	}
@@ -770,7 +814,7 @@ func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest 
 	if !filepath.IsAbs(serverPath) {
 		return fmt.Errorf("resolved file path is not absolute: %s", serverPath)
 	}
-	meta, err := fetchTerminalTrailerMetadataFromChecksum(ctx, client, manifest.TransferID, fileID, serverPath, entry.Size)
+	meta, err := fetchTerminalTrailerMetadataFromChecksum(ctx, client, manifest.TransferID, fileID, serverPath, entry.Size, agePublicKey, ageIdentity)
 	if err != nil {
 		return err
 	}
@@ -780,7 +824,7 @@ func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest 
 	return applyTrailerMetadataToPath(destPath, meta)
 }
 
-func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Client, transferID string, fileID uint64, serverPath string, fileSize int64) (*FileTrailerMetadata, error) {
+func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Client, transferID string, fileID uint64, serverPath string, fileSize int64, agePublicKey string, ageIdentity string) (*FileTrailerMetadata, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d/checksum", client.BaseURL, url.PathEscape(transferID), fileID))
 	if err != nil {
 		return nil, fmt.Errorf("build checksum url: %w", err)
@@ -789,6 +833,9 @@ func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Clien
 	q.Set("path", serverPath)
 	if fileSize > 0 {
 		q.Set("window-size", strconv.FormatInt(fileSize, 10))
+	}
+	if agePublicKey != "" {
+		q.Set("age-public-key", agePublicKey)
 	}
 	u.RawQuery = q.Encode()
 
@@ -805,7 +852,19 @@ func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Clien
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
 		return nil, fmt.Errorf("checksum request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
-	br := bufio.NewReader(resp.Body)
+	bodyReader := io.Reader(resp.Body)
+	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-Filexfer-Enc")), "age") {
+		identity, err := age.ParseX25519Identity(strings.TrimSpace(ageIdentity))
+		if err != nil {
+			return nil, fmt.Errorf("invalid age identity for checksum decryption: %w", err)
+		}
+		decrypted, err := age.Decrypt(resp.Body, identity)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt checksum response failed: %w", err)
+		}
+		bodyReader = decrypted
+	}
+	br := bufio.NewReader(bodyReader)
 	var terminal *FileTrailerMetadata
 	for {
 		headerLine, readErr := br.ReadString('\n')

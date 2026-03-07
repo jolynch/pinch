@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"filippo.io/age"
 	intcodec "github.com/jolynch/pinch/internal/filexfer/codec"
 	"github.com/zeebo/xxh3"
 )
@@ -109,6 +110,8 @@ type DownloadFileRequest struct {
 	OutFile                 string
 	Stdout                  io.Writer
 	AcceptEncoding          string
+	AgePublicKey            string
+	AgeIdentity             string
 	AckEveryBytes           int64
 	NoSync                  bool
 	MetadataApplyBestEffort bool
@@ -141,6 +144,8 @@ type FetchManifestRequest struct {
 	Verbose        bool
 	MaxChunkSize   int
 	AcceptEncoding string
+	AgePublicKey   string
+	AgeIdentity    string
 }
 
 type FetchManifestResponse struct {
@@ -152,6 +157,8 @@ type FetchFileRequest struct {
 	FileID         uint64
 	FullPath       string
 	AcceptEncoding string
+	AgePublicKey   string
+	AgeIdentity    string
 	AckBytes       int64
 }
 
@@ -281,6 +288,9 @@ func (c *Client) FetchManifest(ctx context.Context, request FetchManifestRequest
 	if request.MaxChunkSize > 0 {
 		q.Set("max-manifest-chunk-size", strconv.Itoa(request.MaxChunkSize))
 	}
+	if request.AgePublicKey != "" {
+		q.Set("age-public-key", request.AgePublicKey)
+	}
 	u.RawQuery = q.Encode()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), nil)
@@ -311,6 +321,12 @@ func (c *Client) FetchManifest(ctx context.Context, request FetchManifestRequest
 	raw, err := io.ReadAll(reader)
 	if err != nil {
 		return FetchManifestResponse{}, fmt.Errorf("read manifest body: %w", err)
+	}
+	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-Manifest-Enc")), "age") {
+		raw, err = decryptAgeBytes(raw, request.AgeIdentity)
+		if err != nil {
+			return FetchManifestResponse{}, fmt.Errorf("decrypt manifest body: %w", err)
+		}
 	}
 
 	manifest, err := parseManifest(raw)
@@ -373,6 +389,8 @@ func (c *Client) FetchFile(ctx context.Context, request FetchFileRequest) (Fetch
 		request.FileID,
 		request.FullPath,
 		request.AcceptEncoding,
+		request.AgePublicKey,
+		request.AgeIdentity,
 		0,
 		-1,
 	)
@@ -391,6 +409,8 @@ func (c *Client) fetchFileWindow(
 	fileID uint64,
 	fullPath string,
 	acceptEncoding string,
+	agePublicKey string,
+	ageIdentity string,
 	offset int64,
 	size int64,
 ) (io.ReadCloser, *FileFrameMeta, error) {
@@ -417,6 +437,9 @@ func (c *Client) fetchFileWindow(
 		q.Set("size", strconv.FormatInt(size, 10))
 	}
 	q.Set("comp", normalizeRequestedComp(acceptEncoding))
+	if agePublicKey != "" {
+		q.Set("age-public-key", agePublicKey)
+	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -442,7 +465,29 @@ func (c *Client) fetchFileWindow(
 		return nil, nil, fmt.Errorf("file request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 
-	stream, meta, err := newFileStream(resp.Body)
+	body := io.ReadCloser(resp.Body)
+	if agePublicKey != "" {
+		identity, identityErr := parseAgeIdentity(ageIdentity)
+		if identityErr != nil {
+			resp.Body.Close()
+			return nil, nil, identityErr
+		}
+		if identity == nil {
+			resp.Body.Close()
+			return nil, nil, errors.New("missing age identity for encrypted response")
+		}
+		decryptedReader, decryptErr := age.Decrypt(resp.Body, identity)
+		if decryptErr != nil {
+			resp.Body.Close()
+			return nil, nil, fmt.Errorf("decrypt file response: %w", decryptErr)
+		}
+		body = &readerWithCloser{
+			Reader: decryptedReader,
+			Closer: resp.Body,
+		}
+	}
+
+	stream, meta, err := newFileStream(body, ageIdentity)
 	if err != nil {
 		resp.Body.Close()
 		return nil, nil, err
@@ -450,10 +495,6 @@ func (c *Client) fetchFileWindow(
 	if meta.FileID != fileID {
 		stream.Close()
 		return nil, nil, fmt.Errorf("file id mismatch: expected %d got %d", fileID, meta.FileID)
-	}
-	if meta.Enc != "none" {
-		stream.Close()
-		return nil, nil, fmt.Errorf("unsupported enc mode: %s", meta.Enc)
 	}
 	return stream, meta, nil
 }
@@ -517,7 +558,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 
 	if fileWriter == nil {
 		localHasher := xxh3.New128()
-		reader, meta, err := c.fetchFileWindow(ctx, req.Manifest.TransferID, req.FileID, serverPath, req.AcceptEncoding, 0, -1)
+		reader, meta, err := c.fetchFileWindow(ctx, req.Manifest.TransferID, req.FileID, serverPath, req.AcceptEncoding, req.AgePublicKey, req.AgeIdentity, 0, -1)
 		if err != nil {
 			return DownloadFileResponse{}, err
 		}
@@ -603,6 +644,8 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			req.FileID,
 			serverPath,
 			req.AcceptEncoding,
+			req.AgePublicKey,
+			req.AgeIdentity,
 			offset,
 			window,
 		)
@@ -1494,6 +1537,7 @@ func decodePathToken(prev string, token string) (string, error) {
 type fileStream struct {
 	respBody io.Closer
 	br       *bufio.Reader
+	identity age.Identity
 
 	meta *FileFrameMeta
 
@@ -1511,6 +1555,11 @@ type fileStream struct {
 	closed     bool
 }
 
+type readerWithCloser struct {
+	io.Reader
+	io.Closer
+}
+
 func (s *fileStream) LastTrailerTS() int64 {
 	if s == nil || s.meta == nil {
 		return 0
@@ -1518,10 +1567,15 @@ func (s *fileStream) LastTrailerTS() int64 {
 	return s.meta.TrailerTS
 }
 
-func newFileStream(respBody io.ReadCloser) (io.ReadCloser, *FileFrameMeta, error) {
+func newFileStream(respBody io.ReadCloser, ageIdentity string) (io.ReadCloser, *FileFrameMeta, error) {
+	identity, err := parseAgeIdentity(ageIdentity)
+	if err != nil {
+		return nil, nil, err
+	}
 	stream := &fileStream{
 		respBody: respBody,
 		br:       bufio.NewReader(respBody),
+		identity: identity,
 		meta:     &FileFrameMeta{},
 	}
 	if err := stream.openNextFrame(); err != nil {
@@ -1644,7 +1698,7 @@ func (s *fileStream) openNextFrame() error {
 	s.frameHash = xxh3.New()
 	_, _ = s.frameHash.Write([]byte(headerLine))
 	payloadReader = io.TeeReader(payloadReader, s.frameHash)
-	logicalReader, err := decodePayloadReaderByComp(payloadReader, meta.Comp)
+	logicalReader, err := decodePayloadReader(payloadReader, meta.Comp, meta.Enc, s.identity)
 	if err != nil {
 		return fmt.Errorf("decode payload reader: %w", err)
 	}
@@ -1933,6 +1987,37 @@ func splitTrailerPrefixAndHash(line string) (string, string, error) {
 	return prefix, hashToken, nil
 }
 
+func parseAgeIdentity(raw string) (age.Identity, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	identity, err := age.ParseX25519Identity(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid age identity: %w", err)
+	}
+	return identity, nil
+}
+
+func decryptAgeBytes(ciphertext []byte, ageIdentity string) ([]byte, error) {
+	identity, err := parseAgeIdentity(ageIdentity)
+	if err != nil {
+		return nil, err
+	}
+	if identity == nil {
+		return nil, errors.New("missing age identity for encrypted response")
+	}
+	reader, err := age.Decrypt(bytes.NewReader(ciphertext), identity)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	return plaintext, nil
+}
+
 func validHashToken(raw string) bool {
 	if raw == "" {
 		return false
@@ -1957,6 +2042,24 @@ func validateFrameHashToken(token string, actual uint64) error {
 		return nil
 	default:
 		return fmt.Errorf("unsupported frame hash algorithm: %s", parts[0])
+	}
+}
+
+func decodePayloadReader(payload io.Reader, comp string, enc string, identity age.Identity) (io.ReadCloser, error) {
+	switch enc {
+	case "none":
+		return decodePayloadReaderByComp(payload, comp)
+	case "age":
+		if identity == nil {
+			return nil, errors.New("missing age identity for encrypted frame")
+		}
+		decrypted, err := age.Decrypt(payload, identity)
+		if err != nil {
+			return nil, err
+		}
+		return decodePayloadReaderByComp(decrypted, comp)
+	default:
+		return nil, fmt.Errorf("unsupported encryption mode: %s", enc)
 	}
 }
 

@@ -117,6 +117,26 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	ageRecipient, err := parseAgePublicKey(req.URL.Query().Get("age-public-key"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	frameWriter := http.ResponseWriter(w)
+	if ageRecipient != nil {
+		w.Header().Set("X-Filexfer-Enc", "age")
+		encryptedRW, closeEncrypted, encErr := wrapAgeEncryptedResponseWriter(w, ageRecipient)
+		if encErr != nil {
+			http.Error(w, "failed to initialize encrypted response", http.StatusInternalServerError)
+			return
+		}
+		defer func() {
+			if cerr := closeEncrypted(); cerr != nil {
+				log.Printf("filexfer frame: failed to finalize encrypted stream tid=%s fid=%d err=%v", txferID, fileID, cerr)
+			}
+		}()
+		frameWriter = encryptedRW
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 
@@ -258,21 +278,22 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 				md := collectFileFrameMetadata(fileRef.Path, fileInfo)
 				terminalMD = &md
 			}
+			wirePayload := frame.FramePayload
 			var maxHint *int64
 			if firstFrame {
 				maxHint = &maxWSizeHint
 			}
-			writeStats, err := writeFrame(w, frameWriteArgs{
+			writeStats, err := writeFrame(frameWriter, frameWriteArgs{
 				FileID:       fileID,
 				Offset:       frame.Task.Offset,
 				Size:         frame.Task.LogicalSize,
-				WSize:        frame.WireSize,
+				WSize:        int64(len(wirePayload)),
 				Comp:         batchComp,
 				Enc:          "none",
 				HeaderHash:   headerHash,
 				MaxWSizeHint: maxHint,
 				HeaderTS:     headerTS,
-				Payload:      frame.FramePayload,
+				Payload:      wirePayload,
 				TrailerTS:    trailerTS,
 				FileHashes:   fileHashes,
 				Next:         nextValue,

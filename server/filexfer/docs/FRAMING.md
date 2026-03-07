@@ -215,6 +215,11 @@ The server repeats these triplets until the requested window is complete.
 Default logical frame size cap is `8 MiB`, so large responses are split into
 multiple frames.
 
+If `age-public-key=<age1...>` is provided on the `/fs/file` request, the
+entire HTTP response body (all `FX/1` headers, payload bytes, and `FXT/1`
+trailers) is age-encrypted as one stream. In this mode, framing `enc` remains
+`none` because encryption is applied at the outer transport body.
+
 For `/fs/file` responses, header properties are emitted in this order:
 `offset`, `size`, `wsize`, `comp`, `enc`, `hash`, optional `max-wsize`, then `ts`.
 

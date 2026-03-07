@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"filippo.io/age"
 	intcodec "github.com/jolynch/pinch/internal/filexfer/codec"
 	"github.com/zeebo/xxh3"
 )
@@ -102,6 +103,22 @@ func buildFXFrameWithTrailerTokens(t *testing.T, fileID uint64, comp string, off
 	}
 	trailer := trailerPrefix + " hash=" + frameHash64Token(header, payload, trailerPrefix)
 	return header + string(payload) + trailer + "\n"
+}
+
+func encryptAgeBlob(t *testing.T, plaintext []byte, recipient age.Recipient) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := age.Encrypt(&buf, recipient)
+	if err != nil {
+		t.Fatalf("age encrypt setup failed: %v", err)
+	}
+	if _, err := w.Write(plaintext); err != nil {
+		t.Fatalf("age encrypt write failed: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("age encrypt close failed: %v", err)
+	}
+	return buf.Bytes()
 }
 
 func TestParseFXHeaderMaxWSizeHint(t *testing.T) {
@@ -231,6 +248,42 @@ func TestParseManifestLegacyEntryRejected(t *testing.T) {
 	}
 }
 
+func TestFetchManifestEncryptedWithAge(t *testing.T) {
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate age identity: %v", err)
+	}
+	recipient := identity.Recipient().String()
+	manifestRaw := strings.Join([]string{
+		"FM/1 txenc 5:/root",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	encrypted := encryptAgeBlob(t, []byte(manifestRaw), identity.Recipient())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("age-public-key"); got != recipient {
+			t.Fatalf("expected age-public-key query=%q, got %q", recipient, got)
+		}
+		w.Header().Set("X-Manifest-Enc", "age")
+		_, _ = w.Write(encrypted)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, nil)
+	resp, err := client.FetchManifest(context.Background(), FetchManifestRequest{
+		Directory:    "/root",
+		AgePublicKey: recipient,
+		AgeIdentity:  identity.String(),
+	})
+	if err != nil {
+		t.Fatalf("FetchManifest failed: %v", err)
+	}
+	if resp.Manifest.TransferID != "txenc" || len(resp.Manifest.Entries) != 1 {
+		t.Fatalf("unexpected manifest: %+v", resp.Manifest)
+	}
+}
+
 func TestFetchFileDecodesByHeaderComp(t *testing.T) {
 	logical := []byte("hello world")
 	for _, comp := range []string{"none", EncodingZstd, EncodingLz4} {
@@ -266,6 +319,46 @@ func TestFetchFileDecodesByHeaderComp(t *testing.T) {
 				t.Fatalf("expected comp %q, got %q", comp, resp.Meta.Comp)
 			}
 		})
+	}
+}
+
+func TestFetchFileDecryptsWholeResponseWithAge(t *testing.T) {
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate age identity: %v", err)
+	}
+	recipient := identity.Recipient().String()
+	logical := []byte("hello world")
+	frame := buildFXFrame(t, 7, "none", 0, logical, nil)
+	encrypted := encryptAgeBlob(t, []byte(frame), identity.Recipient())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("age-public-key"); got != recipient {
+			t.Fatalf("expected age-public-key query=%q, got %q", recipient, got)
+		}
+		_, _ = w.Write(encrypted)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, nil)
+	resp, err := client.FetchFile(context.Background(), FetchFileRequest{
+		TransferID:     "tx",
+		FileID:         7,
+		FullPath:       "/root/a.txt",
+		AcceptEncoding: defaultCLIEncodings,
+		AgePublicKey:   recipient,
+		AgeIdentity:    identity.String(),
+		AckBytes:       -1,
+	})
+	if err != nil {
+		t.Fatalf("FetchFile failed: %v", err)
+	}
+	got, err := readAndClose(t, resp.Reader)
+	if err != nil {
+		t.Fatalf("FetchFile read failed: %v", err)
+	}
+	if !bytes.Equal(got, logical) {
+		t.Fatalf("unexpected logical bytes: %q", got)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/age"
 	"github.com/zeebo/xxh3"
 )
 
@@ -250,6 +251,47 @@ func TestFileHandlerIdentityFrame(t *testing.T) {
 	}
 	if !strings.Contains(trailer, " meta:size=5 ") && !strings.HasSuffix(trailer, " meta:size=5") {
 		t.Fatalf("expected terminal metadata in trailer: %q", trailer)
+	}
+}
+
+func TestFileHandlerEncryptsEntireResponseWhenAgeKeyProvided(t *testing.T) {
+	txferID, fullPath := setupSingleFileTransfer(t)
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate age identity: %v", err)
+	}
+	req := newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)+"&age-public-key="+url.QueryEscape(identity.Recipient().String()))
+	w := httptest.NewRecorder()
+
+	FileHandler(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Filexfer-Enc"); got != "age" {
+		t.Fatalf("expected X-Filexfer-Enc=age, got %q", got)
+	}
+	decrypted, err := age.Decrypt(bytes.NewReader(w.Body.Bytes()), identity)
+	if err != nil {
+		t.Fatalf("decrypt file response failed: %v", err)
+	}
+	plain, err := io.ReadAll(decrypted)
+	if err != nil {
+		t.Fatalf("read decrypted file response failed: %v", err)
+	}
+	header, payload, trailer, ok := splitFrame(plain)
+	if !ok {
+		t.Fatalf("expected decrypted frame header/payload/trailer")
+	}
+	if !strings.Contains(header, " enc=none ") {
+		t.Fatalf("expected frame header enc=none, got %q", header)
+	}
+	if string(payload) != "hello" {
+		t.Fatalf("unexpected payload: %q", payload)
+	}
+	if !strings.HasPrefix(trailer, "FXT/1 0 status=ok ts=") {
+		t.Fatalf("unexpected trailer: %q", trailer)
 	}
 }
 

@@ -3,6 +3,10 @@
 This document defines the manifest format used to compactly
 describe files to transfer from a server.
 
+When requesting a manifest from `/fs/transfer`, clients may provide
+`age-public-key=<age1...>`. If provided, the entire manifest HTTP response body
+is age-encrypted and must be decrypted by the client before parsing this format.
+
 ## Structure
 
 Manifest is line-oriented UTF-8 text:
