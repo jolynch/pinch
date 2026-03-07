@@ -29,6 +29,9 @@ type Client struct {
 	FileRequestWindowBytes  int64
 	FrameBufferBytes        int
 	MaxFrameReadBufferBytes int
+
+	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
+	bufferPool sync.Map // map[int]*sync.Pool
 }
 
 type Manifest struct {
@@ -68,7 +71,7 @@ type DownloadFileRequest struct {
 	Stdout          io.Writer
 	AcceptEncoding  string
 	AckEveryBytes   int64
-	SyncEveryBytes  int64
+	NoSync          bool
 	ProgressUpdates chan<- DownloadProgressUpdate
 	OnAck           func(AckProgressEvent)
 }
@@ -156,22 +159,21 @@ const (
 	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024
 	minClientFrameReadBufferBytes        int   = 32 * 1024
 	defaultClientAckEveryBytes           int64 = 256 * 1024 * 1024
-	defaultClientSyncEveryBytes          int64 = 256 * 1024 * 1024
 )
-
-var frameReadBufferPools sync.Map // map[int]*sync.Pool
 
 func NewClient(baseURL string, hc *http.Client) *Client {
 	if hc == nil {
 		hc = &http.Client{}
 	}
-	return &Client{
+	c := &Client{
 		BaseURL:                 strings.TrimRight(baseURL, "/"),
 		FileClient:              hc,
 		FileRequestWindowBytes:  defaultClientRequestWindowBytes,
 		FrameBufferBytes:        defaultClientFrameBufferBytes,
 		MaxFrameReadBufferBytes: defaultClientMaxFrameReadBufferBytes,
 	}
+	c.bufferPool = sync.Map{}
+	return c
 }
 
 func (c *Client) FetchManifest(ctx context.Context, request FetchManifestRequest) (FetchManifestResponse, error) {
@@ -427,10 +429,6 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	if ackEvery <= 0 {
 		ackEvery = defaultClientAckEveryBytes
 	}
-	syncEvery := req.SyncEveryBytes
-	if syncEvery <= 0 {
-		syncEvery = defaultClientSyncEveryBytes
-	}
 
 	if fileWriter == nil {
 		localHasher := xxh3.New128()
@@ -438,8 +436,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		if err != nil {
 			return DownloadFileResponse{}, err
 		}
-		frameBufSize := effectiveFrameReadBufferSize(c.FrameBufferBytes, meta.MaxWireSizeHint, c.MaxFrameReadBufferBytes)
-		frameBuf, releaseFrameBuf = acquireFrameReadBuffer(frameBufSize)
+		frameBuf, releaseFrameBuf = c.acquireFrameReadBuffer(meta.MaxWireSizeHint)
 		copyErr := copyStream(writer, reader, frameBuf, localHasher)
 		closeReadErr := reader.Close()
 		closeWriteErr := closeWriter()
@@ -537,8 +534,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			return DownloadFileResponse{}, err
 		}
 		if frameBuf == nil {
-			targetBufSize := effectiveFrameReadBufferSize(c.FrameBufferBytes, windowMeta.MaxWireSizeHint, c.MaxFrameReadBufferBytes)
-			frameBuf, releaseFrameBuf = acquireFrameReadBuffer(targetBufSize)
+			frameBuf, releaseFrameBuf = c.acquireFrameReadBuffer(windowMeta.MaxWireSizeHint)
 		}
 		getTrailerTS := func() int64 {
 			if tsReader, ok := windowReader.(interface{ LastTrailerTS() int64 }); ok {
@@ -550,18 +546,22 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		}
 		copyErr := copyStreamWithProgress(writer, windowReader, frameBuf, fileHasher, func(written int64) error {
 			currentTotal := offset + written
-			if currentTotal-synced < syncEvery {
+			deltaBytes := currentTotal - lastAcked
+			if deltaBytes < ackEvery {
 				return nil
 			}
 			recvMS := time.Since(intervalTS).Milliseconds()
-			syncStart := time.Now()
-			if err := dataSyncFile(fileWriter); err != nil {
-				return fmt.Errorf("fdatasync output file: %w", err)
+			syncMS := int64(0)
+			if !req.NoSync {
+				syncStart := time.Now()
+				if err := dataSyncFile(fileWriter); err != nil {
+					return fmt.Errorf("fdatasync output file: %w", err)
+				}
+				syncMS = time.Since(syncStart).Milliseconds()
 			}
-			syncMS := time.Since(syncStart).Milliseconds()
 			synced = currentTotal
-			deltaBytes := synced - lastAcked
-			if deltaBytes >= ackEvery {
+			// Final progress ack must include hash token; avoid sending a non-final ack at EOF.
+			if deltaBytes >= ackEvery && synced < totalSize {
 				if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{
 					AckBytes:   synced,
 					ServerTS:   getTrailerTS(),
@@ -627,12 +627,15 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	}
 
 	finalRecvMS := time.Since(intervalTS).Milliseconds()
-	finalSyncStart := time.Now()
-	if err := dataSyncFile(fileWriter); err != nil {
-		_ = closeWriter()
-		return DownloadFileResponse{}, fmt.Errorf("fdatasync output file: %w", err)
+	finalSyncMS := int64(0)
+	if !req.NoSync {
+		finalSyncStart := time.Now()
+		if err := dataSyncFile(fileWriter); err != nil {
+			_ = closeWriter()
+			return DownloadFileResponse{}, fmt.Errorf("fdatasync output file: %w", err)
+		}
+		finalSyncMS = time.Since(finalSyncStart).Milliseconds()
 	}
-	finalSyncMS := time.Since(finalSyncStart).Milliseconds()
 	synced = offset
 	fullHash := formatXXH128HashToken(fileHasher.Sum128())
 	if resultMeta.FileHashToken != "" && !strings.EqualFold(resultMeta.FileHashToken, fullHash) {
@@ -1000,8 +1003,21 @@ func frameReadBucketSize(target int) int {
 	return 64 * mib
 }
 
-func acquireFrameReadBuffer(size int) ([]byte, func()) {
-	pool := frameReadBufferPool(size)
+func (c *Client) acquireFrameReadBuffer(maxWireHint int64) ([]byte, func()) {
+	size := effectiveFrameReadBufferSize(c.FrameBufferBytes, maxWireHint, c.MaxFrameReadBufferBytes)
+	pool := (*sync.Pool)(nil)
+	if existing, ok := c.bufferPool.Load(size); ok {
+		pool = existing.(*sync.Pool)
+	} else {
+		sz := size
+		created := &sync.Pool{
+			New: func() any {
+				return make([]byte, sz)
+			},
+		}
+		actual, _ := c.bufferPool.LoadOrStore(size, created)
+		pool = actual.(*sync.Pool)
+	}
 	raw := pool.Get()
 	buf, ok := raw.([]byte)
 	if !ok || cap(buf) < size {
@@ -1011,20 +1027,6 @@ func acquireFrameReadBuffer(size int) ([]byte, func()) {
 	return buf, func() {
 		pool.Put(buf[:size])
 	}
-}
-
-func frameReadBufferPool(size int) *sync.Pool {
-	if existing, ok := frameReadBufferPools.Load(size); ok {
-		return existing.(*sync.Pool)
-	}
-	sz := size
-	created := &sync.Pool{
-		New: func() any {
-			return make([]byte, sz)
-		},
-	}
-	actual, _ := frameReadBufferPools.LoadOrStore(size, created)
-	return actual.(*sync.Pool)
 }
 
 func dataSyncFile(fd *os.File) error {

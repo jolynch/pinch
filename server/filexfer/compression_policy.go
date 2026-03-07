@@ -12,12 +12,11 @@ const (
 )
 
 const (
-	compressionPolicyWindowSize            = 8
-	compressionPolicyHysteresisStreak      = 2
-	compressionPolicyDowngradeRatio        = 0.90
-	compressionPolicyDowngradePrepareOverW = 1.10
-	compressionPolicyUpgradeRatio          = 1.05
-	compressionPolicyUpgradePrepareOverW   = 0.70
+	emaAlpha             = 0.80
+	hystStreak           = 2
+	downRatioCut         = 0.90
+	downReadOverWriteCut = 1.10
+	upReadOverWriteCut   = 0.25
 )
 
 type CompressionMetrics struct {
@@ -28,36 +27,33 @@ type CompressionMetrics struct {
 }
 
 type CompressionDecision struct {
-	Next             CompressionMode
-	Reason           string
-	Ratio            float64
-	PrepareOverWrite float64
+	Next          CompressionMode
+	Reason        string
+	Ratio         float64
+	ReadOverWrite float64
 }
 
 type CompressionPolicy struct {
-	ratios          []float64
-	prepareOverWire []float64
-	index           int
-	size            int
-	downgradeStreak int
-	upgradeStreak   int
+	emaRatio         float64
+	emaReadOverWrite float64
+	emaInitialized   bool
+	downgradeStreak  int
+	upgradeStreak    int
 }
 
 func NewCompressionPolicy() *CompressionPolicy {
-	return &CompressionPolicy{
-		ratios:          make([]float64, compressionPolicyWindowSize),
-		prepareOverWire: make([]float64, compressionPolicyWindowSize),
-	}
+	return &CompressionPolicy{}
 }
 
 func (p *CompressionPolicy) Decide(current CompressionMode, m CompressionMetrics) CompressionDecision {
 	ratio := compressionRatio(m.LogicalSize, m.WireSize)
-	prepareOverWrite := safeLatencyRatio(m.PrepareLatency, m.WriteLatency)
-	p.record(ratio, prepareOverWrite)
-	avgRatio, avgPrepareOverWrite := p.averages()
+	readOverWrite := safeLatencyRatio(m.PrepareLatency, m.WriteLatency)
+	p.record(ratio, readOverWrite)
+	avgRatio := p.emaRatio
+	avgReadOverWrite := p.emaReadOverWrite
 
-	downgrade := avgRatio < compressionPolicyDowngradeRatio || avgPrepareOverWrite > compressionPolicyDowngradePrepareOverW
-	upgrade := avgPrepareOverWrite < compressionPolicyUpgradePrepareOverW && avgRatio > compressionPolicyUpgradeRatio
+	upgrade := shouldUpgrade(avgReadOverWrite)
+	downgrade := !upgrade && (avgRatio < downRatioCut || avgReadOverWrite > downReadOverWriteCut)
 
 	if downgrade {
 		p.downgradeStreak++
@@ -71,12 +67,12 @@ func (p *CompressionPolicy) Decide(current CompressionMode, m CompressionMetrics
 	}
 
 	decision := CompressionDecision{
-		Next:             current,
-		Reason:           "hold",
-		Ratio:            avgRatio,
-		PrepareOverWrite: avgPrepareOverWrite,
+		Next:          current,
+		Reason:        "hold",
+		Ratio:         avgRatio,
+		ReadOverWrite: avgReadOverWrite,
 	}
-	if p.downgradeStreak >= compressionPolicyHysteresisStreak {
+	if p.downgradeStreak >= hystStreak {
 		next := downgradeMode(current)
 		if next != current {
 			decision.Next = next
@@ -84,7 +80,7 @@ func (p *CompressionPolicy) Decide(current CompressionMode, m CompressionMetrics
 		}
 		p.downgradeStreak = 0
 	}
-	if p.upgradeStreak >= compressionPolicyHysteresisStreak {
+	if p.upgradeStreak >= hystStreak {
 		next := upgradeMode(current)
 		if next != current {
 			decision.Next = next
@@ -95,29 +91,18 @@ func (p *CompressionPolicy) Decide(current CompressionMode, m CompressionMetrics
 	return decision
 }
 
-func (p *CompressionPolicy) record(ratio float64, prepareOverWrite float64) {
+func (p *CompressionPolicy) record(ratio float64, readOverWrite float64) {
 	if p == nil {
 		return
 	}
-	p.ratios[p.index] = ratio
-	p.prepareOverWire[p.index] = prepareOverWrite
-	p.index = (p.index + 1) % compressionPolicyWindowSize
-	if p.size < compressionPolicyWindowSize {
-		p.size++
+	if !p.emaInitialized {
+		p.emaRatio = ratio
+		p.emaReadOverWrite = readOverWrite
+		p.emaInitialized = true
+		return
 	}
-}
-
-func (p *CompressionPolicy) averages() (float64, float64) {
-	if p == nil || p.size == 0 {
-		return 0, 0
-	}
-	sumRatio := 0.0
-	sumPrepareOverWrite := 0.0
-	for i := 0; i < p.size; i++ {
-		sumRatio += p.ratios[i]
-		sumPrepareOverWrite += p.prepareOverWire[i]
-	}
-	return sumRatio / float64(p.size), sumPrepareOverWrite / float64(p.size)
+	p.emaRatio = (emaAlpha * ratio) + ((1 - emaAlpha) * p.emaRatio)
+	p.emaReadOverWrite = (emaAlpha * readOverWrite) + ((1 - emaAlpha) * p.emaReadOverWrite)
 }
 
 func safeLatencyRatio(prepare time.Duration, write time.Duration) float64 {
@@ -131,6 +116,14 @@ func safeLatencyRatio(prepare time.Duration, write time.Duration) float64 {
 		return 0.0
 	}
 	return float64(prepare) / float64(write)
+}
+
+func shouldUpgrade(avgReadOverWrite float64) bool {
+	if avgReadOverWrite >= upReadOverWriteCut {
+		return false
+	}
+	// "Use stronger compression" is controlled purely by latency signal.
+	return true
 }
 
 func downgradeMode(current CompressionMode) CompressionMode {

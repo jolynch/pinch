@@ -81,9 +81,9 @@ func validateServerURL(raw string) error {
 func printCLIUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  pinch cli <server-url> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [-v|--verbose] [--max-manifest-chunk-size N]")
-	fmt.Fprintln(w, "  pinch cli <server-url> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--concurrency N] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <server-url> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--concurrency N] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
 	fmt.Fprintln(w, "  pinch cli <server-url> status --tid <id>")
-	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [-A|--ack-every <bytes>] [-S|--sync-every <bytes>] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -207,8 +207,8 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var outRoot string
 	var outFile string
 	var acceptEncoding string
-	var ackEvery int64
-	var syncEvery int64
+	var ackEveryRaw string
+	var noSync bool
 	var verbose bool
 	fs.StringVar(&txferID, "tid", "", "transfer id")
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm1)")
@@ -218,10 +218,10 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
-	fs.Int64Var(&ackEvery, "A", defaultClientAckEveryBytes, "bytes between progress acks")
-	fs.Int64Var(&ackEvery, "ack-every", defaultClientAckEveryBytes, "bytes between progress acks")
-	fs.Int64Var(&syncEvery, "S", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
-	fs.Int64Var(&syncEvery, "sync-every", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
+	ackEveryRaw = humanBytes(defaultClientAckEveryBytes)
+	fs.StringVar(&ackEveryRaw, "A", ackEveryRaw, "bytes between progress acks")
+	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
+	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -229,12 +229,13 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintln(stderr, "get requires --fd")
 		return 2
 	}
-	if ackEvery <= 0 {
-		fmt.Fprintln(stderr, "--ack-every must be > 0")
+	ackEvery, err := parseByteSize(ackEveryRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
 	}
-	if syncEvery <= 0 {
-		fmt.Fprintln(stderr, "--sync-every must be > 0")
+	if ackEvery <= 0 {
+		fmt.Fprintln(stderr, "--ack-every must be > 0")
 		return 2
 	}
 	fileID, err := parseFileID(fileIDRaw)
@@ -277,7 +278,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		Stdout:          stdout,
 		AcceptEncoding:  acceptEncoding,
 		AckEveryBytes:   ackEvery,
-		SyncEveryBytes:  syncEvery,
+		NoSync:          noSync,
 		ProgressUpdates: progressUpdates,
 		OnAck:           onAck,
 	})
@@ -298,8 +299,8 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var outRoot string
 	var acceptEncoding string
 	var concurrency int
-	var ackEvery int64
-	var syncEvery int64
+	var ackEveryRaw string
+	var noSync bool
 	var verbose bool
 	fs.StringVar(&txferID, "tid", "", "transfer id")
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm1)")
@@ -308,10 +309,10 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
 	fs.IntVar(&concurrency, "concurrency", defaultClientConcurrency(), "parallel download workers")
-	fs.Int64Var(&ackEvery, "A", defaultClientAckEveryBytes, "bytes between progress acks")
-	fs.Int64Var(&ackEvery, "ack-every", defaultClientAckEveryBytes, "bytes between progress acks")
-	fs.Int64Var(&syncEvery, "S", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
-	fs.Int64Var(&syncEvery, "sync-every", defaultClientSyncEveryBytes, "bytes between fdatasync operations")
+	ackEveryRaw = humanBytes(defaultClientAckEveryBytes)
+	fs.StringVar(&ackEveryRaw, "A", ackEveryRaw, "bytes between progress acks")
+	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
+	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -319,12 +320,13 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintln(stderr, "--concurrency must be > 0")
 		return 2
 	}
-	if ackEvery <= 0 {
-		fmt.Fprintln(stderr, "--ack-every must be > 0")
+	ackEvery, err := parseByteSize(ackEveryRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
 	}
-	if syncEvery <= 0 {
-		fmt.Fprintln(stderr, "--sync-every must be > 0")
+	if ackEvery <= 0 {
+		fmt.Fprintln(stderr, "--ack-every must be > 0")
 		return 2
 	}
 	manifest, resolvedManifestPath, resolvedTxferID, err := loadManifestForStart(txferID, manifestPath)
@@ -376,7 +378,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 				OutFile:         "",
 				AcceptEncoding:  acceptEncoding,
 				AckEveryBytes:   ackEvery,
-				SyncEveryBytes:  syncEvery,
+				NoSync:          noSync,
 				ProgressUpdates: progressUpdates,
 				OnAck:           onAck,
 			})
@@ -793,7 +795,7 @@ func formatCompSummary(meta FileFrameMeta) string {
 		return meta.Comp
 	}
 	parts := make([]string, 0, len(meta.CompCounts))
-	preferred := []string{"lz4", "zstd", "none"}
+	preferred := []string{"none", "lz4", "zstd"}
 	used := make(map[string]bool, len(preferred))
 	for _, key := range preferred {
 		if count, ok := meta.CompCounts[key]; ok && count > 0 {

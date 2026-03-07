@@ -473,7 +473,6 @@ func TestDownloadFileFromManifestOnAckCallback(t *testing.T) {
 		OutRoot:        outRoot,
 		AcceptEncoding: defaultCLIEncodings,
 		AckEveryBytes:  1,
-		SyncEveryBytes: 1,
 		OnAck: func(evt AckProgressEvent) {
 			events = append(events, evt)
 		},

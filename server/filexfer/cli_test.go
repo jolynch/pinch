@@ -100,7 +100,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 	stderr.Reset()
 	outRoot := filepath.Join(tmp, "out")
 	code = RunCLI(
-		[]string{srv.URL, "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-A", "1024", "-S", "1024"},
+		[]string{srv.URL, "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-A", "1024"},
 		&stdout,
 		&stderr,
 	)
@@ -210,7 +210,7 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	code := RunCLI(
-		[]string{srv.URL, "start", "--tid", "txstart", "--manifest", manifestPath, "--out-root", outRoot, "--concurrency", "2", "--ack-every", "1024", "--sync-every", "1024"},
+		[]string{srv.URL, "start", "--tid", "txstart", "--manifest", manifestPath, "--out-root", outRoot, "--concurrency", "2", "--ack-every", "1KiB"},
 		&stdout,
 		&stderr,
 	)
@@ -369,6 +369,21 @@ func TestRunCLIGetRejectsManifestTransferIDMismatch(t *testing.T) {
 	}
 }
 
+func TestFormatCompSummaryOrdersByCompressionStrength(t *testing.T) {
+	meta := FileFrameMeta{
+		CompCounts: map[string]uint64{
+			"zstd": 31,
+			"lz4":  2,
+			"none": 2,
+		},
+	}
+	got := formatCompSummary(meta)
+	want := "[none=2, lz4=2, zstd=31]"
+	if got != want {
+		t.Fatalf("unexpected comp summary ordering: got %q want %q", got, want)
+	}
+}
+
 func TestRunCLIStartSkipsCompletedFromProgress(t *testing.T) {
 	tmp := t.TempDir()
 	manifestPath := filepath.Join(tmp, "txskip.fm1")
@@ -441,8 +456,15 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	if code := RunCLI([]string{"http://x", "get", "--tid", "t", "--fd", "0", "--ack-every", "0"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --ack-every, got %d", code)
 	}
-	if code := RunCLI([]string{"http://x", "start", "--tid", "t", "--sync-every", "0"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for invalid --sync-every, got %d", code)
+	if code := RunCLI([]string{"http://x", "start", "--tid", "t", "--no-sync"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("expected runtime error with accepted --no-sync flag, got %d", code)
+	}
+	stderr.Reset()
+	if code := RunCLI([]string{"http://x", "get", "--tid", "t", "--fd", "0", "--ack-every", "bad"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --ack-every size, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --ack-every") {
+		t.Fatalf("expected invalid --ack-every message, got: %s", stderr.String())
 	}
 	if code := RunCLI([]string{"http://x", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for legacy --directory flag, got %d", code)

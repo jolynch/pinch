@@ -225,7 +225,7 @@ func (s *transferStore) appendFileHashChunk(txferID string, fileID uint64, offse
 		}
 	}
 	state.hashedSize += int64(len(chunk))
-	state.hashToken = formatXXH128HashToken(state.hasher.Sum128())
+	state.hashToken = ""
 	state.expiresAt = time.Now().Add(ttl)
 	s.fileHashes[key] = state
 	return true

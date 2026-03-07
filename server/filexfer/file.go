@@ -222,14 +222,14 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 				prevComp := frameCompTokenForMode(activeMode)
 				nextComp := frameCompTokenForMode(nextMode)
 				log.Printf(
-					"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f prepare_over_write=%.3f",
+					"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f read_over_write=%.3f",
 					txferID,
 					fileID,
 					prevComp,
 					nextComp,
 					decision.Reason,
 					decision.Ratio,
-					decision.PrepareOverWrite,
+					decision.ReadOverWrite,
 				)
 				activeMode = nextMode
 				_ = SetTransferFileCompressionMode(txferID, fileID, activeMode)
@@ -376,6 +376,8 @@ func compressionRatio(logicalSize int64, wireSize int64) float64 {
 
 func initialCompressionMode(comp string) CompressionMode {
 	switch comp {
+	case "", "adapt":
+		return CompressionModeNone
 	case EncodingZstd:
 		return CompressionModeZstdLevel1
 	case EncodingLz4:
