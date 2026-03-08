@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"filippo.io/age"
 	intcodec "github.com/jolynch/pinch/internal/filexfer/codec"
@@ -95,11 +96,19 @@ func buildFXFrameWithTrailerTokens(t *testing.T, fileID uint64, comp string, off
 	if next != nil {
 		trailerPrefix += fmt.Sprintf(" next=%d", *next)
 	}
+	terminal := next == nil || (next != nil && *next == 0)
+	hasFileHash := false
 	for _, token := range trailerTokens {
 		if strings.TrimSpace(token) == "" {
 			continue
 		}
+		if strings.HasPrefix(token, "file-hash=") {
+			hasFileHash = true
+		}
 		trailerPrefix += " " + token
+	}
+	if terminal && !hasFileHash {
+		trailerPrefix += " file-hash=xxh128:" + xsum
 	}
 	trailer := trailerPrefix + " hash=" + frameHash64Token(header, payload, trailerPrefix)
 	return header + string(payload) + trailer + "\n"
@@ -362,7 +371,7 @@ func TestFetchFileDecryptsWholeResponseWithAge(t *testing.T) {
 	}
 }
 
-func TestFetchFileRejectsChecksumMismatch(t *testing.T) {
+func TestFetchFileIgnoresPerFrameChecksumMismatch(t *testing.T) {
 	logical := []byte("hello")
 	payload, err := encodeSingleFramePayload(logical, "none")
 	if err != nil {
@@ -387,8 +396,12 @@ func TestFetchFileRejectsChecksumMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchFile setup failed: %v", err)
 	}
-	if _, err := readAndClose(t, resp.Reader); err == nil {
-		t.Fatalf("expected checksum mismatch error")
+	got, err := readAndClose(t, resp.Reader)
+	if err != nil {
+		t.Fatalf("expected per-frame checksum mismatch to be ignored, got %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("unexpected payload %q", got)
 	}
 }
 
@@ -746,7 +759,7 @@ func TestDownloadFileFromManifestVerifiesBeforeMetadataApply(t *testing.T) {
 		OutRoot:        outRoot,
 		AcceptEncoding: defaultCLIEncodings,
 	})
-	if err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
+	if err == nil || !strings.Contains(err.Error(), "window hash mismatch") {
 		t.Fatalf("expected hash verification failure before metadata apply, got %v", err)
 	}
 }
@@ -803,6 +816,51 @@ func TestDownloadFileFromManifestOnAckCallback(t *testing.T) {
 	}
 	if len(events) > 1 && last.PrevAckTime.IsZero() {
 		t.Fatalf("expected non-zero previous ack time when multiple events are present")
+	}
+}
+
+func TestDownloadFileFromManifestAckTimeoutDoesNotHang(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txacktimeout",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	logical := []byte("hello")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/fs/file/txacktimeout/0" {
+			frame := buildFXFrame(t, 0, "none", 0, logical, nil)
+			_, _ = w.Write([]byte(frame))
+			return
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/fs/file/txacktimeout/0/ack" {
+			<-r.Context().Done()
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, nil)
+	client.AckRequestTimeout = 50 * time.Millisecond
+	start := time.Now()
+	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:       manifest,
+		FileID:         0,
+		OutRoot:        outRoot,
+		AcceptEncoding: defaultCLIEncodings,
+	})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("expected ack timeout failure")
+	}
+	if !strings.Contains(err.Error(), "acknowledge download failed") {
+		t.Fatalf("expected acknowledge failure, got %v", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("expected bounded ack timeout behavior, elapsed=%s", elapsed)
 	}
 }
 

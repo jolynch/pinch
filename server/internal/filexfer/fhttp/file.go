@@ -2,16 +2,18 @@ package fhttp
 
 import (
 	"bytes"
-	"encoding/hex"
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -22,6 +24,9 @@ import (
 
 const defaultFileFrameLogicalSize int64 = 8 * 1024 * 1024
 const zeroCopyChunkSize int64 = 8 * 1024 * 1024
+const maxLinuxPipeSizeBytes = 1 * 1024 * 1024
+const placeholderHeaderHashToken = "xxh128:00000000000000000000000000000000"
+const placeholderTrailerHashToken = "xxh64:0000000000000000"
 const maxConcurrentFramePrepares = 8
 
 var logicalBufferPools sync.Map   // map[int]*sync.Pool
@@ -43,6 +48,307 @@ type preparedFrame struct {
 	PrepareLatency time.Duration
 	Err            error
 	release        func()
+}
+
+type windowHashResult struct {
+	token string
+	err   error
+}
+
+type readerOnly struct {
+	io.Reader
+}
+
+func startWindowHashWorker(pipeR *os.File) <-chan windowHashResult {
+	done := make(chan windowHashResult, 1)
+	go func() {
+		defer close(done)
+		if pipeR == nil {
+			done <- windowHashResult{err: errors.New("nil hash pipe reader")}
+			return
+		}
+		defer pipeR.Close()
+		hasher := xxh3.New128()
+		buf, release, err := acquireLogicalBuffer(256 * 1024)
+		if err != nil {
+			done <- windowHashResult{err: err}
+			return
+		}
+		defer release()
+		if _, err := io.CopyBuffer(hasher, readerOnly{Reader: pipeR}, buf); err != nil {
+			done <- windowHashResult{err: err}
+			return
+		}
+		done <- windowHashResult{token: formatXXH128HashToken(hasher.Sum128())}
+	}()
+	return done
+}
+
+func desiredPipeSizeBytes(windowLen int64, frameSize int64) int {
+	if windowLen > maxLinuxPipeSizeBytes {
+		return maxLinuxPipeSizeBytes
+	}
+	if frameSize <= 0 {
+		return 64 * 1024
+	}
+	target := frameSize
+	if target > maxLinuxPipeSizeBytes {
+		target = maxLinuxPipeSizeBytes
+	}
+	if target < 64*1024 {
+		target = 64 * 1024
+	}
+	return int(target)
+}
+
+func growPipeBestEffort(pipeFD *os.File, sizeBytes int) {
+	if pipeFD == nil || sizeBytes <= 0 {
+		return
+	}
+	_, _ = unix.FcntlInt(pipeFD.Fd(), unix.F_SETPIPE_SZ, sizeBytes)
+}
+
+func buildFrameHeaderLine(fileID uint64, offset int64, size int64, maxWSizeHint *int64, ts int64) string {
+	if maxWSizeHint != nil {
+		return "FX/1 " + strconv.FormatUint(fileID, 10) +
+			" offset=" + strconv.FormatInt(offset, 10) +
+			" size=" + strconv.FormatInt(size, 10) +
+			" wsize=" + strconv.FormatInt(size, 10) +
+			" comp=none enc=none hash=" + placeholderHeaderHashToken +
+			" max-wsize=" + strconv.FormatInt(*maxWSizeHint, 10) +
+			" ts=" + strconv.FormatInt(ts, 10) + "\n"
+	}
+	return "FX/1 " + strconv.FormatUint(fileID, 10) +
+		" offset=" + strconv.FormatInt(offset, 10) +
+		" size=" + strconv.FormatInt(size, 10) +
+		" wsize=" + strconv.FormatInt(size, 10) +
+		" comp=none enc=none hash=" + placeholderHeaderHashToken +
+		" ts=" + strconv.FormatInt(ts, 10) + "\n"
+}
+
+func buildFrameTrailerLine(fileID uint64, ts int64, next int64, windowHashToken string, metadata *fileFrameMetadata) string {
+	var b strings.Builder
+	b.WriteString("FXT/1 ")
+	b.WriteString(strconv.FormatUint(fileID, 10))
+	b.WriteString(" status=ok ts=")
+	b.WriteString(strconv.FormatInt(ts, 10))
+	if windowHashToken != "" {
+		b.WriteString(" file-hash=")
+		b.WriteString(windowHashToken)
+	}
+	b.WriteString(" next=")
+	b.WriteString(strconv.FormatInt(next, 10))
+	if metadata != nil {
+		for _, token := range fileFrameMetadataTokens(metadata) {
+			b.WriteString(" ")
+			b.WriteString(token)
+		}
+	}
+	b.WriteString(" hash=")
+	b.WriteString(placeholderTrailerHashToken)
+	b.WriteString("\n")
+	return b.String()
+}
+
+func fileFrameMetadataTokens(metadata *fileFrameMetadata) []string {
+	if metadata == nil {
+		return nil
+	}
+	return []string{
+		"meta:size=" + strconv.FormatInt(metadata.Size, 10),
+		"meta:mtime_ns=" + strconv.FormatInt(metadata.MtimeNS, 10),
+		"meta:mode=" + metadata.Mode,
+		"meta:uid=" + metadata.UID,
+		"meta:gid=" + metadata.GID,
+		"meta:user=" + strings.ReplaceAll(metadata.User, " ", "_"),
+		"meta:group=" + strings.ReplaceAll(metadata.Group, " ", "_"),
+	}
+}
+
+func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, frameSize int64, frameWriter io.Writer, hashPipeW *os.File) error {
+	if fd == nil || fileOffset == nil || frameWriter == nil || hashPipeW == nil {
+		return errors.New("invalid buffered payload stream arguments")
+	}
+	section := io.NewSectionReader(fd, *fileOffset, frameSize)
+	buf, release, err := acquireLogicalBuffer(256 * 1024)
+	if err != nil {
+		return err
+	}
+	defer release()
+	written, err := io.CopyBuffer(io.MultiWriter(frameWriter, hashPipeW), section, buf)
+	*fileOffset += written
+	if err != nil {
+		return err
+	}
+	if written != frameSize {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, frameSize int64, frameWriter io.Writer, hashPipeW *os.File, pipeSize int) error {
+	return streamFramePayloadLinuxSpliceToOutput(fd, fileOffset, frameSize, frameWriter, hashPipeW, pipeSize, -1)
+}
+
+func streamFramePayloadLinuxSpliceToOutput(fd *os.File, fileOffset *int64, frameSize int64, frameWriter io.Writer, hashPipeW *os.File, pipeSize int, outFD int) error {
+	if fd == nil || fileOffset == nil || frameWriter == nil || hashPipeW == nil {
+		return errors.New("invalid splice payload stream arguments")
+	}
+	srcR, srcW, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer srcR.Close()
+	defer srcW.Close()
+
+	growPipeBestEffort(srcR, pipeSize)
+	growPipeBestEffort(srcW, pipeSize)
+	growPipeBestEffort(hashPipeW, pipeSize)
+	var (
+		copyBuf        []byte
+		releaseCopyBuf func()
+	)
+	if outFD < 0 {
+		copyBufSize := logicalBufferBucketSize(int64(pipeSize))
+		copyBuf, releaseCopyBuf, err = acquireLogicalBuffer(copyBufSize)
+		if err != nil {
+			return err
+		}
+		defer releaseCopyBuf()
+	}
+
+	remaining := frameSize
+	for remaining > 0 {
+		step := remaining
+		if step > int64(pipeSize) {
+			step = int64(pipeSize)
+		}
+		splicedIn, spliceErr := unix.Splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), unix.SPLICE_F_MOVE)
+		if spliceErr != nil {
+			return spliceErr
+		}
+		if splicedIn <= 0 {
+			return io.ErrUnexpectedEOF
+		}
+
+		// tee(2) does not consume src bytes. If tee returns a partial duplicate,
+		// we must consume exactly that amount from src before calling tee again,
+		// otherwise we'd duplicate the same prefix repeatedly.
+		sourceRemaining := splicedIn
+		for sourceRemaining > 0 {
+			teed, teeErr := unix.Tee(int(srcR.Fd()), int(hashPipeW.Fd()), int(sourceRemaining), 0)
+			if teeErr != nil {
+				return teeErr
+			}
+			if teed <= 0 {
+				return io.ErrUnexpectedEOF
+			}
+			if outFD >= 0 {
+				moveRemaining := teed
+				for moveRemaining > 0 {
+					moved, moveErr := unix.Splice(int(srcR.Fd()), nil, outFD, nil, int(moveRemaining), unix.SPLICE_F_MOVE)
+					if moveErr != nil {
+						if errors.Is(moveErr, unix.EINTR) {
+							continue
+						}
+						if errors.Is(moveErr, unix.EAGAIN) {
+							if waitErr := waitSocketWritable(outFD); waitErr != nil {
+								return waitErr
+							}
+							continue
+						}
+						return moveErr
+					}
+					if moved <= 0 {
+						return io.ErrUnexpectedEOF
+					}
+					moveRemaining -= moved
+				}
+			} else {
+				limited := &io.LimitedReader{R: readerOnly{Reader: srcR}, N: int64(teed)}
+				written, copyErr := io.CopyBuffer(frameWriter, limited, copyBuf)
+				if copyErr != nil {
+					return copyErr
+				}
+				if written != int64(teed) {
+					return io.ErrUnexpectedEOF
+				}
+			}
+			sourceRemaining -= teed
+		}
+		remaining -= int64(splicedIn)
+	}
+	return nil
+}
+
+func waitSocketWritable(fd int) error {
+	if fd < 0 {
+		return errors.New("invalid socket fd")
+	}
+	pollFDs := []unix.PollFd{{
+		Fd:     int32(fd),
+		Events: unix.POLLOUT,
+	}}
+	for {
+		_, err := unix.Poll(pollFDs, -1)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return err
+	}
+}
+
+func dupConnFD(conn net.Conn) (int, error) {
+	sysConn, ok := conn.(syscall.Conn)
+	if !ok {
+		return -1, errors.New("connection does not implement syscall.Conn")
+	}
+	raw, err := sysConn.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+	dupFD := -1
+	var dupErr error
+	if err := raw.Control(func(fd uintptr) {
+		dupFD, dupErr = unix.Dup(int(fd))
+	}); err != nil {
+		return -1, err
+	}
+	if dupErr != nil {
+		return -1, dupErr
+	}
+	if dupFD < 0 {
+		return -1, errors.New("failed to duplicate connection fd")
+	}
+	return dupFD, nil
+}
+
+func hijackStreamingConn(w http.ResponseWriter) (net.Conn, int, error) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		return nil, -1, errors.New("response writer does not support hijack")
+	}
+	conn, rw, err := hijacker.Hijack()
+	if err != nil {
+		return nil, -1, err
+	}
+	if _, err := io.WriteString(rw, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"); err != nil {
+		_ = conn.Close()
+		return nil, -1, err
+	}
+	if err := rw.Flush(); err != nil {
+		_ = conn.Close()
+		return nil, -1, err
+	}
+	outFD, err := dupConnFD(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, -1, err
+	}
+	return conn, outFD, nil
 }
 
 func ZeroCopyFileHandler(w http.ResponseWriter, req *http.Request) {
@@ -197,17 +503,56 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 	// in short order.
 	maybeFadviseSequential(fd, offset, windowLen)
 
-	comp, err := parseRequestedComp(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	ageRecipient, err := parseAgePublicKey(req.URL.Query().Get("age-public-key"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	frameWriter := http.ResponseWriter(w)
+	rawSpliceFD := strings.ToLower(strings.TrimSpace(req.URL.Query().Get("splice-fd")))
+	explicitSocketSplice := rawSpliceFD != ""
+	socketSpliceEnabled := true
+	switch rawSpliceFD {
+	case "", "1", "true", "on", "yes":
+		// default-enabled unless explicitly disabled
+	case "0", "false", "off", "no":
+		socketSpliceEnabled = false
+	default:
+		http.Error(w, "invalid query parameter: splice-fd", http.StatusBadRequest)
+		return
+	}
+	if ageRecipient != nil {
+		if explicitSocketSplice && socketSpliceEnabled {
+			http.Error(w, "splice-fd cannot be combined with age-public-key", http.StatusBadRequest)
+			return
+		}
+		socketSpliceEnabled = false
+	}
+	experimentalSocketSplice := socketSpliceEnabled && runtime.GOOS == "linux"
+	frameWriter := io.Writer(w)
+	socketSpliceFD := -1
+	var hijackedConn net.Conn
+	if experimentalSocketSplice {
+		conn, outFD, hijackErr := hijackStreamingConn(rawWriter)
+		if hijackErr != nil {
+			if explicitSocketSplice {
+				http.Error(w, "failed to initialize hijacked streaming response", http.StatusInternalServerError)
+				return
+			}
+			// Best-effort default: fall back to regular writer path when hijack is unavailable.
+			experimentalSocketSplice = false
+			log.Printf("filexfer: splice-fd fallback tid=%s fid=%d err=%v", txferID, fileID, hijackErr)
+		} else {
+			hijackedConn = conn
+			socketSpliceFD = outFD
+			frameWriter = conn
+			defer func() {
+				if socketSpliceFD >= 0 {
+					_ = unix.Close(socketSpliceFD)
+				}
+				_ = hijackedConn.Close()
+			}()
+		}
+	}
 	if ageRecipient != nil {
 		w.Header().Set("X-Filexfer-Enc", "age")
 		encryptedRW, closeEncrypted, encErr := wrapAgeEncryptedResponseWriter(w, ageRecipient)
@@ -223,213 +568,119 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		frameWriter = encryptedRW
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-
-	requestChunkMax := min(windowLen, defaultFileFrameLogicalSize)
-	logicalBufferSize := logicalBufferBucketSize(requestChunkMax)
-	adaptiveComp := comp == "adapt"
-	activeMode := initialCompressionMode(comp)
-	if mode, ok := GetTransferFileCompressionMode(txferID, fileID); ok {
-		activeMode = clampCompressionModeForAccept(mode, comp)
+	if !experimentalSocketSplice {
+		w.Header().Set("Content-Type", "application/octet-stream")
 	}
-	maxWSizeHint, err := maxRequestWireSizeHintBytes(comp, int64(logicalBufferSize))
-	if err != nil {
-		http.Error(w, "failed to compute frame wire-size hint", http.StatusInternalServerError)
-		return
-	}
-	policy := NewCompressionPolicy()
+	maxWSizeHint := min(windowLen, defaultFileFrameLogicalSize)
 	cursor := offset
 	windowStart := offset
-	windowWireTotal := int64(0)
-	windowLogicalTotal := int64(0)
+	windowWireTotal := int64(0)    // no compression currently; equal to logical
+	windowLogicalTotal := int64(0) // bytes served for this request window
 	windowFrames := 0
 	windowTS0 := time.Now().UnixMilli()
-	if !UpdateTransferFileHash(txferID, fileID, cursor, nil) {
-		http.Error(w, "invalid file stream offset for file hash", http.StatusConflict)
+	pipeSizeBytes := desiredPipeSizeBytes(windowLen, defaultFileFrameLogicalSize)
+	hashPipeR, hashPipeW, err := os.Pipe()
+	if err != nil {
+		http.Error(w, "failed to initialize window hash pipe", http.StatusInternalServerError)
 		return
 	}
+	defer hashPipeR.Close()
+	hashDone := startWindowHashWorker(hashPipeR)
+	defer func() {
+		if hashPipeW != nil {
+			_ = hashPipeW.Close()
+		}
+		if hashDone != nil {
+			<-hashDone
+		}
+	}()
+	useLinuxSplice := runtime.GOOS == "linux"
 	firstFrame := true
 	for remaining := windowLen; remaining > 0; {
-		workers := int((remaining + defaultFileFrameLogicalSize - 1) / defaultFileFrameLogicalSize)
-		if workers > maxConcurrentFramePrepares {
-			workers = maxConcurrentFramePrepares
+		frameSize := min(remaining, defaultFileFrameLogicalSize)
+		headerTS := time.Now().UnixMilli()
+		var maxHint *int64
+		if firstFrame && maxWSizeHint > 0 {
+			maxHint = &maxWSizeHint
 		}
-		if cursor < 4*defaultFileFrameLogicalSize {
-			workers = 1
-		}
-		workers = max(1, workers)
-
-		batchMode := activeMode
-		batchComp := frameCompTokenForMode(batchMode)
-		tasks := make([]framePrepareTask, 0, workers)
-		taskOffset := cursor
-		taskRemaining := remaining
-		for i := 0; i < workers && taskRemaining > 0; i++ {
-			chunkLogical := min(taskRemaining, defaultFileFrameLogicalSize)
-			tasks = append(tasks, framePrepareTask{
-				Index:       i,
-				Offset:      taskOffset,
-				LogicalSize: chunkLogical,
-				Mode:        batchMode,
-			})
-			taskOffset += chunkLogical
-			taskRemaining -= chunkLogical
-		}
-
-		prepared := make([]preparedFrame, len(tasks))
-		var wg sync.WaitGroup
-		for _, task := range tasks {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				frame := preparedFrame{Task: task}
-				logicalBuffer, releaseLogicalBuffer, err := acquireLogicalBuffer(logicalBufferSize)
-				if err != nil {
-					frame.Err = err
-					prepared[task.Index] = frame
-					return
-				}
-				compressors, releaseCompressors, err := acquireFrameCompressor(maxWSizeHint)
-				if err != nil {
-					releaseLogicalBuffer()
-					frame.Err = err
-					prepared[task.Index] = frame
-					return
-				}
-
-				prepareStart := time.Now()
-				logicalChunk, framePayload, wireSize, chunkHash, err := prepareFramePayloadAt(fd, compressors, task.Mode, logicalBuffer, task.Offset, task.LogicalSize)
-				if err != nil {
-					releaseCompressors()
-					releaseLogicalBuffer()
-					frame.Err = err
-					prepared[task.Index] = frame
-					return
-				}
-				frame.PrepareLatency = time.Since(prepareStart)
-				frame.LogicalChunk = logicalChunk
-				frame.FramePayload = framePayload
-				frame.WireSize = wireSize
-				frame.ChunkHash = chunkHash
-				frame.release = func() {
-					releaseCompressors()
-					releaseLogicalBuffer()
-				}
-				prepared[task.Index] = frame
-			}()
-		}
-		wg.Wait()
-
-		nextBatchMode := batchMode
-		for i := range prepared {
-			frame := prepared[i]
-			if frame.Err != nil {
-				releasePreparedFrames(prepared)
-				http.Error(w, "failed to prepare frame payload", http.StatusInternalServerError)
+		headerLine := buildFrameHeaderLine(fileID, cursor, frameSize, maxHint, headerTS)
+		if _, err := io.WriteString(frameWriter, headerLine); err != nil {
+			if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
+				http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
 				return
 			}
-			if !UpdateTransferFileHash(txferID, fileID, frame.Task.Offset, frame.LogicalChunk) {
-				releasePreparedFrames(prepared)
-				http.Error(w, "failed to update file hash state", http.StatusInternalServerError)
+			return
+		}
+
+		frameOffset := cursor
+		var payloadErr error
+		if useLinuxSplice {
+			payloadErr = streamFramePayloadLinuxSpliceToOutput(fd, &frameOffset, frameSize, frameWriter, hashPipeW, pipeSizeBytes, socketSpliceFD)
+		} else {
+			payloadErr = streamFramePayloadBuffered(fd, &frameOffset, frameSize, frameWriter, hashPipeW)
+		}
+		if payloadErr != nil {
+			if errors.Is(payloadErr, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
+				http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
 				return
 			}
+			return
+		}
 
-			headerTS := time.Now().UnixMilli()
-			hash128Bytes := frame.ChunkHash.Bytes()
-			hashHex := hex.EncodeToString(hash128Bytes[:])
-			headerHash := "xxh128:" + hashHex
-			nextOffset := frame.Task.Offset + frame.Task.LogicalSize
-			isTerminalResponseChunk := nextOffset == offset+windowLen
-			isTerminalFileChunk := nextOffset == fileInfo.Size()
-			nextValue := nextOffset
-			if isTerminalResponseChunk {
-				nextValue = 0
+		cursor = frameOffset
+		remaining -= frameSize
+		firstFrame = false
+		windowFrames++
+		windowLogicalTotal += frameSize
+		windowWireTotal += frameSize
+
+		isTerminalResponseChunk := remaining == 0
+		nextValue := cursor
+		if isTerminalResponseChunk {
+			nextValue = 0
+		}
+		trailerTS := time.Now().UnixMilli()
+		windowHashToken := ""
+		var terminalMD *fileFrameMetadata
+		if isTerminalResponseChunk {
+			if hashPipeW != nil {
+				_ = hashPipeW.Close()
+				hashPipeW = nil
 			}
-			trailerTS := time.Now().UnixMilli()
-			var (
-				fileHashes []string
-				terminalMD *fileFrameMetadata
-			)
-			if isTerminalFileChunk {
-				fileHashToken, ok := FinalizeTransferFileHash(txferID, fileID)
-				if !ok {
-					releasePreparedFrames(prepared)
-					http.Error(w, "failed to finalize file hash state", http.StatusInternalServerError)
-					return
-				}
-				fileHashes = []string{fileHashToken}
-			}
-			if isTerminalResponseChunk {
-				md := collectFileFrameMetadata(fileRef.Path, fileInfo)
-				terminalMD = &md
-			}
-			wirePayload := frame.FramePayload
-			var maxHint *int64
-			if firstFrame {
-				maxHint = &maxWSizeHint
-			}
-			writeStats, err := writeFrame(frameWriter, frameWriteArgs{
-				FileID:       fileID,
-				Offset:       frame.Task.Offset,
-				Size:         frame.Task.LogicalSize,
-				WSize:        int64(len(wirePayload)),
-				Comp:         batchComp,
-				Enc:          "none",
-				HeaderHash:   headerHash,
-				MaxWSizeHint: maxHint,
-				HeaderTS:     headerTS,
-				Payload:      wirePayload,
-				TrailerTS:    trailerTS,
-				FileHashes:   fileHashes,
-				Next:         nextValue,
-				Metadata:     terminalMD,
-			})
-			if err != nil {
-				releasePreparedFrames(prepared)
-				if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
-					http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+			if hashDone == nil {
+				if socketSpliceFD < 0 {
+					http.Error(w, "failed to finalize window hash state", http.StatusInternalServerError)
 				}
 				return
 			}
-			windowFrames++
-			windowLogicalTotal += frame.Task.LogicalSize
-			windowWireTotal += frame.WireSize
-			if adaptiveComp {
-				decision := policy.Decide(batchMode, CompressionMetrics{
-					LogicalSize:    frame.Task.LogicalSize,
-					WireSize:       frame.WireSize,
-					PrepareLatency: frame.PrepareLatency,
-					WriteLatency:   writeStats.WriteLatency,
-				})
-				candidate := clampCompressionModeForAccept(decision.Next, comp)
-				if candidate != batchMode {
-					prevComp := frameCompTokenForMode(batchMode)
-					nextComp := frameCompTokenForMode(candidate)
-					log.Printf(
-						"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f read_over_write=%.3f",
-						txferID,
-						fileID,
-						prevComp,
-						nextComp,
-						decision.Reason,
-						decision.Ratio,
-						decision.ReadOverWrite,
-					)
-					nextBatchMode = candidate
+			result := <-hashDone
+			hashDone = nil
+			if result.err != nil {
+				if socketSpliceFD < 0 {
+					http.Error(w, "failed to finalize window hash", http.StatusInternalServerError)
 				}
+				return
 			}
-
-			cursor = nextOffset
-			remaining -= frame.Task.LogicalSize
-			firstFrame = false
-			if frame.release != nil {
-				frame.release()
-				prepared[i].release = nil
+			windowHashToken = result.token
+			if !SetTransferFileWindowHash(txferID, fileID, cursor, windowHashToken) {
+				if socketSpliceFD < 0 {
+					http.Error(w, "failed to store window hash state", http.StatusInternalServerError)
+				}
+				return
 			}
+			md := collectFileFrameMetadata(fileRef.Path, fileInfo)
+			terminalMD = &md
 		}
-		if adaptiveComp && nextBatchMode != activeMode {
-			activeMode = nextBatchMode
-			_ = SetTransferFileCompressionMode(txferID, fileID, activeMode)
+		trailerLine := buildFrameTrailerLine(fileID, trailerTS, nextValue, windowHashToken, terminalMD)
+		if _, err := io.WriteString(frameWriter, trailerLine); err != nil {
+			if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
+				http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+				return
+			}
+			return
+		}
+		if fl, ok := frameWriter.(http.Flusher); ok {
+			fl.Flush()
 		}
 	}
 	windowTS1 := time.Now().UnixMilli()
@@ -504,13 +755,13 @@ func FileAckHandler(w http.ResponseWriter, req *http.Request) {
 	if ackTarget < 0 {
 		ackTarget = 0
 	}
-	if ackBytes >= 0 && ackTarget == maxAck {
+	if ackBytes >= 0 {
 		if ackHashToken == "" {
-			http.Error(w, "missing final ack hash token", http.StatusBadRequest)
+			http.Error(w, "missing window ack hash token", http.StatusBadRequest)
 			return
 		}
-		if !VerifyTransferFileHash(txferID, fileID, maxAck, ackHashToken) {
-			http.Error(w, "final ack hash token mismatch", http.StatusConflict)
+		if !VerifyTransferFileWindowHash(txferID, fileID, ackTarget, ackHashToken) {
+			http.Error(w, "window ack hash token mismatch", http.StatusConflict)
 			return
 		}
 	}

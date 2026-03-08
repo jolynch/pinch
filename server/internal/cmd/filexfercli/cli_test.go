@@ -31,7 +31,7 @@ func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 		len(body),
 		xsum,
 	)
-	trailerPrefix := fmt.Sprintf("FXT/1 %d status=ok ts=1001", fileID)
+	trailerPrefix := fmt.Sprintf("FXT/1 %d status=ok ts=1001 file-hash=xxh128:%s", fileID, xsum)
 	h := xxh3.New()
 	_, _ = h.Write([]byte(header))
 	_, _ = h.Write(body)

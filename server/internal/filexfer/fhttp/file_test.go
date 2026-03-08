@@ -123,19 +123,6 @@ func decodeFrameSequence(t *testing.T, body []byte) []decodedFrame {
 	return frames
 }
 
-func expectedFrameHashToken(header string, payload []byte, trailerLine string) string {
-	idx := strings.LastIndex(trailerLine, " hash=")
-	if idx < 0 {
-		return ""
-	}
-	trailerPrefix := trailerLine[:idx]
-	h := xxh3.New()
-	_, _ = h.Write([]byte(header + "\n"))
-	_, _ = h.Write(payload)
-	_, _ = h.Write([]byte(trailerPrefix))
-	return formatXXH64HashToken(h.Sum64())
-}
-
 func splitFrame(body []byte) (string, []byte, string, bool) {
 	headerEnd := bytes.IndexByte(body, '\n')
 	if headerEnd < 0 {
@@ -229,10 +216,10 @@ func TestFileHandlerIdentityFrame(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected frame header, payload, and trailer")
 	}
-	if !strings.HasPrefix(header, "FX/1 0 offset=0 size=5 wsize=5 comp=none enc=none hash=xxh128:"+xxh128Hex([]byte("hello"))+" max-wsize=") {
+	if !strings.HasPrefix(header, "FX/1 0 offset=0 size=5 wsize=5 comp=none enc=none hash=xxh128:00000000000000000000000000000000 max-wsize=") {
 		t.Fatalf("unexpected frame header: %q", header)
 	}
-	if got, ok := headerProp(header, "max-wsize"); !ok || got != "1048576" {
+	if got, ok := headerProp(header, "max-wsize"); !ok || got != "5" {
 		t.Fatalf("unexpected max-wsize: %q (present=%v)", got, ok)
 	}
 	if string(payload) != "hello" {
@@ -245,9 +232,11 @@ func TestFileHandlerIdentityFrame(t *testing.T) {
 	if parsedTrailer.TS <= 0 {
 		t.Fatalf("missing/invalid trailer ts: %d", parsedTrailer.TS)
 	}
-	expectedHash := expectedFrameHashToken(header, payload, trailer)
-	if parsedTrailer.HashToken != expectedHash {
-		t.Fatalf("unexpected hash token: %q", parsedTrailer.HashToken)
+	if parsedTrailer.HashToken != placeholderTrailerHashToken {
+		t.Fatalf("unexpected trailer hash token: %q", parsedTrailer.HashToken)
+	}
+	if parsedTrailer.FileHashToken != "xxh128:"+xxh128Hex([]byte("hello")) {
+		t.Fatalf("unexpected file-hash token: %q", parsedTrailer.FileHashToken)
 	}
 	if !strings.Contains(trailer, " meta:size=5 ") && !strings.HasSuffix(trailer, " meta:size=5") {
 		t.Fatalf("expected terminal metadata in trailer: %q", trailer)
@@ -335,7 +324,7 @@ func TestFileHandlerCompressedFrameHeaders(t *testing.T) {
 		if !ok {
 			t.Fatalf("encoding %s: expected frame header/payload/trailer", enc)
 		}
-		if !strings.Contains(header, " comp="+enc+" ") {
+		if !strings.Contains(header, " comp=none ") {
 			t.Fatalf("encoding %s: unexpected frame header: %q", enc, header)
 		}
 		if !strings.HasPrefix(trailer, "FXT/1 0 status=ok ts=") {
@@ -362,7 +351,7 @@ func TestFileHandlerPartialWindow(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected frame header/payload/trailer")
 	}
-	if !strings.HasPrefix(header, "FX/1 0 offset=1 size=3 wsize=3 comp=none enc=none hash=xxh128:"+xxh128Hex([]byte("ell"))+" max-wsize=") {
+	if !strings.HasPrefix(header, "FX/1 0 offset=1 size=3 wsize=3 comp=none enc=none hash=xxh128:00000000000000000000000000000000 max-wsize=") {
 		t.Fatalf("unexpected frame header: %q", header)
 	}
 	if string(payload) != "ell" {
@@ -372,9 +361,11 @@ func TestFileHandlerPartialWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse trailer: %v", err)
 	}
-	expectedHash := expectedFrameHashToken(header, payload, trailer)
-	if parsedTrailer.HashToken != expectedHash {
-		t.Fatalf("unexpected hash token: %q", parsedTrailer.HashToken)
+	if parsedTrailer.HashToken != placeholderTrailerHashToken {
+		t.Fatalf("unexpected trailer hash token: %q", parsedTrailer.HashToken)
+	}
+	if parsedTrailer.FileHashToken != "xxh128:"+xxh128Hex([]byte("ell")) {
+		t.Fatalf("unexpected file-hash token: %q", parsedTrailer.FileHashToken)
 	}
 }
 
@@ -461,17 +452,21 @@ func TestFileHandlerMultiFrameDefaultChunkSize(t *testing.T) {
 		if frame.trailer.TS <= 0 {
 			t.Fatalf("frame %d: missing trailer ts", i)
 		}
-		expectedHash := expectedFrameHashToken(frame.header, frame.payload, frame.trailerLine)
-		if frame.trailer.HashToken != expectedHash {
-			t.Fatalf("frame %d: invalid hash token %q", i, frame.trailer.HashToken)
+		if frame.trailer.HashToken != placeholderTrailerHashToken {
+			t.Fatalf("frame %d: unexpected trailer hash token %q", i, frame.trailer.HashToken)
 		}
 		offset += frame.meta.Size
 		if i < len(frames)-1 {
+			if frame.trailer.FileHashToken != "" {
+				t.Fatalf("frame %d: expected empty intermediate file-hash, got %q", i, frame.trailer.FileHashToken)
+			}
 			if frame.trailer.Next == nil || *frame.trailer.Next != offset {
 				t.Fatalf("frame %d: expected next offset %d", i, offset)
 			}
 		} else if frame.trailer.Next == nil || *frame.trailer.Next != 0 {
 			t.Fatalf("last frame should carry next=0")
+		} else if frame.trailer.FileHashToken != "xxh128:"+xxh128Hex(content) {
+			t.Fatalf("last frame: unexpected window file-hash %q", frame.trailer.FileHashToken)
 		}
 	}
 	if !strings.Contains(w.Body.String(), " meta:size=") {
@@ -497,10 +492,8 @@ func TestFileHandlerCompressedMultiFrameChecksumsAndNext(t *testing.T) {
 	expectedSizes := []int64{8 * 1024 * 1024, 8 * 1024 * 1024, 1 * 1024 * 1024}
 	var offset int64
 	for i, frame := range frames {
-		switch frame.meta.Comp {
-		case EncodingZstd, EncodingLz4, "none":
-		default:
-			t.Fatalf("frame %d: unexpected comp=%s", i, frame.meta.Comp)
+		if frame.meta.Comp != "none" {
+			t.Fatalf("frame %d: expected comp=none, got %s", i, frame.meta.Comp)
 		}
 		if frame.meta.Size != expectedSizes[i] {
 			t.Fatalf("frame %d: expected size %d got %d", i, expectedSizes[i], frame.meta.Size)
@@ -515,17 +508,21 @@ func TestFileHandlerCompressedMultiFrameChecksumsAndNext(t *testing.T) {
 		if int64(len(logical)) != frame.meta.Size {
 			t.Fatalf("frame %d: logical size mismatch", i)
 		}
-		expectedHash := expectedFrameHashToken(frame.header, frame.payload, frame.trailerLine)
-		if frame.trailer.HashToken != expectedHash {
-			t.Fatalf("frame %d: invalid hash token %q", i, frame.trailer.HashToken)
+		if frame.trailer.HashToken != placeholderTrailerHashToken {
+			t.Fatalf("frame %d: unexpected trailer hash token %q", i, frame.trailer.HashToken)
 		}
 		offset += frame.meta.Size
 		if i < len(frames)-1 {
+			if frame.trailer.FileHashToken != "" {
+				t.Fatalf("frame %d: expected empty intermediate file-hash, got %q", i, frame.trailer.FileHashToken)
+			}
 			if frame.trailer.Next == nil || *frame.trailer.Next != offset {
 				t.Fatalf("frame %d: expected next offset %d", i, offset)
 			}
 		} else if frame.trailer.Next == nil || *frame.trailer.Next != 0 {
 			t.Fatalf("last frame should carry next=0")
+		} else if frame.trailer.FileHashToken != "xxh128:"+xxh128Hex(content) {
+			t.Fatalf("last frame: unexpected window file-hash %q", frame.trailer.FileHashToken)
 		}
 	}
 }
@@ -597,16 +594,31 @@ func TestFileHandlerRejectsPathOutsideRoot(t *testing.T) {
 
 func TestFileAckHandlerAckBytesUpdatesTransferProgress(t *testing.T) {
 	txferID, fullPath := setupSingleFileTransfer(t)
-	makeReq := func(ack string) *http.Request {
+	makeReq := func(ack string, delta string) *http.Request {
 		return newFileAckRequest(
 			txferID,
 			"0",
-			"?path="+url.QueryEscape(fullPath)+"&ack-bytes="+url.QueryEscape(ack)+"&delta-bytes=1&recv-ms=1&sync-ms=1",
+			"?path="+url.QueryEscape(fullPath)+"&ack-bytes="+url.QueryEscape(ack)+"&delta-bytes="+url.QueryEscape(delta)+"&recv-ms=1&sync-ms=1",
 		)
 	}
 
+	// Seed full-file hash state by streaming the file once.
 	w := httptest.NewRecorder()
-	FileAckHandler(w, makeReq("2@1"))
+	FileHandler(w, newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)))
+	if got := w.Result().StatusCode; got != http.StatusOK {
+		t.Fatalf("expected 200 while seeding file hash state, got %d", got)
+	}
+	frames := decodeFrameSequence(t, w.Body.Bytes())
+	if len(frames) == 0 {
+		t.Fatalf("expected at least one frame while seeding")
+	}
+	seedHash := frames[len(frames)-1].trailer.FileHashToken
+	if seedHash == "" {
+		t.Fatalf("expected terminal file-hash token while seeding")
+	}
+
+	w = httptest.NewRecorder()
+	FileAckHandler(w, makeReq("5@1@"+seedHash, "5"))
 	if got := w.Result().StatusCode; got != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", got)
 	}
@@ -614,23 +626,6 @@ func TestFileAckHandlerAckBytesUpdatesTransferProgress(t *testing.T) {
 	if !ok {
 		t.Fatalf("transfer not found")
 	}
-	if tx.Done != 0 || tx.DoneSize != 2 {
-		t.Fatalf("unexpected counters after partial ack: done=%d doneSize=%d", tx.Done, tx.DoneSize)
-	}
-
-	// Seed full-file hash state by streaming the file once.
-	w = httptest.NewRecorder()
-	FileHandler(w, newFileRequest(txferID, "0", "?path="+url.QueryEscape(fullPath)))
-	if got := w.Result().StatusCode; got != http.StatusOK {
-		t.Fatalf("expected 200 while seeding file hash state, got %d", got)
-	}
-
-	w = httptest.NewRecorder()
-	FileAckHandler(w, makeReq("5@1@xxh128:"+xxh128Hex([]byte("hello"))))
-	if got := w.Result().StatusCode; got != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d", got)
-	}
-	tx, _ = GetTransfer(txferID)
 	if tx.Done != 1 || tx.DoneSize != 5 {
 		t.Fatalf("unexpected counters after full ack: done=%d doneSize=%d", tx.Done, tx.DoneSize)
 	}

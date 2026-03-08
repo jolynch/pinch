@@ -692,7 +692,6 @@ func loadProgressState(progressPath string) (map[uint64]progressStateEntry, erro
 
 type metadataProgressUpdate struct {
 	FileID uint64
-	Ack    chan struct{}
 }
 
 func startProgressWriter(progressPath string, initial map[uint64]progressStateEntry, updates <-chan DownloadProgressUpdate, stderr io.Writer) (func(), func(uint64)) {
@@ -743,9 +742,42 @@ func startProgressWriter(progressPath string, initial map[uint64]progressStateEn
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		dirty := false
+		applyProgress := func(update DownloadProgressUpdate) {
+			prev := state[update.FileID]
+			if update.AckBytes > prev.AckBytes {
+				prev.AckBytes = update.AckBytes
+				state[update.FileID] = prev
+				dirty = true
+			}
+		}
+		applyMetadataDone := func(update metadataProgressUpdate) {
+			prev := state[update.FileID]
+			if !prev.MetadataDone {
+				prev.MetadataDone = true
+				state[update.FileID] = prev
+				dirty = true
+			}
+		}
+		drainPending := func() {
+			for {
+				select {
+				case update, ok := <-updates:
+					if !ok {
+						updates = nil
+						continue
+					}
+					applyProgress(update)
+				case update := <-metadataDoneCh:
+					applyMetadataDone(update)
+				default:
+					return
+				}
+			}
+		}
 		for {
 			select {
 			case <-stopCh:
+				drainPending()
 				if dirty {
 					if err := writeSnapshot(); err != nil {
 						fmt.Fprintf(stderr, "progress flush failed: %v\n", err)
@@ -761,20 +793,9 @@ func startProgressWriter(progressPath string, initial map[uint64]progressStateEn
 					}
 					return
 				}
-				prev := state[update.FileID]
-				if update.AckBytes > prev.AckBytes {
-					prev.AckBytes = update.AckBytes
-					state[update.FileID] = prev
-					dirty = true
-				}
+				applyProgress(update)
 			case update := <-metadataDoneCh:
-				prev := state[update.FileID]
-				if !prev.MetadataDone {
-					prev.MetadataDone = true
-					state[update.FileID] = prev
-					dirty = true
-				}
-				close(update.Ack)
+				applyMetadataDone(update)
 			case <-ticker.C:
 				if dirty {
 					if err := writeSnapshot(); err != nil {
@@ -792,15 +813,12 @@ func startProgressWriter(progressPath string, initial map[uint64]progressStateEn
 		<-doneCh
 	}
 	markMetadataDone := func(fileID uint64) {
-		ack := make(chan struct{})
 		select {
 		case <-doneCh:
 			return
-		case metadataDoneCh <- metadataProgressUpdate{FileID: fileID, Ack: ack}:
-		}
-		select {
-		case <-doneCh:
-		case <-ack:
+		case metadataDoneCh <- metadataProgressUpdate{FileID: fileID}:
+		default:
+			// Do not block download workers on progress persistence.
 		}
 	}
 	return stop, markMetadataDone

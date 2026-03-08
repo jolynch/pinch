@@ -57,6 +57,7 @@ type Client struct {
 	FileRequestWindowBytes  int64
 	FrameBufferBytes        int
 	MaxFrameReadBufferBytes int
+	AckRequestTimeout       time.Duration
 
 	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
 	bufferPool sync.Map // map[int]*sync.Pool
@@ -208,6 +209,8 @@ const (
 	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024
 	minClientFrameReadBufferBytes        int   = 32 * 1024
 	defaultClientAckEveryBytes           int64 = 256 * 1024 * 1024
+	defaultClientAckRequestTimeout             = 15 * time.Second
+	defaultClientResponseHeaderTimeout         = 20 * time.Second
 )
 
 func maxSocketReadBufferBytes() int {
@@ -237,6 +240,7 @@ func newTunedHTTPClient(readBufBytes int) *http.Client {
 		return &http.Client{}
 	}
 	transport := base.Clone()
+	transport.ResponseHeaderTimeout = defaultClientResponseHeaderTimeout
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -265,6 +269,7 @@ func NewClient(baseURL string, hc *http.Client) *Client {
 		FileRequestWindowBytes:  defaultClientRequestWindowBytes,
 		FrameBufferBytes:        defaultClientFrameBufferBytes,
 		MaxFrameReadBufferBytes: defaultClientMaxFrameReadBufferBytes,
+		AckRequestTimeout:       defaultClientAckRequestTimeout,
 	}
 	c.bufferPool = sync.Map{}
 	return c
@@ -579,10 +584,6 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	if windowSize <= 0 {
 		windowSize = defaultClientRequestWindowBytes
 	}
-	ackEvery := req.AckEveryBytes
-	if ackEvery <= 0 {
-		ackEvery = defaultClientAckEveryBytes
-	}
 
 	if req.UseZeroCopy {
 		return c.downloadFileFromManifestZeroCopy(ctx, req, entry, serverPath, destPath, writer, closeWriter, fileWriter)
@@ -633,10 +634,6 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		resultMeta FileFrameMeta
 		mixedComp  bool
 		fileHasher = xxh3.New128()
-		lastTS     int64
-		lastAcked  int64
-		synced     int64
-		intervalTS = time.Now()
 	)
 
 	ackCtx, stopAck := context.WithCancel(ctx)
@@ -697,46 +694,9 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		if frameBuf == nil {
 			frameBuf, releaseFrameBuf = c.acquireFrameReadBuffer(windowMeta.MaxWireSizeHint)
 		}
-		getTrailerTS := func() int64 {
-			if tsReader, ok := windowReader.(interface{ LastTrailerTS() int64 }); ok {
-				if ts := tsReader.LastTrailerTS(); ts > 0 {
-					return ts
-				}
-			}
-			return lastTS
-		}
-		copyErr := copyStreamWithProgress(writer, windowReader, frameBuf, fileHasher, func(written int64) error {
-			currentTotal := offset + written
-			deltaBytes := currentTotal - lastAcked
-			if deltaBytes < ackEvery {
-				return nil
-			}
-			recvMS := time.Since(intervalTS).Milliseconds()
-			syncMS := int64(0)
-			if !req.NoSync {
-				syncStart := time.Now()
-				if err := dataSyncFile(fileWriter); err != nil {
-					return fmt.Errorf("fdatasync output file: %w", err)
-				}
-				syncMS = time.Since(syncStart).Milliseconds()
-			}
-			synced = currentTotal
-			// Final progress ack must include hash token; avoid sending a non-final ack at EOF.
-			if deltaBytes >= ackEvery && synced < totalSize {
-				if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{
-					AckBytes:   synced,
-					ServerTS:   getTrailerTS(),
-					DeltaBytes: deltaBytes,
-					RecvMS:     recvMS,
-					SyncMS:     syncMS,
-				}); qErr != nil {
-					return fmt.Errorf("enqueue ack failed: %w", qErr)
-				}
-				lastAcked = synced
-				intervalTS = time.Now()
-			}
-			return nil
-		})
+		windowHasher := xxh3.New128()
+		windowStart := time.Now()
+		copyErr := copyStream(io.MultiWriter(writer, windowHasher, fileHasher), windowReader, frameBuf, nil)
 		closeReadErr := windowReader.Close()
 		if copyErr != nil {
 			_ = closeWriter()
@@ -750,8 +710,38 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			_ = closeWriter()
 			return DownloadFileResponse{}, fmt.Errorf("window size mismatch: requested=%d got=%d", window, windowMeta.Size)
 		}
+		windowHash := intcodec.FormatXXH128HashToken(windowHasher.Sum128())
+		if windowMeta.FileHashToken == "" {
+			_ = closeWriter()
+			return DownloadFileResponse{}, errors.New("window hash missing from trailer")
+		}
+		if !strings.EqualFold(windowMeta.FileHashToken, windowHash) {
+			_ = closeWriter()
+			return DownloadFileResponse{}, fmt.Errorf("window hash mismatch: server=%s client=%s", windowMeta.FileHashToken, windowHash)
+		}
+		recvMS := time.Since(windowStart).Milliseconds()
+		syncMS := int64(0)
+		if !req.NoSync {
+			syncStart := time.Now()
+			if err := dataSyncFile(fileWriter); err != nil {
+				_ = closeWriter()
+				return DownloadFileResponse{}, fmt.Errorf("fdatasync output file: %w", err)
+			}
+			syncMS = time.Since(syncStart).Milliseconds()
+		}
 		offset += windowMeta.Size
-		lastTS = windowMeta.TrailerTS
+		if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{
+			AckBytes:   offset,
+			ServerTS:   windowMeta.TrailerTS,
+			HashToken:  windowHash,
+			DeltaBytes: windowMeta.Size,
+			RecvMS:     recvMS,
+			SyncMS:     syncMS,
+			Final:      true,
+		}); qErr != nil {
+			_ = closeWriter()
+			return DownloadFileResponse{}, fmt.Errorf("enqueue window ack failed: %w", qErr)
+		}
 
 		if firstMeta == nil {
 			tmp := *windowMeta
@@ -790,38 +780,10 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	if mixedComp {
 		resultMeta.Comp = "mixed"
 	}
-
-	finalRecvMS := time.Since(intervalTS).Milliseconds()
-	finalSyncMS := int64(0)
-	if !req.NoSync {
-		finalSyncStart := time.Now()
-		if err := dataSyncFile(fileWriter); err != nil {
-			_ = closeWriter()
-			return DownloadFileResponse{}, fmt.Errorf("fdatasync output file: %w", err)
-		}
-		finalSyncMS = time.Since(finalSyncStart).Milliseconds()
-	}
-	synced = offset
 	fullHash := intcodec.FormatXXH128HashToken(fileHasher.Sum128())
-	if resultMeta.FileHashToken != "" && !strings.EqualFold(resultMeta.FileHashToken, fullHash) {
-		_ = closeWriter()
-		return DownloadFileResponse{}, fmt.Errorf("file hash mismatch: server=%s client=%s", resultMeta.FileHashToken, fullHash)
-	}
 	if err := applyVerifiedFileMetadata(fileWriter, resultMeta.TrailerMetadata, req.MetadataApplyBestEffort); err != nil {
 		_ = closeWriter()
 		return DownloadFileResponse{}, err
-	}
-	if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{
-		AckBytes:   synced,
-		ServerTS:   lastTS,
-		HashToken:  fullHash,
-		DeltaBytes: synced - lastAcked,
-		RecvMS:     finalRecvMS,
-		SyncMS:     finalSyncMS,
-		Final:      true,
-	}); qErr != nil {
-		_ = closeWriter()
-		return DownloadFileResponse{}, fmt.Errorf("enqueue final ack failed: %w", qErr)
 	}
 	closeAckWorker()
 	if err := waitAckWorker(ackErrCh); err != nil {
@@ -1081,6 +1043,10 @@ func waitAckWorker(ackErrCh <-chan error) error {
 }
 
 func (c *Client) runAckWorker(ctx context.Context, ackQueue <-chan ackEvent, ackErrCh chan<- error, base ackRequestBase) {
+	ackTimeout := c.AckRequestTimeout
+	if ackTimeout <= 0 {
+		ackTimeout = defaultClientAckRequestTimeout
+	}
 	var prevAckTime time.Time
 	for evt := range ackQueue {
 		req := AcknowledgeFileProgressRequest{
@@ -1095,7 +1061,9 @@ func (c *Client) runAckWorker(ctx context.Context, ackQueue <-chan ackEvent, ack
 			SyncMS:     evt.SyncMS,
 		}
 		err := retryAck(ctx, func(callCtx context.Context) error {
-			_, err := c.AcknowledgeFileProgress(callCtx, req)
+			ackCtx, cancel := context.WithTimeout(callCtx, ackTimeout)
+			defer cancel()
+			_, err := c.AcknowledgeFileProgress(ackCtx, req)
 			return err
 		})
 		if err != nil {
@@ -1668,7 +1636,6 @@ type fileStream struct {
 
 	frameMeta   FileFrameMeta
 	logical     io.ReadCloser
-	frameHash   *xxh3.Hasher
 	logicalRead int64
 
 	expectOffset    bool
@@ -1820,9 +1787,6 @@ func (s *fileStream) openNextFrame() error {
 	}
 
 	payloadReader := io.LimitReader(s.br, meta.WireSize)
-	s.frameHash = xxh3.New()
-	_, _ = s.frameHash.Write([]byte(headerLine))
-	payloadReader = io.TeeReader(payloadReader, s.frameHash)
 	logicalReader, err := decodePayloadReader(payloadReader, meta.Comp, meta.Enc, s.identity)
 	if err != nil {
 		return fmt.Errorf("decode payload reader: %w", err)
@@ -1849,13 +1813,6 @@ func (s *fileStream) finishFrame() error {
 	}
 	if trailer.FileID != s.frameMeta.FileID {
 		return fmt.Errorf("trailer file id mismatch: header=%d trailer=%d", s.frameMeta.FileID, trailer.FileID)
-	}
-	if s.frameHash == nil {
-		return errors.New("missing frame hash state")
-	}
-	_, _ = s.frameHash.Write([]byte(trailer.ChecksumPrefix))
-	if err := validateFrameHashToken(trailer.HashToken, s.frameHash.Sum64()); err != nil {
-		return err
 	}
 
 	nextOffset := s.frameMeta.Offset + s.frameMeta.Size
@@ -1892,7 +1849,6 @@ func (s *fileStream) finishFrame() error {
 
 	closeErr := s.logical.Close()
 	s.logical = nil
-	s.frameHash = nil
 	return closeErr
 }
 

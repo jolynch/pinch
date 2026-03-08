@@ -244,30 +244,29 @@ Implementation note:
 
 For `/fs/file` responses, header properties are emitted in this order:
 `offset`, `size`, `wsize`, `comp`, `enc`, `hash`, optional `max-wsize`, then `ts`.
+Current `/fs/file` implementation forces `comp=none` regardless of requested compression.
 
 Current trailer shape:
 
 ```text
-FXT/1 <file_id> status=ok ts=<unix_ms> hash=<algo>:<value> [file-hash=<algo>:<value>] next=<offset>
+FXT/1 <file_id> status=ok ts=<unix_ms> [file-hash=<algo>:<value>] next=<offset> [meta:*=...] hash=<algo>:<value>
 ```
 
 `next` is the offset that the following frame starts at (`offset + size`).
 The final trailer uses `next=0` as a terminal marker.
 
-`file-hash` is emitted on final trailer as the full-file checksum token for the served file window.
+`file-hash` is emitted on final trailer as the checksum token for the served request window.
 The final trailer also includes file metadata tokens:
 `meta:size`, `meta:mtime_ns`, `meta:mode`, `meta:uid`, `meta:gid`, `meta:user`, `meta:group`.
 Clients may use `meta:mode`, `meta:uid`, and `meta:gid` to mirror ownership/permissions
 only after payload integrity verification succeeds.
 
-`hash=<algo>:<value>` is the canonical checksum token for `/fs/file` trailers.
-For `/fs/file`, trailer hash is `hash=xxh64:<hex16>` and covers:
-- header line bytes (including trailing `\n`)
-- payload bytes (`wsize`)
-- trailer prefix bytes up to but not including ` hash=...`
+`hash=<algo>:<value>` remains present on every trailer for framing compatibility.
+Current `/fs/file` implementation emits a placeholder trailer hash token and does not
+use it for cryptographic verification.
 
-`file-hash=<algo>:<value>` on terminal trailer is the full logical object checksum.
-Current implementation emits `file-hash=xxh128:<hex32>`.
+`file-hash=<algo>:<value>` on terminal trailer is the authoritative per-window
+checksum token. Current implementation emits `file-hash=xxh128:<hex32>`.
 
 `max-wsize` is a first-frame hint only. Clients may use it to pre-size a reusable
 frame buffer, but they may cap allocation (current client default cap is `64 MiB`)
@@ -278,18 +277,20 @@ and still stream larger frames in multiple reads.
 `ack-bytes` is interpreted as:
 
 - `-1` for missing-file acknowledgement.
-- `<bytes>@<server_ts_ms>` for positive progress acknowledgement.
-- `<bytes>@<server_ts_ms>@<algo>:<value>` for final completion acknowledgement with full-file hash.
+- `<bytes>@<server_ts_ms>@<algo>:<value>` for positive window acknowledgement.
+
+Positive ack hash token is required and must match the server-stored expected
+window hash for that `ack-bytes` boundary.
 
 Legacy positive numeric-only acks are not accepted.
 
-Ack-only calls are supported using:
+Acks are submitted using:
 
 ```text
-GET /fs/file/{txferid}/{fid}?path=<abs>&offset=0&size=0&ack-bytes=...
+PUT /fs/file/{txferid}/{fid}/ack?path=<abs>&ack-bytes=<...>&delta-bytes=<...>&recv-ms=<...>&sync-ms=<...>
 ```
 
-Successful ack-only requests return `204 No Content` and no frame payload.
+Successful ack requests return `204 No Content`.
 
 ## `/fs/file/{txferid}/{fid}/checksum` Contract
 

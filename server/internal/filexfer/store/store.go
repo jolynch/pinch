@@ -83,9 +83,10 @@ func (e *FileLookupError) Error() string {
 }
 
 type transferStore struct {
-	mu         sync.RWMutex
-	transfers  map[string]Transfer
-	fileHashes map[fileHashKey]fileHashState
+	mu           sync.RWMutex
+	transfers    map[string]Transfer
+	fileHashes   map[fileHashKey]fileHashState
+	windowHashes map[windowHashKey]windowHashState
 }
 
 type fileHashKey struct {
@@ -104,6 +105,17 @@ type fileHashState struct {
 	expiresAt     time.Time
 }
 
+type windowHashKey struct {
+	txferID  string
+	fileID   uint64
+	endBytes int64
+}
+
+type windowHashState struct {
+	hashToken string
+	expiresAt time.Time
+}
+
 var (
 	ttl     = defaultTransferTTL
 	manager = newTransferStore()
@@ -115,8 +127,9 @@ func init() {
 
 func newTransferStore() *transferStore {
 	return &transferStore{
-		transfers:  make(map[string]Transfer),
-		fileHashes: make(map[fileHashKey]fileHashState),
+		transfers:    make(map[string]Transfer),
+		fileHashes:   make(map[fileHashKey]fileHashState),
+		windowHashes: make(map[windowHashKey]windowHashState),
 	}
 }
 
@@ -324,6 +337,11 @@ func (s *transferStore) delete(txferID string) bool {
 			delete(s.fileHashes, key)
 		}
 	}
+	for key := range s.windowHashes {
+		if key.txferID == txferID {
+			delete(s.windowHashes, key)
+		}
+	}
 	return true
 }
 
@@ -402,6 +420,7 @@ func (s *transferStore) resetForTest() {
 	s.mu.Lock()
 	s.transfers = make(map[string]Transfer)
 	s.fileHashes = make(map[fileHashKey]fileHashState)
+	s.windowHashes = make(map[windowHashKey]windowHashState)
 	s.mu.Unlock()
 }
 
@@ -506,6 +525,11 @@ func (s *transferStore) acknowledgeFile(txferID string, fileID uint64, ackBytes 
 	}
 
 	s.transfers[txferID] = transfer
+	for key := range s.windowHashes {
+		if key.txferID == txferID && key.fileID == fileID && key.endBytes <= target {
+			delete(s.windowHashes, key)
+		}
+	}
 	return true
 }
 
@@ -550,8 +574,75 @@ func (s *transferStore) reapExpiredLoop() {
 				delete(s.fileHashes, key)
 			}
 		}
+		for key, state := range s.windowHashes {
+			if !state.expiresAt.After(now) {
+				delete(s.windowHashes, key)
+				continue
+			}
+			if _, ok := s.transfers[key.txferID]; !ok {
+				delete(s.windowHashes, key)
+			}
+		}
 		s.mu.Unlock()
 	}
+}
+
+func validHashToken(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	parts := strings.SplitN(raw, ":", 2)
+	return len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
+}
+
+func normalizeHashToken(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+func (s *transferStore) setWindowHashToken(txferID string, fileID uint64, endBytes int64, token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	transfer, ok := s.transfers[txferID]
+	if !ok {
+		return false
+	}
+	if fileID >= uint64(len(transfer.State)) || endBytes < 0 {
+		return false
+	}
+	if !validHashToken(token) {
+		return false
+	}
+	key := windowHashKey{
+		txferID:  txferID,
+		fileID:   fileID,
+		endBytes: endBytes,
+	}
+	s.windowHashes[key] = windowHashState{
+		hashToken: normalizeHashToken(token),
+		expiresAt: time.Now().Add(ttl),
+	}
+	return true
+}
+
+func (s *transferStore) verifyWindowHashToken(txferID string, fileID uint64, endBytes int64, token string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if endBytes < 0 {
+		return false
+	}
+	key := windowHashKey{
+		txferID:  txferID,
+		fileID:   fileID,
+		endBytes: endBytes,
+	}
+	state, ok := s.windowHashes[key]
+	if !ok {
+		return false
+	}
+	return state.hashToken == normalizeHashToken(token)
 }
 
 func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
@@ -676,6 +767,14 @@ func UpdateTransferFileHash(txferID string, fileID uint64, offset int64, chunk [
 
 func VerifyTransferFileHash(txferID string, fileID uint64, expectedBytes int64, hashToken string) bool {
 	return manager.verifyFileHashToken(txferID, fileID, expectedBytes, hashToken)
+}
+
+func SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
+	return manager.setWindowHashToken(txferID, fileID, endBytes, hashToken)
+}
+
+func VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
+	return manager.verifyWindowHashToken(txferID, fileID, endBytes, hashToken)
 }
 
 func FinalizeTransferFileHash(txferID string, fileID uint64) (string, bool) {

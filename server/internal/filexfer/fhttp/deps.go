@@ -127,6 +127,14 @@ func FinalizeTransferFileHash(txferID string, fileID uint64) (string, bool) {
 	return intstore.FinalizeTransferFileHash(txferID, fileID)
 }
 
+func SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
+	return intstore.SetTransferFileWindowHash(txferID, fileID, endBytes, hashToken)
+}
+
+func VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
+	return intstore.VerifyTransferFileWindowHash(txferID, fileID, endBytes, hashToken)
+}
+
 func GetTransferFileCompressionMode(txferID string, fileID uint64) (CompressionMode, bool) {
 	return intstore.GetTransferFileCompressionMode(txferID, fileID)
 }
