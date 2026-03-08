@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 )
 
 const defaultFileFrameLogicalSize int64 = 8 * 1024 * 1024
+const zeroCopyChunkSize int64 = 8 * 1024 * 1024
 const maxConcurrentFramePrepares = 8
 
 var logicalBufferPools sync.Map   // map[int]*sync.Pool
@@ -41,6 +43,89 @@ type preparedFrame struct {
 	PrepareLatency time.Duration
 	Err            error
 	release        func()
+}
+
+func ZeroCopyFileHandler(w http.ResponseWriter, req *http.Request) {
+	txferID := req.PathValue("txferid")
+	if txferID == "" {
+		http.Error(w, "missing required path parameter: txferid", http.StatusBadRequest)
+		return
+	}
+	fileIDRaw := req.PathValue("fid")
+	if fileIDRaw == "" {
+		http.Error(w, "missing required path parameter: fid", http.StatusBadRequest)
+		return
+	}
+	fileID, err := strconv.ParseUint(fileIDRaw, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid path parameter: fid", http.StatusBadRequest)
+		return
+	}
+
+	fullPathRaw := req.URL.Query().Get("path")
+	if fullPathRaw == "" {
+		http.Error(w, "missing required query parameter: path", http.StatusBadRequest)
+		return
+	}
+	offset, logicalSizeLimit, err := parseChunkWindow(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	fd, _, err := GetFile(txferID, fileID, fullPathRaw)
+	if err != nil {
+		writeLookupErr(w, err)
+		return
+	}
+	defer fd.Close()
+
+	fileInfo, err := fd.Stat()
+	if err != nil {
+		http.Error(w, "failed to stat file", http.StatusInternalServerError)
+		return
+	}
+	windowLen := fileInfo.Size()
+	if windowLen < 0 {
+		http.Error(w, "invalid file size", http.StatusInternalServerError)
+		return
+	}
+	if offset > windowLen {
+		http.Error(w, "offset out of range", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	windowLen -= offset
+	if logicalSizeLimit >= 0 && logicalSizeLimit < windowLen {
+		windowLen = logicalSizeLimit
+	}
+
+	maybeFadviseSequential(fd, offset, windowLen)
+	if _, err := fd.Seek(offset, io.SeekStart); err != nil {
+		http.Error(w, "failed to seek file", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(windowLen, 10))
+	flusher, _ := w.(http.Flusher)
+
+	remaining := windowLen
+	for remaining > 0 {
+		chunkLen := min(remaining, zeroCopyChunkSize)
+		written, copyErr := io.CopyN(w, fd, chunkLen)
+		remaining -= written
+		if copyErr != nil {
+			if errors.Is(copyErr, io.EOF) || errors.Is(copyErr, io.ErrUnexpectedEOF) {
+				log.Printf("filexfer zerocopy: short read tid=%s fid=%d want=%d wrote=%d err=%v", txferID, fileID, chunkLen, written, copyErr)
+				return
+			}
+			log.Printf("filexfer zerocopy: stream write failed tid=%s fid=%d wrote=%d err=%v", txferID, fileID, written, copyErr)
+			return
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 }
 
 func FileHandler(w http.ResponseWriter, req *http.Request) {

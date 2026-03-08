@@ -109,6 +109,7 @@ type DownloadFileRequest struct {
 	OutRoot                 string
 	OutFile                 string
 	Stdout                  io.Writer
+	UseZeroCopy             bool
 	AcceptEncoding          string
 	AgePublicKey            string
 	AgeIdentity             string
@@ -156,6 +157,7 @@ type FetchFileRequest struct {
 	TransferID     string
 	FileID         uint64
 	FullPath       string
+	UseZeroCopy    bool
 	AcceptEncoding string
 	AgePublicKey   string
 	AgeIdentity    string
@@ -388,6 +390,7 @@ func (c *Client) FetchFile(ctx context.Context, request FetchFileRequest) (Fetch
 		request.TransferID,
 		request.FileID,
 		request.FullPath,
+		request.UseZeroCopy,
 		request.AcceptEncoding,
 		request.AgePublicKey,
 		request.AgeIdentity,
@@ -408,6 +411,7 @@ func (c *Client) fetchFileWindow(
 	txferID string,
 	fileID uint64,
 	fullPath string,
+	useZeroCopy bool,
 	acceptEncoding string,
 	agePublicKey string,
 	ageIdentity string,
@@ -424,7 +428,11 @@ func (c *Client) fetchFileWindow(
 		return nil, nil, errors.New("missing full path")
 	}
 
-	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d", c.BaseURL, url.PathEscape(txferID), fileID))
+	filePath := fmt.Sprintf("%s/fs/file/%s/%d", c.BaseURL, url.PathEscape(txferID), fileID)
+	if useZeroCopy {
+		filePath += "/zerocopy"
+	}
+	u, err := url.Parse(filePath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("build file url: %w", err)
 	}
@@ -436,9 +444,11 @@ func (c *Client) fetchFileWindow(
 	if size >= 0 {
 		q.Set("size", strconv.FormatInt(size, 10))
 	}
-	q.Set("comp", normalizeRequestedComp(acceptEncoding))
-	if agePublicKey != "" {
-		q.Set("age-public-key", agePublicKey)
+	if !useZeroCopy {
+		q.Set("comp", normalizeRequestedComp(acceptEncoding))
+		if agePublicKey != "" {
+			q.Set("age-public-key", agePublicKey)
+		}
 	}
 	u.RawQuery = q.Encode()
 
@@ -463,6 +473,24 @@ func (c *Client) fetchFileWindow(
 			})
 		}
 		return nil, nil, fmt.Errorf("file request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+
+	if useZeroCopy {
+		metaSize := size
+		if metaSize < 0 && resp.ContentLength >= 0 {
+			metaSize = resp.ContentLength
+		}
+		if metaSize < 0 {
+			metaSize = 0
+		}
+		return resp.Body, &FileFrameMeta{
+			FileID:   fileID,
+			Comp:     "none",
+			Enc:      "none",
+			Offset:   offset,
+			Size:     metaSize,
+			WireSize: metaSize,
+		}, nil
 	}
 
 	body := io.ReadCloser(resp.Body)
@@ -556,9 +584,13 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		ackEvery = defaultClientAckEveryBytes
 	}
 
+	if req.UseZeroCopy {
+		return c.downloadFileFromManifestZeroCopy(ctx, req, entry, serverPath, destPath, writer, closeWriter, fileWriter)
+	}
+
 	if fileWriter == nil {
 		localHasher := xxh3.New128()
-		reader, meta, err := c.fetchFileWindow(ctx, req.Manifest.TransferID, req.FileID, serverPath, req.AcceptEncoding, req.AgePublicKey, req.AgeIdentity, 0, -1)
+		reader, meta, err := c.fetchFileWindow(ctx, req.Manifest.TransferID, req.FileID, serverPath, false, req.AcceptEncoding, req.AgePublicKey, req.AgeIdentity, 0, -1)
 		if err != nil {
 			return DownloadFileResponse{}, err
 		}
@@ -643,6 +675,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			req.Manifest.TransferID,
 			req.FileID,
 			serverPath,
+			false,
 			req.AcceptEncoding,
 			req.AgePublicKey,
 			req.AgeIdentity,
@@ -803,6 +836,98 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		DestinationPath: destPath,
 		Meta:            resultMeta,
 		LocalFileHash:   fullHash,
+	}, nil
+}
+
+func (c *Client) downloadFileFromManifestZeroCopy(
+	ctx context.Context,
+	req DownloadFileRequest,
+	entry ManifestEntry,
+	serverPath string,
+	destPath string,
+	writer io.Writer,
+	closeWriter func() error,
+	fileWriter *os.File,
+) (DownloadFileResponse, error) {
+	localHasher := xxh3.New128()
+	reader, _, err := c.fetchFileWindow(
+		ctx,
+		req.Manifest.TransferID,
+		req.FileID,
+		serverPath,
+		true,
+		req.AcceptEncoding,
+		req.AgePublicKey,
+		req.AgeIdentity,
+		0,
+		-1,
+	)
+	if err != nil {
+		_ = closeWriter()
+		return DownloadFileResponse{}, err
+	}
+	frameBuf, releaseFrameBuf := c.acquireFrameReadBuffer(8 * 1024 * 1024)
+	defer releaseFrameBuf()
+
+	var copied int64
+	copyErr := copyStreamWithProgress(writer, reader, frameBuf, localHasher, func(written int64) error {
+		copied = written
+		return nil
+	})
+	closeReadErr := reader.Close()
+	if copyErr != nil {
+		_ = closeWriter()
+		return DownloadFileResponse{}, fmt.Errorf("stream output file: %w", copyErr)
+	}
+	if closeReadErr != nil {
+		_ = closeWriter()
+		return DownloadFileResponse{}, closeReadErr
+	}
+	if !req.NoSync {
+		if err := dataSyncFile(fileWriter); err != nil {
+			_ = closeWriter()
+			return DownloadFileResponse{}, fmt.Errorf("fdatasync output file: %w", err)
+		}
+	}
+	if copied != entry.Size {
+		_ = closeWriter()
+		return DownloadFileResponse{}, fmt.Errorf("zerocopy size mismatch: expected=%d got=%d", entry.Size, copied)
+	}
+	closeWriteErr := closeWriter()
+	if closeWriteErr != nil {
+		return DownloadFileResponse{}, fmt.Errorf("close output file: %w", closeWriteErr)
+	}
+
+	if req.ProgressUpdates != nil {
+		select {
+		case req.ProgressUpdates <- DownloadProgressUpdate{FileID: req.FileID, AckBytes: copied}:
+		default:
+		}
+	}
+	if req.OnAck != nil {
+		now := time.Now()
+		req.OnAck(AckProgressEvent{
+			TransferID:  req.Manifest.TransferID,
+			FileID:      req.FileID,
+			AckBytes:    copied,
+			TargetBytes: entry.Size,
+			AckTime:     now,
+		})
+	}
+
+	meta := FileFrameMeta{
+		FileID:   req.FileID,
+		Comp:     "none",
+		Enc:      "none",
+		Offset:   0,
+		Size:     copied,
+		WireSize: copied,
+	}
+	localHash := intcodec.FormatXXH128HashToken(localHasher.Sum128())
+	return DownloadFileResponse{
+		DestinationPath: destPath,
+		Meta:            meta,
+		LocalFileHash:   localHash,
 	}, nil
 }
 

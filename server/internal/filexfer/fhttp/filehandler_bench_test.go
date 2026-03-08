@@ -3,14 +3,17 @@ package fhttp
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -82,6 +85,7 @@ func runFileHandlerBenchmark(b *testing.B, spec benchWorkloadSpec) {
 	if maxN < 1 {
 		maxN = 1
 	}
+	endpointMode := benchFileEndpoint()
 
 	b.StopTimer()
 	dataDir, err := ensureBenchData(benchDataRoot, spec)
@@ -124,7 +128,7 @@ func runFileHandlerBenchmark(b *testing.B, spec benchWorkloadSpec) {
 			return manifest.Entries[i].ID < manifest.Entries[j].ID
 		})
 
-		iterBytes, iterFiles, err := downloadAllFromManifest(context.Background(), client, manifest, iterOut, concurrency)
+		iterBytes, iterFiles, err := downloadAllFromManifest(context.Background(), client, manifest, iterOut, concurrency, endpointMode)
 		if err != nil {
 			b.Fatalf("[%s] download all: %v", spec.Name, err)
 		}
@@ -142,7 +146,7 @@ func runFileHandlerBenchmark(b *testing.B, spec benchWorkloadSpec) {
 	}
 }
 
-func downloadAllFromManifest(ctx context.Context, client *Client, manifest *Manifest, outRoot string, concurrency int) (int64, int64, error) {
+func downloadAllFromManifest(ctx context.Context, client *Client, manifest *Manifest, outRoot string, concurrency int, endpointMode string) (int64, int64, error) {
 	workCh := make(chan ManifestEntry)
 	errCh := make(chan error, len(manifest.Entries))
 	var wg sync.WaitGroup
@@ -152,17 +156,29 @@ func downloadAllFromManifest(ctx context.Context, client *Client, manifest *Mani
 	worker := func() {
 		defer wg.Done()
 		for entry := range workCh {
-			resp, err := client.DownloadFileFromManifest(ctx, DownloadFileRequest{
-				Manifest:       manifest,
-				FileID:         entry.ID,
-				OutRoot:        outRoot,
-				AcceptEncoding: "adapt",
-			})
+			var (
+				downloaded int64
+				err        error
+			)
+			if endpointMode == "zerocopy" {
+				downloaded, err = downloadEntryZeroCopy(ctx, client, manifest, entry, outRoot)
+			} else {
+				var resp DownloadFileResponse
+				resp, err = client.DownloadFileFromManifest(ctx, DownloadFileRequest{
+					Manifest:       manifest,
+					FileID:         entry.ID,
+					OutRoot:        outRoot,
+					AcceptEncoding: "adapt",
+				})
+				if err == nil {
+					downloaded = resp.Meta.Size
+				}
+			}
 			if err != nil {
 				errCh <- fmt.Errorf("id=%d: %w", entry.ID, err)
 				continue
 			}
-			bytesDownloaded.Add(resp.Meta.Size)
+			bytesDownloaded.Add(downloaded)
 			filesDownloaded.Add(1)
 		}
 	}
@@ -182,6 +198,58 @@ func downloadAllFromManifest(ctx context.Context, client *Client, manifest *Mani
 		return bytesDownloaded.Load(), filesDownloaded.Load(), err
 	}
 	return bytesDownloaded.Load(), filesDownloaded.Load(), nil
+}
+
+func downloadEntryZeroCopy(ctx context.Context, client *Client, manifest *Manifest, entry ManifestEntry, outRoot string) (int64, error) {
+	serverPath := filepath.Clean(filepath.Join(manifest.Root, filepath.FromSlash(entry.Path)))
+	if !filepath.IsAbs(serverPath) {
+		return 0, fmt.Errorf("resolved path is not absolute: %s", serverPath)
+	}
+	destPath := filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return 0, fmt.Errorf("create output directory: %w", err)
+	}
+	dest, err := os.Create(destPath)
+	if err != nil {
+		return 0, fmt.Errorf("create output file: %w", err)
+	}
+	defer dest.Close()
+
+	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d/zerocopy", client.BaseURL, url.PathEscape(manifest.TransferID), entry.ID))
+	if err != nil {
+		return 0, fmt.Errorf("build zerocopy url: %w", err)
+	}
+	q := u.Query()
+	q.Set("path", serverPath)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("build zerocopy request: %w", err)
+	}
+
+	httpClient := client.FileClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("request zerocopy file: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+		return 0, fmt.Errorf("zerocopy request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+
+	written, err := io.Copy(dest, resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("copy zerocopy response: %w", err)
+	}
+	if written != entry.Size {
+		return 0, fmt.Errorf("unexpected zerocopy bytes: got=%d want=%d", written, entry.Size)
+	}
+	return written, nil
 }
 
 func ensureBenchData(baseDir string, spec benchWorkloadSpec) (string, error) {
@@ -248,6 +316,7 @@ func newBenchServer() *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /fs/transfer", TransferHandler)
 	mux.HandleFunc("GET /fs/file/{txferid}/{fid}", FileHandler)
+	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/zerocopy", ZeroCopyFileHandler)
 	mux.HandleFunc("PUT /fs/file/{txferid}/{fid}/ack", FileAckHandler)
 	mux.HandleFunc("GET /fs/transfer/{txferid}/status", TransferStatusHandler)
 	return httptest.NewServer(mux)
@@ -263,4 +332,12 @@ func envInt(name string, fallback int) int {
 		return fallback
 	}
 	return v
+}
+
+func benchFileEndpoint() string {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("BENCH_FILE_ENDPOINT")))
+	if raw == "zerocopy" {
+		return "zerocopy"
+	}
+	return "framed"
 }

@@ -220,6 +220,28 @@ entire HTTP response body (all `FX/1` headers, payload bytes, and `FXT/1`
 trailers) is age-encrypted as one stream. In this mode, framing `enc` remains
 `none` because encryption is applied at the outer transport body.
 
+## `/fs/file/{txferid}/{fid}/zerocopy` Contract
+
+`GET /fs/file/{txferid}/{fid}/zerocopy` is an unframed raw-byte endpoint.
+
+- Required query parameter: `path=<absolute file path>`.
+- Optional query parameters: `offset=<n>` and `size=<n>`.
+  - `offset` defaults to `0`.
+  - `size` defaults to the remaining bytes from `offset`.
+- Response is always plain file bytes with:
+  - `Content-Type: application/octet-stream`
+  - `Content-Length: <window bytes>`
+  - HTTP status `200` for valid requests.
+- If `offset` is past EOF, server returns `416`.
+- No `FX/1` or `FXT/1` framing is emitted.
+- No compression, no encryption, and no ack semantics are applied.
+
+Implementation note:
+
+- The server emits the response in internal `8 MiB` chunks and flushes after
+  each chunk for progress visibility.
+- Chunking is internal only; no frame markers are present on the wire.
+
 For `/fs/file` responses, header properties are emitted in this order:
 `offset`, `size`, `wsize`, `comp`, `enc`, `hash`, optional `max-wsize`, then `ts`.
 

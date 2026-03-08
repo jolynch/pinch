@@ -737,6 +737,7 @@ func main() {
 	mux.HandleFunc("PUT /fs/transfer", fhttp.TransferHandler)
 	mux.HandleFunc("GET /fs/transfer/{txferid}/status", fhttp.TransferStatusHandler)
 	mux.HandleFunc("GET /fs/file/{txferid}/{fid}", fhttp.FileHandler)
+	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/zerocopy", fhttp.ZeroCopyFileHandler)
 	mux.HandleFunc("PUT /fs/file/{txferid}/{fid}/ack", fhttp.FileAckHandler)
 	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/checksum", fhttp.FileChecksumHandler)
 

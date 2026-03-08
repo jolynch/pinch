@@ -97,9 +97,9 @@ func validateServerURL(raw string) error {
 func printCLIUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  pinch cli <server-url> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--encrypt age] [-v|--verbose] [--max-manifest-chunk-size N]")
-	fmt.Fprintln(w, "  pinch cli <server-url> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--accept-encoding <csv>] [--encrypt age] [--concurrency N] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <server-url> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--zerocopy] [--accept-encoding <csv>] [--encrypt age] [--concurrency N] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
 	fmt.Fprintln(w, "  pinch cli <server-url> status --tid <id>")
-	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--accept-encoding <csv>] [--encrypt age] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--zerocopy] [--accept-encoding <csv>] [--encrypt age] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
 }
 
 func resolveEncryptionOptions(mode string) (string, string, error) {
@@ -249,6 +249,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var outFile string
 	var acceptEncoding string
 	var encryptMode string
+	var zeroCopy bool
 	var ackEveryRaw string
 	var noSync bool
 	var verbose bool
@@ -257,6 +258,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	fs.StringVar(&fileIDRaw, "fd", "", "file id to download")
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
 	fs.StringVar(&outFile, "o", "", "output file path, or '-' for stdout")
+	fs.BoolVar(&zeroCopy, "zerocopy", false, "download file via /fs/file/{txferid}/{fid}/zerocopy endpoint")
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
 	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
@@ -279,6 +281,10 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	}
 	if ackEvery <= 0 {
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
+		return 2
+	}
+	if zeroCopy && strings.TrimSpace(encryptMode) != "" {
+		fmt.Fprintln(stderr, "--zerocopy cannot be combined with --encrypt")
 		return 2
 	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
@@ -333,6 +339,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		OutRoot:         outRoot,
 		OutFile:         outFile,
 		Stdout:          stdout,
+		UseZeroCopy:     zeroCopy,
 		AcceptEncoding:  acceptEncoding,
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
@@ -363,6 +370,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var outRoot string
 	var acceptEncoding string
 	var encryptMode string
+	var zeroCopy bool
 	var concurrency int
 	var ackEveryRaw string
 	var noSync bool
@@ -370,6 +378,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	fs.StringVar(&txferID, "tid", "", "transfer id")
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm1)")
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
+	fs.BoolVar(&zeroCopy, "zerocopy", false, "download files via /fs/file/{txferid}/{fid}/zerocopy endpoint")
 	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
 	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
@@ -393,6 +402,10 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	if ackEvery <= 0 {
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
+		return 2
+	}
+	if zeroCopy && strings.TrimSpace(encryptMode) != "" {
+		fmt.Fprintln(stderr, "--zerocopy cannot be combined with --encrypt")
 		return 2
 	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
@@ -456,6 +469,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 				FileID:          entry.ID,
 				OutRoot:         outRoot,
 				OutFile:         "",
+				UseZeroCopy:     zeroCopy,
 				AcceptEncoding:  acceptEncoding,
 				AgePublicKey:    agePublicKey,
 				AgeIdentity:     ageIdentity,
