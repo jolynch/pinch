@@ -108,21 +108,24 @@ func growPipeBestEffort(pipeFD *os.File, sizeBytes int) {
 	_, _ = unix.FcntlInt(pipeFD.Fd(), unix.F_SETPIPE_SZ, sizeBytes)
 }
 
-func buildFrameHeaderLine(fileID uint64, offset int64, size int64, maxWSizeHint *int64, ts int64) string {
+func buildFrameHeaderLine(fileID uint64, offset int64, size int64, wireSize int64, comp string, maxWSizeHint *int64, ts int64) string {
+	if comp == "" {
+		comp = "none"
+	}
 	if maxWSizeHint != nil {
 		return "FX/1 " + strconv.FormatUint(fileID, 10) +
 			" offset=" + strconv.FormatInt(offset, 10) +
 			" size=" + strconv.FormatInt(size, 10) +
-			" wsize=" + strconv.FormatInt(size, 10) +
-			" comp=none enc=none hash=" + placeholderHeaderHashToken +
+			" wsize=" + strconv.FormatInt(wireSize, 10) +
+			" comp=" + comp + " enc=none hash=" + placeholderHeaderHashToken +
 			" max-wsize=" + strconv.FormatInt(*maxWSizeHint, 10) +
 			" ts=" + strconv.FormatInt(ts, 10) + "\n"
 	}
 	return "FX/1 " + strconv.FormatUint(fileID, 10) +
 		" offset=" + strconv.FormatInt(offset, 10) +
 		" size=" + strconv.FormatInt(size, 10) +
-		" wsize=" + strconv.FormatInt(size, 10) +
-		" comp=none enc=none hash=" + placeholderHeaderHashToken +
+		" wsize=" + strconv.FormatInt(wireSize, 10) +
+		" comp=" + comp + " enc=none hash=" + placeholderHeaderHashToken +
 		" ts=" + strconv.FormatInt(ts, 10) + "\n"
 }
 
@@ -188,6 +191,20 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, frameSize int64,
 
 func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, frameSize int64, frameWriter io.Writer, hashPipeW *os.File, pipeSize int) error {
 	return streamFramePayloadLinuxSpliceToOutput(fd, fileOffset, frameSize, frameWriter, hashPipeW, pipeSize, -1)
+}
+
+func writeAll(w io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := w.Write(payload)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		payload = payload[n:]
+	}
+	return nil
 }
 
 func streamFramePayloadLinuxSpliceToOutput(fd *os.File, fileOffset *int64, frameSize int64, frameWriter io.Writer, hashPipeW *os.File, pipeSize int, outFD int) error {
@@ -508,6 +525,17 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	requestedComp, err := parseRequestedComp(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	selectedComp := requestedComp
+	if selectedComp == "adapt" || selectedComp == "" {
+		selectedComp = "none"
+	}
+	selectedMode := initialCompressionMode(selectedComp)
+
 	rawSpliceFD := strings.ToLower(strings.TrimSpace(req.URL.Query().Get("splice-fd")))
 	explicitSocketSplice := rawSpliceFD != ""
 	socketSpliceEnabled := true
@@ -523,6 +551,13 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 	if ageRecipient != nil {
 		if explicitSocketSplice && socketSpliceEnabled {
 			http.Error(w, "splice-fd cannot be combined with age-public-key", http.StatusBadRequest)
+			return
+		}
+		socketSpliceEnabled = false
+	}
+	if selectedComp != "none" {
+		if explicitSocketSplice && socketSpliceEnabled {
+			http.Error(w, "splice-fd requires comp=none", http.StatusBadRequest)
 			return
 		}
 		socketSpliceEnabled = false
@@ -574,7 +609,7 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 	maxWSizeHint := min(windowLen, defaultFileFrameLogicalSize)
 	cursor := offset
 	windowStart := offset
-	windowWireTotal := int64(0)    // no compression currently; equal to logical
+	windowWireTotal := int64(0)
 	windowLogicalTotal := int64(0) // bytes served for this request window
 	windowFrames := 0
 	windowTS0 := time.Now().UnixMilli()
@@ -595,6 +630,31 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		}
 	}()
 	useLinuxSplice := runtime.GOOS == "linux"
+	var (
+		compressedLogicalBuf []byte
+		releaseLogicalBuf    func()
+		compressorCtx        *frameCompressor
+		releaseCompressorCtx func()
+	)
+	if selectedComp != "none" {
+		compressedLogicalBuf, releaseLogicalBuf, err = acquireLogicalBuffer(int(defaultFileFrameLogicalSize))
+		if err != nil {
+			http.Error(w, "failed to initialize compression logical buffer", http.StatusInternalServerError)
+			return
+		}
+		defer releaseLogicalBuf()
+		maxWireHint, hintErr := maxRequestWireSizeHintBytes(selectedComp, defaultFileFrameLogicalSize)
+		if hintErr != nil {
+			http.Error(w, "failed to initialize compression wire hint", http.StatusInternalServerError)
+			return
+		}
+		compressorCtx, releaseCompressorCtx, err = acquireFrameCompressor(maxWireHint)
+		if err != nil {
+			http.Error(w, "failed to initialize compression context", http.StatusInternalServerError)
+			return
+		}
+		defer releaseCompressorCtx()
+	}
 	firstFrame := true
 	for remaining := windowLen; remaining > 0; {
 		frameSize := min(remaining, defaultFileFrameLogicalSize)
@@ -603,28 +663,69 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		if firstFrame && maxWSizeHint > 0 {
 			maxHint = &maxWSizeHint
 		}
-		headerLine := buildFrameHeaderLine(fileID, cursor, frameSize, maxHint, headerTS)
-		if _, err := io.WriteString(frameWriter, headerLine); err != nil {
-			if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
-				http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
-				return
-			}
-			return
-		}
-
 		frameOffset := cursor
-		var payloadErr error
-		if useLinuxSplice {
-			payloadErr = streamFramePayloadLinuxSpliceToOutput(fd, &frameOffset, frameSize, frameWriter, hashPipeW, pipeSizeBytes, socketSpliceFD)
-		} else {
-			payloadErr = streamFramePayloadBuffered(fd, &frameOffset, frameSize, frameWriter, hashPipeW)
-		}
-		if payloadErr != nil {
-			if errors.Is(payloadErr, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
-				http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+		wireSize := frameSize
+		var payload []byte
+		if selectedComp == "none" {
+			headerLine := buildFrameHeaderLine(fileID, cursor, frameSize, wireSize, selectedComp, maxHint, headerTS)
+			if _, err := io.WriteString(frameWriter, headerLine); err != nil {
+				if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
+					http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+					return
+				}
 				return
 			}
-			return
+			var payloadErr error
+			if useLinuxSplice {
+				payloadErr = streamFramePayloadLinuxSpliceToOutput(fd, &frameOffset, frameSize, frameWriter, hashPipeW, pipeSizeBytes, socketSpliceFD)
+			} else {
+				payloadErr = streamFramePayloadBuffered(fd, &frameOffset, frameSize, frameWriter, hashPipeW)
+			}
+			if payloadErr != nil {
+				if errors.Is(payloadErr, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
+					http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+					return
+				}
+				return
+			}
+		} else {
+			if compressorCtx == nil || compressedLogicalBuf == nil {
+				http.Error(w, "failed to initialize compression path", http.StatusInternalServerError)
+				return
+			}
+			logical, compressedPayload, compressedWireSize, _, prepErr := prepareFramePayloadAt(
+				fd,
+				compressorCtx,
+				selectedMode,
+				compressedLogicalBuf,
+				frameOffset,
+				frameSize,
+			)
+			if prepErr != nil {
+				return
+			}
+			if err := writeAll(hashPipeW, logical[:frameSize]); err != nil {
+				return
+			}
+			payload = compressedPayload
+			wireSize = compressedWireSize
+			frameOffset += frameSize
+
+			headerLine := buildFrameHeaderLine(fileID, cursor, frameSize, wireSize, selectedComp, maxHint, headerTS)
+			if _, err := io.WriteString(frameWriter, headerLine); err != nil {
+				if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
+					http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+					return
+				}
+				return
+			}
+			if err := writeAll(frameWriter, payload); err != nil {
+				if errors.Is(err, errFileStreamTimeLimitExceeded) && !limitedWriter.wroteAnyBody() {
+					http.Error(rawWriter, "file stream time limit exceeded", http.StatusGatewayTimeout)
+					return
+				}
+				return
+			}
 		}
 
 		cursor = frameOffset
@@ -632,7 +733,7 @@ func FileHandler(w http.ResponseWriter, req *http.Request) {
 		firstFrame = false
 		windowFrames++
 		windowLogicalTotal += frameSize
-		windowWireTotal += frameSize
+		windowWireTotal += wireSize
 
 		isTerminalResponseChunk := remaining == 0
 		nextValue := cursor
