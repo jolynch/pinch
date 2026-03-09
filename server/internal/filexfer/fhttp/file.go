@@ -24,13 +24,15 @@ import (
 
 const defaultFileFrameLogicalSize int64 = 8 * 1024 * 1024
 const zeroCopyChunkSize int64 = 8 * 1024 * 1024
-const maxLinuxPipeSizeBytes = 1 * 1024 * 1024
+const defaultMaxLinuxPipeSizeBytes int64 = 1 * 1024 * 1024
 const placeholderHeaderHashToken = "xxh128:00000000000000000000000000000000"
 const placeholderTrailerHashToken = "xxh64:0000000000000000"
 const maxConcurrentFramePrepares = 8
 
 var logicalBufferPools sync.Map   // map[int]*sync.Pool
 var frameCompressorPools sync.Map // map[int64]*sync.Pool
+var pipeMaxSizeOnce sync.Once
+var pipeMaxSizeBytes int64 = defaultMaxLinuxPipeSizeBytes
 
 type framePrepareTask struct {
 	Index       int
@@ -55,27 +57,13 @@ type windowHashResult struct {
 	err   error
 }
 
-type readerOnly struct {
-	io.Reader
-}
-
 func startWindowHashWorker(pipeR *os.File) <-chan windowHashResult {
 	done := make(chan windowHashResult, 1)
 	go func() {
 		defer close(done)
-		if pipeR == nil {
-			done <- windowHashResult{err: errors.New("nil hash pipe reader")}
-			return
-		}
 		defer pipeR.Close()
 		hasher := xxh3.New128()
-		buf, release, err := acquireLogicalBuffer(256 * 1024)
-		if err != nil {
-			done <- windowHashResult{err: err}
-			return
-		}
-		defer release()
-		if _, err := io.CopyBuffer(hasher, readerOnly{Reader: pipeR}, buf); err != nil {
+		if _, err := pipeR.WriteTo(hasher); err != nil {
 			done <- windowHashResult{err: err}
 			return
 		}
@@ -85,20 +73,36 @@ func startWindowHashWorker(pipeR *os.File) <-chan windowHashResult {
 }
 
 func desiredPipeSizeBytes(windowLen int64, frameSize int64) int {
-	if windowLen > maxLinuxPipeSizeBytes {
-		return maxLinuxPipeSizeBytes
+	maxPipeSize := bestEffortPipeMaxSizeBytes()
+	if windowLen > maxPipeSize {
+		return int(maxPipeSize)
 	}
 	if frameSize <= 0 {
 		return 64 * 1024
 	}
 	target := frameSize
-	if target > maxLinuxPipeSizeBytes {
-		target = maxLinuxPipeSizeBytes
+	if target > maxPipeSize {
+		target = maxPipeSize
 	}
 	if target < 64*1024 {
 		target = 64 * 1024
 	}
 	return int(target)
+}
+
+func bestEffortPipeMaxSizeBytes() int64 {
+	pipeMaxSizeOnce.Do(func() {
+		raw, err := os.ReadFile("/proc/sys/fs/pipe-max-size")
+		if err != nil {
+			return
+		}
+		value, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+		if err != nil || value <= 0 {
+			return
+		}
+		pipeMaxSizeBytes = value
+	})
+	return pipeMaxSizeBytes
 }
 
 func growPipeBestEffort(pipeFD *os.File, sizeBytes int) {
@@ -281,8 +285,8 @@ func streamFramePayloadLinuxSpliceToOutput(fd *os.File, fileOffset *int64, frame
 					}
 					moveRemaining -= moved
 				}
-			} else {
-				limited := &io.LimitedReader{R: readerOnly{Reader: srcR}, N: int64(teed)}
+				} else {
+					limited := &io.LimitedReader{R: srcR, N: int64(teed)}
 				written, copyErr := io.CopyBuffer(frameWriter, limited, copyBuf)
 				if copyErr != nil {
 					return copyErr
