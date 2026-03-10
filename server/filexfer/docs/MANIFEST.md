@@ -3,9 +3,9 @@
 This document defines the manifest format used to compactly
 describe files to transfer from a server.
 
-When requesting a manifest from `/fs/transfer`, clients may provide
-`age-public-key=<age1...>`. If provided, the entire manifest HTTP response body
-is age-encrypted and must be decrypted by the client before parsing this format.
+When requesting a manifest via `TXFER`, clients may first issue `AUTH`.
+If `AUTH` provides a client recipient, the manifest response stream is age-encrypted
+for that recipient and must be decrypted by the client before parsing this format.
 
 ## Structure
 

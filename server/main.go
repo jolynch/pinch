@@ -23,7 +23,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/jolynch/pinch/internal/cmd/filexfercli"
-	"github.com/jolynch/pinch/internal/filexfer/fhttp"
+	"github.com/jolynch/pinch/internal/filexfer/ftcp"
 	"github.com/jolynch/pinch/internal/filexfer/limit"
 	"github.com/jolynch/pinch/state"
 	"github.com/jolynch/pinch/utils"
@@ -31,6 +31,7 @@ import (
 
 var (
 	listen       = "127.0.0.1:8080"
+	fileListener = "127.0.0.1:3453"
 	inputDir     = "/var/lib/pinch/in"
 	outputDir    = "/var/lib/pinch/out"
 	keysDir      = "/var/lib/pinch/keys"
@@ -40,6 +41,41 @@ var (
 	fsFileRate   = ""
 	fsFileBurst  = "1MiB"
 )
+
+func loadServerAgeIdentity(dir string) (*age.X25519Identity, error) {
+	keyPath := path.Join(dir, "key")
+	if raw, err := os.ReadFile(keyPath); err == nil {
+		lines := strings.Split(string(raw), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			identity, parseErr := age.ParseX25519Identity(line)
+			if parseErr != nil {
+				return nil, fmt.Errorf("invalid existing key file %s: %w", keyPath, parseErr)
+			}
+			return identity, nil
+		}
+		return nil, fmt.Errorf("existing key file %s has no identity", keyPath)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read key file %s: %w", keyPath, err)
+	}
+
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		return nil, fmt.Errorf("generate age identity: %w", err)
+	}
+	out, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open key file %s: %w", keyPath, err)
+	}
+	defer out.Close()
+	fmt.Fprintf(out, "# created: %s\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(out, "# public key: %s\n", identity.Recipient())
+	fmt.Fprintf(out, "%s\n", identity)
+	return identity, nil
+}
 
 func maxSocketWriteBufferBytes() int {
 	// 4MiB baseline if kernel cap cannot be read.
@@ -674,6 +710,7 @@ func main() {
 	}
 
 	flag.StringVar(&listen, "listen", listen, "The address to listen on")
+	flag.StringVar(&fileListener, "file-listen", fileListener, "The file transfer TCP listen address")
 	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
 	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
 	flag.StringVar(&keysDir, "keys", keysDir, "The directory to create output pipes in")
@@ -682,6 +719,7 @@ func main() {
 	flag.StringVar(&fsFileRate, "fs-file-rate", fsFileRate, "Global /fs/file rate limit (examples: 100MiB, 1000mbps). Empty/0 disables limiting")
 	flag.StringVar(&fsFileBurst, "fs-file-rate-burst", fsFileBurst, "Token-bucket burst for /fs/file rate limit (examples: 1MiB, 4MB)")
 	fsFileTimeLimit := flag.Duration("fs-file-time-limit", 0, "Per-request wall-clock limit for GET /fs/file (0 disables)")
+	fsRequireAuth := flag.Bool("fs-require-auth", false, "Require AUTH before using file-listen commands")
 	dieAfter := flag.Duration("die-after", 0, "Die after this duration. Zero seconds indicates live forever")
 
 	flag.Parse()
@@ -699,23 +737,12 @@ func main() {
 	if !makeDirs(keysDir) {
 		log.Fatalf("Could not setup key directory, dying")
 	}
-	serverKey, err := age.GenerateX25519Identity()
+	var err error
+	serverKey, err = loadServerAgeIdentity(keysDir)
 	if err != nil {
-		log.Fatalf("AGE could not generate private and public keys for this node")
-	} else {
-		keyPath := path.Join(keysDir, "key")
-		out, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-
-		if err != nil {
-			log.Fatalf("Error while opening key file: %v", err)
-		}
-		fmt.Fprintf(out, "# created: %s\n", time.Now().Format(time.RFC3339))
-		fmt.Fprintf(out, "# public key: %s\n", serverKey.Recipient())
-		fmt.Fprintf(out, "%s\n", serverKey)
-		log.Printf("Public key %s", serverKey.Recipient().String())
-		defer out.Close()
-		log.Printf("AGE key file generated and saved to %s", keyPath)
+		log.Fatalf("AGE key setup failed: %v", err)
 	}
+	log.Printf("Public key %s", serverKey.Recipient().String())
 
 	log.Printf("Scanning input directory [%s] to clean up.", inputDir)
 	if err := cleanupDir(inputDir); err != nil {
@@ -733,13 +760,20 @@ func main() {
 	mux.HandleFunc("/io/", handleIO)
 	mux.HandleFunc("/status/", getStatus)
 
-	// Filesystem API
-	mux.HandleFunc("PUT /fs/transfer", fhttp.TransferHandler)
-	mux.HandleFunc("GET /fs/transfer/{txferid}/status", fhttp.TransferStatusHandler)
-	mux.HandleFunc("GET /fs/file/{txferid}/{fid}", fhttp.FileHandler)
-	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/zerocopy", fhttp.ZeroCopyFileHandler)
-	mux.HandleFunc("PUT /fs/file/{txferid}/{fid}/ack", fhttp.FileAckHandler)
-	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/checksum", fhttp.FileChecksumHandler)
+	fileLn, err := net.Listen("tcp", fileListener)
+	if err != nil {
+		log.Fatalf("Failed to bind file listener at %s: %v", fileListener, err)
+	}
+	defer fileLn.Close()
+	go func() {
+		log.Printf("File transfer listener at %s", fileListener)
+		if serveErr := ftcp.Serve(fileLn, ftcp.ServerOptions{
+			RequireAuth:    *fsRequireAuth,
+			ServerIdentity: serverKey,
+		}); serveErr != nil {
+			log.Fatalf("File transfer listener stopped: %v", serveErr)
+		}
+	}()
 
 	if *dieAfter > 0 {
 		go die(*dieAfter)

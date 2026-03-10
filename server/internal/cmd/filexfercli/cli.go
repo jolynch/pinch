@@ -7,7 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -78,18 +78,26 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 }
 
 func validateServerURL(raw string) error {
+	errMsg := "first argument must be server URL or file-listener address, for example http://localhost:8080 or 127.0.0.1:3453"
 	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("first argument must be server URL, for example http://localhost:8080")
+		return errors.New(errMsg)
 	}
 	if strings.HasPrefix(raw, "-") {
-		return fmt.Errorf("first argument must be server URL, for example http://localhost:8080")
+		return errors.New(errMsg)
 	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("first argument must be server URL, for example http://localhost:8080")
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return errors.New(errMsg)
+		}
+		if u.Host == "" {
+			return errors.New(errMsg)
+		}
+		return nil
 	}
-	if u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("first argument must be server URL, for example http://localhost:8080")
+	host, port, splitErr := net.SplitHostPort(raw)
+	if splitErr != nil || strings.TrimSpace(host) == "" || strings.TrimSpace(port) == "" {
+		return errors.New(errMsg)
 	}
 	return nil
 }
@@ -150,7 +158,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		return 2
 	}
 
-	client := NewClient(serverURL, nil)
+	client := NewClient(serverURL)
 	start := time.Now()
 	manifestResp, err := client.FetchManifest(context.Background(), FetchManifestRequest{
 		Directory:      sourceDir,
@@ -216,7 +224,7 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 		return 2
 	}
 
-	client := NewClient(serverURL, nil)
+	client := NewClient(serverURL)
 	statusResp, err := client.GetTransferStatus(context.Background(), GetTransferStatusRequest{
 		TransferID: txferID,
 	})
@@ -283,8 +291,9 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
 		return 2
 	}
-	if zeroCopy && strings.TrimSpace(encryptMode) != "" {
-		fmt.Fprintln(stderr, "--zerocopy cannot be combined with --encrypt")
+	_ = acceptEncoding
+	if zeroCopy {
+		fmt.Fprintln(stderr, "--zerocopy is unsupported with tcp file transport")
 		return 2
 	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
@@ -318,7 +327,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		onAck = ackReporter.Report
 	}
 
-	client := NewClient(serverURL, nil)
+	client := NewClient(serverURL)
 	start := time.Now()
 	if st, ok := progressState[fileID]; ok && st.AckBytes >= manifestEntrySize(manifest, fileID) {
 		if !st.MetadataDone {
@@ -433,10 +442,10 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		ackReporter := newAckMilestoneReporter(stderr)
 		onAck = ackReporter.Report
 	}
-	client := NewClient(serverURL, nil)
+	client := NewClient(serverURL)
 
 	startAll := time.Now()
-	workCh := make(chan ManifestEntry)
+	workCh := make(chan []ManifestEntry)
 	errCh := make(chan error, len(manifest.Entries))
 	var wg sync.WaitGroup
 	var completed atomic.Int64
@@ -446,46 +455,57 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		stopStatusPolling = startVerboseStatusPolling(txferID, client, stderr)
 		defer stopStatusPolling()
 	}
-
-	worker := func() {
-		defer wg.Done()
-		for entry := range workCh {
-			if st, ok := progressState[entry.ID]; ok && st.AckBytes >= entry.Size {
-				if st.MetadataDone {
-					completed.Add(1)
-					continue
-				}
-				if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, "", agePublicKey, ageIdentity); err != nil {
-					errCh <- fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err)
-					continue
-				}
-				markMetadataDone(entry.ID)
+	pendingEntries := make([]ManifestEntry, 0, len(manifest.Entries))
+	for _, entry := range manifest.Entries {
+		if st, ok := progressState[entry.ID]; ok && st.AckBytes >= entry.Size {
+			if st.MetadataDone {
 				completed.Add(1)
 				continue
 			}
+			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, "", agePublicKey, ageIdentity); err != nil {
+				errCh <- fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err)
+				continue
+			}
+			markMetadataDone(entry.ID)
+			completed.Add(1)
+			continue
+		}
+		pendingEntries = append(pendingEntries, entry)
+	}
+	batches := buildManifestBatchesByBytes(pendingEntries, ackEvery)
+
+	worker := func() {
+		defer wg.Done()
+		for batch := range workCh {
+			if len(batch) == 0 {
+				continue
+			}
+			fileIDs := make([]uint64, 0, len(batch))
+			for _, entry := range batch {
+				fileIDs = append(fileIDs, entry.ID)
+			}
 			startOne := time.Now()
-			downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+			downloadBatchResp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
 				Manifest:        manifest,
-				FileID:          entry.ID,
+				FileIDs:         fileIDs,
 				OutRoot:         outRoot,
-				OutFile:         "",
-				UseZeroCopy:     zeroCopy,
-				AcceptEncoding:  acceptEncoding,
 				AgePublicKey:    agePublicKey,
 				AgeIdentity:     ageIdentity,
-				AckEveryBytes:   ackEvery,
 				NoSync:          noSync,
 				ProgressUpdates: progressUpdates,
 				OnAck:           onAck,
 			})
 			if err != nil {
-				errCh <- fmt.Errorf("id=%d: %w", entry.ID, err)
+				errCh <- fmt.Errorf("batch first-id=%d count=%d: %w", batch[0].ID, len(batch), err)
 				continue
 			}
-			markMetadataDone(entry.ID)
-			completed.Add(1)
-			totalTransferred.Add(downloadResp.Meta.Size)
-			printStartFileSummary(stdout, entry.ID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, time.Since(startOne))
+			elapsedBatch := time.Since(startOne)
+			for _, downloadResp := range downloadBatchResp.Files {
+				markMetadataDone(downloadResp.Meta.FileID)
+				completed.Add(1)
+				totalTransferred.Add(downloadResp.Meta.Size)
+				printStartFileSummary(stdout, downloadResp.Meta.FileID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsedBatch)
+			}
 		}
 	}
 
@@ -493,8 +513,8 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		wg.Add(1)
 		go worker()
 	}
-	for _, entry := range manifest.Entries {
-		workCh <- entry
+	for _, batch := range batches {
+		workCh <- batch
 	}
 	close(workCh)
 	wg.Wait()
@@ -548,6 +568,35 @@ func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta Fi
 		compSummary,
 		humanRate(speed),
 	)
+}
+
+func buildManifestBatchesByBytes(entries []ManifestEntry, maxBytes int64) [][]ManifestEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = 1
+	}
+	batches := make([][]ManifestEntry, 0, len(entries))
+	current := make([]ManifestEntry, 0, 8)
+	var currentBytes int64
+	for _, entry := range entries {
+		size := entry.Size
+		if size < 0 {
+			size = 0
+		}
+		if len(current) > 0 && currentBytes+size > maxBytes {
+			batches = append(batches, current)
+			current = make([]ManifestEntry, 0, 8)
+			currentBytes = 0
+		}
+		current = append(current, entry)
+		currentBytes += size
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
+	}
+	return batches
 }
 
 func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer) func() {
@@ -857,46 +906,20 @@ func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest 
 }
 
 func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Client, transferID string, fileID uint64, serverPath string, fileSize int64, agePublicKey string, ageIdentity string) (*FileTrailerMetadata, error) {
-	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d/checksum", client.BaseURL, url.PathEscape(transferID), fileID))
-	if err != nil {
-		return nil, fmt.Errorf("build checksum url: %w", err)
-	}
-	q := u.Query()
-	q.Set("path", serverPath)
-	if fileSize > 0 {
-		q.Set("window-size", strconv.FormatInt(fileSize, 10))
-	}
-	if agePublicKey != "" {
-		q.Set("age-public-key", agePublicKey)
-	}
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("build checksum request: %w", err)
-	}
-	resp, err := client.FileClient.Do(req)
+	resp, err := client.FetchChecksumStream(ctx, FetchChecksumStreamRequest{
+		TransferID:   transferID,
+		FileID:       fileID,
+		FullPath:     serverPath,
+		WindowSize:   fileSize,
+		ChecksumsCSV: "xxh128",
+		AgePublicKey: agePublicKey,
+		AgeIdentity:  ageIdentity,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("checksum request failed: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-		return nil, fmt.Errorf("checksum request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
-	}
-	bodyReader := io.Reader(resp.Body)
-	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-Filexfer-Enc")), "age") {
-		identity, err := age.ParseX25519Identity(strings.TrimSpace(ageIdentity))
-		if err != nil {
-			return nil, fmt.Errorf("invalid age identity for checksum decryption: %w", err)
-		}
-		decrypted, err := age.Decrypt(resp.Body, identity)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt checksum response failed: %w", err)
-		}
-		bodyReader = decrypted
-	}
-	br := bufio.NewReader(bodyReader)
+	defer resp.Reader.Close()
+	br := bufio.NewReader(resp.Reader)
 	var terminal *FileTrailerMetadata
 	for {
 		headerLine, readErr := br.ReadString('\n')

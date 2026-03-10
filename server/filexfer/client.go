@@ -4,14 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -51,13 +48,33 @@ type TransferStatus struct {
 	DownloadStatus DownloadStatus `json:"download_status"`
 }
 
+type ClientOption interface {
+	apply(*Client)
+}
+
+type clientOptionFunc func(*Client)
+
+func (f clientOptionFunc) apply(c *Client) {
+	f(c)
+}
+
+func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.contextDialer = dialer
+	})
+}
+
 type Client struct {
-	BaseURL                 string
-	FileClient              *http.Client
+	FileAddr                string
+	ServerAgePublicKey      string
 	FileRequestWindowBytes  int64
 	FrameBufferBytes        int
 	MaxFrameReadBufferBytes int
 	AckRequestTimeout       time.Duration
+
+	// Context dialer allows clients to setup custom connections
+	// For example injecting TLS
+	contextDialer           func(context.Context, string) (net.Conn, error)
 
 	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
 	bufferPool sync.Map // map[int]*sync.Pool
@@ -141,6 +158,22 @@ type DownloadFileResponse struct {
 	LocalFileHash   string
 }
 
+type DownloadBatchRequest struct {
+	Manifest                *Manifest
+	FileIDs                 []uint64
+	OutRoot                 string
+	AgePublicKey            string
+	AgeIdentity             string
+	NoSync                  bool
+	MetadataApplyBestEffort bool
+	ProgressUpdates         chan<- DownloadProgressUpdate
+	OnAck                   func(AckProgressEvent)
+}
+
+type DownloadBatchResponse struct {
+	Files []DownloadFileResponse
+}
+
 type FetchManifestRequest struct {
 	Directory      string
 	Verbose        bool
@@ -155,19 +188,35 @@ type FetchManifestResponse struct {
 }
 
 type FetchFileRequest struct {
-	TransferID     string
-	FileID         uint64
-	FullPath       string
-	UseZeroCopy    bool
-	AcceptEncoding string
-	AgePublicKey   string
-	AgeIdentity    string
-	AckBytes       int64
+	TransferID   string
+	Files        []FetchFileTarget
+	AgePublicKey string
+	AgeIdentity  string
+	AckBytes     int64
+}
+
+type FetchFileTarget struct {
+	FileID   uint64
+	FullPath string
 }
 
 type FetchFileResponse struct {
 	Reader io.ReadCloser
 	Meta   *FileFrameMeta
+}
+
+type FetchChecksumStreamRequest struct {
+	TransferID   string
+	FileID       uint64
+	FullPath     string
+	WindowSize   int64
+	ChecksumsCSV string
+	AgePublicKey string
+	AgeIdentity  string
+}
+
+type FetchChecksumStreamResponse struct {
+	Reader io.ReadCloser
 }
 
 type AcknowledgeFileProgressRequest struct {
@@ -210,66 +259,23 @@ const (
 	minClientFrameReadBufferBytes        int   = 32 * 1024
 	defaultClientAckEveryBytes           int64 = 256 * 1024 * 1024
 	defaultClientAckRequestTimeout             = 15 * time.Second
-	defaultClientResponseHeaderTimeout         = 20 * time.Second
 )
 
-func maxSocketReadBufferBytes() int {
-	return maxSocketBufferBytes("/proc/sys/net/core/rmem_max")
-}
-
-func maxSocketBufferBytes(sysctlPath string) int {
-	// 4MiB baseline if kernel cap cannot be read.
-	const baseline = 4 * 1024 * 1024
-	raw, err := os.ReadFile(sysctlPath)
-	if err != nil {
-		return baseline
-	}
-	v, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || v <= 0 {
-		return baseline
-	}
-	if v > baseline {
-		return v
-	}
-	return baseline
-}
-
-func newTunedHTTPClient(readBufBytes int) *http.Client {
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok || base == nil {
-		return &http.Client{}
-	}
-	transport := base.Clone()
-	transport.ResponseHeaderTimeout = defaultClientResponseHeaderTimeout
-	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.SetReadBuffer(readBufBytes)
-			_ = tc.SetNoDelay(true)
-		}
-		return conn, nil
-	}
-	return &http.Client{Transport: transport}
-}
-
-func NewClient(baseURL string, hc *http.Client) *Client {
-	if hc == nil {
-		hc = newTunedHTTPClient(maxSocketReadBufferBytes())
-	}
+func NewClient(fileAddr string, opts ...ClientOption) *Client {
+	trimmed := strings.TrimSpace(fileAddr)
 	c := &Client{
-		BaseURL:                 strings.TrimRight(baseURL, "/"),
-		FileClient:              hc,
+		FileAddr:                trimmed,
+		ServerAgePublicKey:      strings.TrimSpace(os.Getenv("PINCH_FILE_SERVER_AGE_PUBLIC_KEY")),
 		FileRequestWindowBytes:  defaultClientRequestWindowBytes,
 		FrameBufferBytes:        defaultClientFrameBufferBytes,
 		MaxFrameReadBufferBytes: defaultClientMaxFrameReadBufferBytes,
 		AckRequestTimeout:       defaultClientAckRequestTimeout,
+	}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt.apply(c)
 	}
 	c.bufferPool = sync.Map{}
 	return c
@@ -282,65 +288,7 @@ func (c *Client) FetchManifest(ctx context.Context, request FetchManifestRequest
 	if request.Directory == "" {
 		return FetchManifestResponse{}, errors.New("missing directory")
 	}
-
-	u, err := url.Parse(c.BaseURL + "/fs/transfer")
-	if err != nil {
-		return FetchManifestResponse{}, fmt.Errorf("build transfer url: %w", err)
-	}
-	q := u.Query()
-	q.Set("directory", request.Directory)
-	if request.Verbose {
-		q.Set("verbose", "true")
-	}
-	if request.MaxChunkSize > 0 {
-		q.Set("max-manifest-chunk-size", strconv.Itoa(request.MaxChunkSize))
-	}
-	if request.AgePublicKey != "" {
-		q.Set("age-public-key", request.AgePublicKey)
-	}
-	u.RawQuery = q.Encode()
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), nil)
-	if err != nil {
-		return FetchManifestResponse{}, fmt.Errorf("build manifest request: %w", err)
-	}
-	if request.AcceptEncoding != "" {
-		httpReq.Header.Set("Accept-Encoding", request.AcceptEncoding)
-	}
-
-	resp, err := c.httpClient().Do(httpReq)
-	if err != nil {
-		return FetchManifestResponse{}, fmt.Errorf("request manifest: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-		return FetchManifestResponse{}, fmt.Errorf("manifest request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
-	}
-
-	reader, err := intcodec.WrapDecompressedReader(resp.Body, resp.Header.Get("Content-Encoding"))
-	if err != nil {
-		return FetchManifestResponse{}, fmt.Errorf("decode manifest body: %w", err)
-	}
-	defer reader.Close()
-
-	raw, err := io.ReadAll(reader)
-	if err != nil {
-		return FetchManifestResponse{}, fmt.Errorf("read manifest body: %w", err)
-	}
-	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-Manifest-Enc")), "age") {
-		raw, err = decryptAgeBytes(raw, request.AgeIdentity)
-		if err != nil {
-			return FetchManifestResponse{}, fmt.Errorf("decrypt manifest body: %w", err)
-		}
-	}
-
-	manifest, err := parseManifest(raw)
-	if err != nil {
-		return FetchManifestResponse{}, err
-	}
-	return FetchManifestResponse{Manifest: manifest}, nil
+	return c.fetchManifestTCP(ctx, request)
 }
 
 func SaveManifest(path string, manifest *Manifest) error {
@@ -390,13 +338,17 @@ func (m *Manifest) EntryByID(id uint64) (ManifestEntry, bool) {
 
 func (c *Client) FetchFile(ctx context.Context, request FetchFileRequest) (FetchFileResponse, error) {
 	_ = request.AckBytes
+	if len(request.Files) != 1 {
+		return FetchFileResponse{}, errors.New("FetchFile requires exactly one file target")
+	}
+	target := request.Files[0]
 	reader, meta, err := c.fetchFileWindow(
 		ctx,
 		request.TransferID,
-		request.FileID,
-		request.FullPath,
-		request.UseZeroCopy,
-		request.AcceptEncoding,
+		target.FileID,
+		target.FullPath,
+		false,
+		"",
 		request.AgePublicKey,
 		request.AgeIdentity,
 		0,
@@ -432,104 +384,38 @@ func (c *Client) fetchFileWindow(
 	if fullPath == "" {
 		return nil, nil, errors.New("missing full path")
 	}
-
-	filePath := fmt.Sprintf("%s/fs/file/%s/%d", c.BaseURL, url.PathEscape(txferID), fileID)
 	if useZeroCopy {
-		filePath += "/zerocopy"
+		return nil, nil, errors.New("zerocopy mode is unsupported with tcp file transport")
 	}
-	u, err := url.Parse(filePath)
+	_ = acceptEncoding
+	return c.fetchFileWindowTCP(
+		ctx,
+		txferID,
+		fileID,
+		fullPath,
+		agePublicKey,
+		ageIdentity,
+		offset,
+		size,
+	)
+}
+
+func (c *Client) FetchChecksumStream(ctx context.Context, request FetchChecksumStreamRequest) (FetchChecksumStreamResponse, error) {
+	if c == nil {
+		return FetchChecksumStreamResponse{}, errors.New("nil client")
+	}
+	if request.TransferID == "" {
+		return FetchChecksumStreamResponse{}, errors.New("missing transfer id")
+	}
+	if request.FullPath == "" {
+		return FetchChecksumStreamResponse{}, errors.New("missing full path")
+	}
+
+	reader, err := c.fetchChecksumStreamTCP(ctx, request)
 	if err != nil {
-		return nil, nil, fmt.Errorf("build file url: %w", err)
+		return FetchChecksumStreamResponse{}, err
 	}
-	q := u.Query()
-	q.Set("path", fullPath)
-	if offset > 0 {
-		q.Set("offset", strconv.FormatInt(offset, 10))
-	}
-	if size >= 0 {
-		q.Set("size", strconv.FormatInt(size, 10))
-	}
-	if !useZeroCopy {
-		q.Set("comp", normalizeRequestedComp(acceptEncoding))
-		if agePublicKey != "" {
-			q.Set("age-public-key", agePublicKey)
-		}
-	}
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, nil, fmt.Errorf("build file request: %w", err)
-	}
-
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("request file: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusNotFound {
-			body := strings.TrimSpace(string(msg))
-			return nil, nil, fmt.Errorf("%w: %w", ErrFileMissing, &fileMissingError{
-				Status: resp.StatusCode,
-				Body:   body,
-			})
-		}
-		return nil, nil, fmt.Errorf("file request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
-	}
-
-	if useZeroCopy {
-		metaSize := size
-		if metaSize < 0 && resp.ContentLength >= 0 {
-			metaSize = resp.ContentLength
-		}
-		if metaSize < 0 {
-			metaSize = 0
-		}
-		return resp.Body, &FileFrameMeta{
-			FileID:   fileID,
-			Comp:     "none",
-			Enc:      "none",
-			Offset:   offset,
-			Size:     metaSize,
-			WireSize: metaSize,
-		}, nil
-	}
-
-	body := io.ReadCloser(resp.Body)
-	if agePublicKey != "" {
-		identity, identityErr := parseAgeIdentity(ageIdentity)
-		if identityErr != nil {
-			resp.Body.Close()
-			return nil, nil, identityErr
-		}
-		if identity == nil {
-			resp.Body.Close()
-			return nil, nil, errors.New("missing age identity for encrypted response")
-		}
-		decryptedReader, decryptErr := age.Decrypt(resp.Body, identity)
-		if decryptErr != nil {
-			resp.Body.Close()
-			return nil, nil, fmt.Errorf("decrypt file response: %w", decryptErr)
-		}
-		body = &readerWithCloser{
-			Reader: decryptedReader,
-			Closer: resp.Body,
-		}
-	}
-
-	stream, meta, err := newFileStream(body, ageIdentity)
-	if err != nil {
-		resp.Body.Close()
-		return nil, nil, err
-	}
-	if meta.FileID != fileID {
-		stream.Close()
-		return nil, nil, fmt.Errorf("file id mismatch: expected %d got %d", fileID, meta.FileID)
-	}
-	return stream, meta, nil
+	return FetchChecksumStreamResponse{Reader: reader}, nil
 }
 
 func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileRequest) (DownloadFileResponse, error) {
@@ -586,7 +472,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	}
 
 	if req.UseZeroCopy {
-		return c.downloadFileFromManifestZeroCopy(ctx, req, entry, serverPath, destPath, writer, closeWriter, fileWriter)
+		return DownloadFileResponse{}, errors.New("zerocopy mode is unsupported with tcp file transport")
 	}
 
 	if fileWriter == nil {
@@ -801,98 +687,6 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	}, nil
 }
 
-func (c *Client) downloadFileFromManifestZeroCopy(
-	ctx context.Context,
-	req DownloadFileRequest,
-	entry ManifestEntry,
-	serverPath string,
-	destPath string,
-	writer io.Writer,
-	closeWriter func() error,
-	fileWriter *os.File,
-) (DownloadFileResponse, error) {
-	localHasher := xxh3.New128()
-	reader, _, err := c.fetchFileWindow(
-		ctx,
-		req.Manifest.TransferID,
-		req.FileID,
-		serverPath,
-		true,
-		req.AcceptEncoding,
-		req.AgePublicKey,
-		req.AgeIdentity,
-		0,
-		-1,
-	)
-	if err != nil {
-		_ = closeWriter()
-		return DownloadFileResponse{}, err
-	}
-	frameBuf, releaseFrameBuf := c.acquireFrameReadBuffer(8 * 1024 * 1024)
-	defer releaseFrameBuf()
-
-	var copied int64
-	copyErr := copyStreamWithProgress(writer, reader, frameBuf, localHasher, func(written int64) error {
-		copied = written
-		return nil
-	})
-	closeReadErr := reader.Close()
-	if copyErr != nil {
-		_ = closeWriter()
-		return DownloadFileResponse{}, fmt.Errorf("stream output file: %w", copyErr)
-	}
-	if closeReadErr != nil {
-		_ = closeWriter()
-		return DownloadFileResponse{}, closeReadErr
-	}
-	if !req.NoSync {
-		if err := dataSyncFile(fileWriter); err != nil {
-			_ = closeWriter()
-			return DownloadFileResponse{}, fmt.Errorf("fdatasync output file: %w", err)
-		}
-	}
-	if copied != entry.Size {
-		_ = closeWriter()
-		return DownloadFileResponse{}, fmt.Errorf("zerocopy size mismatch: expected=%d got=%d", entry.Size, copied)
-	}
-	closeWriteErr := closeWriter()
-	if closeWriteErr != nil {
-		return DownloadFileResponse{}, fmt.Errorf("close output file: %w", closeWriteErr)
-	}
-
-	if req.ProgressUpdates != nil {
-		select {
-		case req.ProgressUpdates <- DownloadProgressUpdate{FileID: req.FileID, AckBytes: copied}:
-		default:
-		}
-	}
-	if req.OnAck != nil {
-		now := time.Now()
-		req.OnAck(AckProgressEvent{
-			TransferID:  req.Manifest.TransferID,
-			FileID:      req.FileID,
-			AckBytes:    copied,
-			TargetBytes: entry.Size,
-			AckTime:     now,
-		})
-	}
-
-	meta := FileFrameMeta{
-		FileID:   req.FileID,
-		Comp:     "none",
-		Enc:      "none",
-		Offset:   0,
-		Size:     copied,
-		WireSize: copied,
-	}
-	localHash := intcodec.FormatXXH128HashToken(localHasher.Sum128())
-	return DownloadFileResponse{
-		DestinationPath: destPath,
-		Meta:            meta,
-		LocalFileHash:   localHash,
-	}, nil
-}
-
 func (c *Client) GetTransferStatus(ctx context.Context, request GetTransferStatusRequest) (GetTransferStatusResponse, error) {
 	if c == nil {
 		return GetTransferStatusResponse{}, errors.New("nil client")
@@ -900,25 +694,259 @@ func (c *Client) GetTransferStatus(ctx context.Context, request GetTransferStatu
 	if request.TransferID == "" {
 		return GetTransferStatusResponse{}, errors.New("missing transfer id")
 	}
-	u := fmt.Sprintf("%s/fs/transfer/%s/status", c.BaseURL, url.PathEscape(request.TransferID))
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	return c.getTransferStatusTCP(ctx, request)
+}
+
+func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req DownloadBatchRequest) (DownloadBatchResponse, error) {
+	if req.Manifest == nil {
+		return DownloadBatchResponse{}, errors.New("nil manifest")
+	}
+	if len(req.FileIDs) == 0 {
+		return DownloadBatchResponse{}, errors.New("empty file batch")
+	}
+	if req.OutRoot == "" {
+		req.OutRoot = "."
+	}
+
+	type plannedFile struct {
+		entry      ManifestEntry
+		serverPath string
+		destPath   string
+	}
+	planned := make([]plannedFile, 0, len(req.FileIDs))
+	targets := make([]FetchFileTarget, 0, len(req.FileIDs))
+	for _, fileID := range req.FileIDs {
+		entry, serverPath, err := resolveManifestEntryPath(req.Manifest, fileID)
+		if err != nil {
+			return DownloadBatchResponse{}, err
+		}
+		destPath := filepath.Clean(filepath.Join(req.OutRoot, filepath.FromSlash(entry.Path)))
+		if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+			return DownloadBatchResponse{}, fmt.Errorf("create output parent directory: %w", err)
+		}
+		planned = append(planned, plannedFile{
+			entry:      entry,
+			serverPath: serverPath,
+			destPath:   destPath,
+		})
+		targets = append(targets, FetchFileTarget{FileID: entry.ID, FullPath: serverPath})
+	}
+
+	stream, err := c.fetchFileBatchTCP(ctx, req.Manifest.TransferID, targets, req.AgePublicKey, req.AgeIdentity)
 	if err != nil {
-		return GetTransferStatusResponse{}, fmt.Errorf("build status request: %w", err)
+		return DownloadBatchResponse{}, err
 	}
-	resp, err := c.httpClient().Do(httpReq)
+	defer stream.Close()
+	br := bufio.NewReader(stream)
+
+	results := make([]DownloadFileResponse, 0, len(planned))
+	var (
+		frameBuf        []byte
+		releaseFrameBuf func()
+	)
+	defer func() {
+		if releaseFrameBuf != nil {
+			releaseFrameBuf()
+		}
+	}()
+	ackTimeout := c.AckRequestTimeout
+	if ackTimeout <= 0 {
+		ackTimeout = defaultClientAckRequestTimeout
+	}
+	var prevAckTime time.Time
+
+	for _, pf := range planned {
+		fd, err := os.Create(pf.destPath)
+		if err != nil {
+			return DownloadBatchResponse{}, fmt.Errorf("create output file: %w", err)
+		}
+		fileHasher := xxh3.New128()
+		fileStart := time.Now()
+
+		meta := FileFrameMeta{
+			FileID: pf.entry.ID,
+			Comp:   "none",
+			Enc:    "none",
+			Offset: 0,
+		}
+		var (
+			offset        int64
+			lastTrailerTS int64
+			lastMetadata  *FileTrailerMetadata
+			serverHash    string
+		)
+		for {
+			headerLine, readErr := br.ReadString('\n')
+			if readErr != nil {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("read frame header: %w", readErr)
+			}
+			headerTrimmed := strings.TrimRight(headerLine, "\r\n")
+			if isStatusLine(headerTrimmed) {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("unexpected status line before file complete: %s", headerTrimmed)
+			}
+			frameMeta, parseErr := parseFXHeader(headerTrimmed)
+			if parseErr != nil {
+				fd.Close()
+				return DownloadBatchResponse{}, parseErr
+			}
+			if frameMeta.FileID != pf.entry.ID {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("batched file id mismatch: expected=%d got=%d", pf.entry.ID, frameMeta.FileID)
+			}
+			if frameMeta.Offset != offset {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("batched offset mismatch: expected=%d got=%d", offset, frameMeta.Offset)
+			}
+			if frameBuf == nil {
+				frameBuf, releaseFrameBuf = c.acquireFrameReadBuffer(frameMeta.MaxWireSizeHint)
+			}
+
+			payloadReader := io.LimitReader(br, frameMeta.WireSize)
+			logicalReader, decodeErr := decodePayloadReader(payloadReader, frameMeta.Comp, frameMeta.Enc, nil)
+			if decodeErr != nil {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("decode payload reader: %w", decodeErr)
+			}
+			copyErr := copyStream(io.MultiWriter(fd, fileHasher), logicalReader, frameBuf, nil)
+			closeLogicalErr := logicalReader.Close()
+			if copyErr != nil {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("stream output file: %w", copyErr)
+			}
+			if closeLogicalErr != nil {
+				fd.Close()
+				return DownloadBatchResponse{}, closeLogicalErr
+			}
+			meta.Size += frameMeta.Size
+			meta.WireSize += frameMeta.WireSize
+			meta.Comp = frameMeta.Comp
+			meta.Enc = frameMeta.Enc
+			offset += frameMeta.Size
+
+			trailerLine, trailerReadErr := br.ReadString('\n')
+			if trailerReadErr != nil {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("read frame trailer: %w", trailerReadErr)
+			}
+			trailer, trailerErr := parseFXTrailer(strings.TrimRight(trailerLine, "\r\n"))
+			if trailerErr != nil {
+				fd.Close()
+				return DownloadBatchResponse{}, trailerErr
+			}
+			if trailer.FileID != pf.entry.ID {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("trailer file id mismatch: expected=%d got=%d", pf.entry.ID, trailer.FileID)
+			}
+			lastTrailerTS = trailer.TS
+			if trailer.Metadata != nil {
+				lastMetadata = cloneTrailerMetadata(trailer.Metadata)
+			}
+			if trailer.Next == nil {
+				fd.Close()
+				return DownloadBatchResponse{}, errors.New("missing trailer next offset")
+			}
+			if *trailer.Next == 0 {
+				serverHash = trailer.FileHashToken
+				break
+			}
+			if *trailer.Next != offset {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("invalid trailer next offset: expected=%d got=%d", offset, *trailer.Next)
+			}
+		}
+		if offset != pf.entry.Size {
+			fd.Close()
+			return DownloadBatchResponse{}, fmt.Errorf("batched file size mismatch: expected=%d got=%d", pf.entry.Size, offset)
+		}
+		if err := applyVerifiedFileMetadata(fd, lastMetadata, req.MetadataApplyBestEffort); err != nil {
+			fd.Close()
+			return DownloadBatchResponse{}, err
+		}
+		syncMS := int64(0)
+		if !req.NoSync {
+			syncStart := time.Now()
+			if err := dataSyncFile(fd); err != nil {
+				fd.Close()
+				return DownloadBatchResponse{}, fmt.Errorf("fdatasync output file: %w", err)
+			}
+			syncMS = time.Since(syncStart).Milliseconds()
+		}
+		if err := fd.Close(); err != nil {
+			return DownloadBatchResponse{}, fmt.Errorf("close output file: %w", err)
+		}
+
+		localHash := intcodec.FormatXXH128HashToken(fileHasher.Sum128())
+		if serverHash == "" {
+			return DownloadBatchResponse{}, errors.New("window hash missing from trailer")
+		}
+		if !strings.EqualFold(serverHash, localHash) {
+			return DownloadBatchResponse{}, fmt.Errorf("window hash mismatch: server=%s client=%s", serverHash, localHash)
+		}
+
+		recvMS := time.Since(fileStart).Milliseconds()
+		ackReq := AcknowledgeFileProgressRequest{
+			TransferID: req.Manifest.TransferID,
+			FileID:     pf.entry.ID,
+			FullPath:   pf.serverPath,
+			AckBytes:   offset,
+			ServerTS:   lastTrailerTS,
+			HashToken:  localHash,
+			DeltaBytes: offset,
+			RecvMS:     recvMS,
+			SyncMS:     syncMS,
+		}
+		ackErr := retryAck(ctx, func(callCtx context.Context) error {
+			ackCtx, cancel := context.WithTimeout(callCtx, ackTimeout)
+			defer cancel()
+			_, err := c.AcknowledgeFileProgress(ackCtx, ackReq)
+			return err
+		})
+		if ackErr != nil {
+			return DownloadBatchResponse{}, fmt.Errorf("acknowledge download failed: %w", ackErr)
+		}
+
+		if req.ProgressUpdates != nil {
+			select {
+			case req.ProgressUpdates <- DownloadProgressUpdate{FileID: pf.entry.ID, AckBytes: offset}:
+			default:
+			}
+		}
+		if req.OnAck != nil {
+			ackTime := time.Now()
+			req.OnAck(AckProgressEvent{
+				TransferID:  req.Manifest.TransferID,
+				FileID:      pf.entry.ID,
+				AckBytes:    offset,
+				TargetBytes: pf.entry.Size,
+				PrevAckTime: prevAckTime,
+				AckTime:     ackTime,
+			})
+			prevAckTime = ackTime
+		}
+
+		meta.TrailerTS = lastTrailerTS
+		meta.FileHashToken = localHash
+		meta.TrailerMetadata = lastMetadata
+		results = append(results, DownloadFileResponse{
+			DestinationPath: pf.destPath,
+			Meta:            meta,
+			LocalFileHash:   localHash,
+		})
+	}
+
+	statusLine, err := readTCPLine(br, maxTCPLineBytes)
 	if err != nil {
-		return GetTransferStatusResponse{}, fmt.Errorf("request transfer status: %w", err)
+		return DownloadBatchResponse{}, fmt.Errorf("read batch terminal status: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-		return GetTransferStatusResponse{}, fmt.Errorf("transfer status failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	if err := parseErrControlFrame(statusLine); err != nil {
+		return DownloadBatchResponse{}, err
 	}
-	var status TransferStatus
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		return GetTransferStatusResponse{}, fmt.Errorf("decode transfer status: %w", err)
+	if _, ok := parseOKStatusLine(statusLine); !ok {
+		return DownloadBatchResponse{}, fmt.Errorf("unexpected batch terminal response: %s", statusLine)
 	}
-	return GetTransferStatusResponse{Status: &status}, nil
+	return DownloadBatchResponse{Files: results}, nil
 }
 
 func shouldAcknowledgeMissing404(body string) bool {
@@ -947,35 +975,7 @@ func (c *Client) AcknowledgeFileProgress(ctx context.Context, request Acknowledg
 			return AcknowledgeFileProgressResponse{}, errors.New("ack sync-ms must be >= 0")
 		}
 	}
-
-	u, err := url.Parse(fmt.Sprintf("%s/fs/file/%s/%d/ack", c.BaseURL, url.PathEscape(request.TransferID), request.FileID))
-	if err != nil {
-		return AcknowledgeFileProgressResponse{}, fmt.Errorf("build progress-ack url: %w", err)
-	}
-	q := u.Query()
-	q.Set("path", request.FullPath)
-	q.Set("ack-bytes", ackToken)
-	if request.AckBytes >= 0 {
-		q.Set("delta-bytes", strconv.FormatInt(request.DeltaBytes, 10))
-		q.Set("recv-ms", strconv.FormatInt(request.RecvMS, 10))
-		q.Set("sync-ms", strconv.FormatInt(request.SyncMS, 10))
-	}
-	u.RawQuery = q.Encode()
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), nil)
-	if err != nil {
-		return AcknowledgeFileProgressResponse{}, fmt.Errorf("build progress-ack request: %w", err)
-	}
-	resp, err := c.httpClient().Do(httpReq)
-	if err != nil {
-		return AcknowledgeFileProgressResponse{}, fmt.Errorf("progress-ack request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
-		return AcknowledgeFileProgressResponse{}, fmt.Errorf("progress-ack failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(msg)))
-	}
-	return AcknowledgeFileProgressResponse{}, nil
+	return c.acknowledgeFileProgressTCP(ctx, request, ackToken)
 }
 
 func buildAckToken(ackBytes int64, serverTS int64, hashToken string) (string, error) {
@@ -1263,32 +1263,6 @@ func dataSyncFile(fd *os.File) error {
 		return nil
 	}
 	return syscall.Fdatasync(int(fd.Fd()))
-}
-
-func (c *Client) httpClient() *http.Client {
-	if c.FileClient != nil {
-		return c.FileClient
-	}
-	return newTunedHTTPClient(maxSocketReadBufferBytes())
-}
-
-func normalizeRequestedComp(raw string) string {
-	comp := strings.ToLower(strings.TrimSpace(raw))
-	switch comp {
-	case "", "adapt":
-		return "adapt"
-	case EncodingZstd:
-		return EncodingZstd
-	case EncodingLz4:
-		return EncodingLz4
-	case "none", EncodingIdentity:
-		return "none"
-	}
-	// Legacy CSV Accept-Encoding style values map to adaptive mode.
-	if strings.Contains(comp, ",") || strings.Contains(comp, ";") {
-		return "adapt"
-	}
-	return "adapt"
 }
 
 func parseManifest(raw []byte) (*Manifest, error) {
@@ -1753,11 +1727,21 @@ func (s *fileStream) openNextFrame() error {
 		}
 		return fmt.Errorf("read frame header: %w", err)
 	}
+	trimmedHeader := strings.TrimRight(headerLine, "\r\n")
+	if s.expectOffset && !s.expectNextFrame && isStatusLine(trimmedHeader) {
+		if err := parseErrControlFrame(trimmedHeader); err != nil {
+			return err
+		}
+		if _, ok := parseOKStatusLine(trimmedHeader); ok {
+			return io.EOF
+		}
+		return errors.New("unexpected terminal status line")
+	}
 	if s.expectOffset && !s.expectNextFrame {
 		return errors.New("unexpected extra frame after terminal trailer")
 	}
 
-	meta, err := parseFXHeader(strings.TrimRight(headerLine, "\r\n"))
+	meta, err := parseFXHeader(trimmedHeader)
 	if err != nil {
 		return err
 	}

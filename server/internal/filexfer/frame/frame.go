@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/user"
 	"strconv"
@@ -95,7 +94,7 @@ type WriteStats struct {
 
 type frameWriteStats = WriteStats
 
-func WriteFrame(w http.ResponseWriter, args WriteArgs) (WriteStats, error) {
+func WriteFrame(w io.Writer, args WriteArgs) (WriteStats, error) {
 	start := time.Now()
 	header := ""
 	if args.MaxWSizeHint != nil {
@@ -148,7 +147,7 @@ func WriteFrame(w http.ResponseWriter, args WriteArgs) (WriteStats, error) {
 		return WriteStats{}, err
 	}
 
-	if fl, ok := w.(http.Flusher); ok {
+	if fl, ok := w.(interface{ Flush() }); ok {
 		fl.Flush()
 	}
 	writeLatency := time.Since(start)
@@ -162,7 +161,7 @@ func WriteFrame(w http.ResponseWriter, args WriteArgs) (WriteStats, error) {
 	}, nil
 }
 
-func writeFrame(w http.ResponseWriter, args frameWriteArgs) (frameWriteStats, error) {
+func writeFrame(w io.Writer, args frameWriteArgs) (frameWriteStats, error) {
 	return WriteFrame(w, args)
 }
 
