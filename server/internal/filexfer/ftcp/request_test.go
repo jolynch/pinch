@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-func TestParseRequestSEND(t *testing.T) {
-	payload := []byte("SEND tx1 42 10 20 13:/tmp/file.txt")
+func TestParseRequestSENDMinimal(t *testing.T) {
+	payload := []byte(`SEND tx1 fd=42 "/tmp/file.txt"`)
 	req, err := ParseRequest(payload)
 	if err != nil {
 		t.Fatalf("ParseRequest err: %v", err)
@@ -17,19 +17,81 @@ func TestParseRequestSEND(t *testing.T) {
 	if len(req.Params) != 2 {
 		t.Fatalf("params len=%d", len(req.Params))
 	}
-	if req.Params[0]["txferid"] != "tx1" {
-		t.Fatalf("unexpected txferid: %q", req.Params[0]["txferid"])
+	if got := req.Params[0]["txferid"]; got != "tx1" {
+		t.Fatalf("unexpected txferid: %q", got)
 	}
-	if req.Params[1]["fid"] != "42" || req.Params[1]["offset"] != "10" || req.Params[1]["size"] != "20" {
-		t.Fatalf("unexpected item params: %#v", req.Params[1])
+	if got := req.Params[1]["fid"]; got != "42" {
+		t.Fatalf("unexpected fid: %q", got)
 	}
-	if req.Params[1]["path"] != "/tmp/file.txt" {
-		t.Fatalf("unexpected path: %q", req.Params[1]["path"])
+	if got := req.Params[1]["path"]; got != "/tmp/file.txt" {
+		t.Fatalf("unexpected path: %q", got)
+	}
+	if got := req.Params[1]["offset"]; got != "" {
+		t.Fatalf("unexpected offset token: %q", got)
+	}
+}
+
+func TestParseRequestSENDMultipleBlocksWithOptions(t *testing.T) {
+	payload := []byte(`SEND tx1 fd=42 "/tmp/a.txt" offset=10 size=20 comp=none foo=bar fd=77 10:/tmp/b.txt size=99`)
+	req, err := ParseRequest(payload)
+	if err != nil {
+		t.Fatalf("ParseRequest err: %v", err)
+	}
+	if len(req.Params) != 3 {
+		t.Fatalf("params len=%d", len(req.Params))
+	}
+	first := req.Params[1]
+	if first["fid"] != "42" || first["offset"] != "10" || first["size"] != "20" || first["comp"] != "none" {
+		t.Fatalf("unexpected first block: %#v", first)
+	}
+	second := req.Params[2]
+	if second["fid"] != "77" || second["path"] != "/tmp/b.txt" || second["size"] != "99" {
+		t.Fatalf("unexpected second block: %#v", second)
+	}
+}
+
+func TestParseRequestACKMinimal(t *testing.T) {
+	payload := []byte(`ACK tx1 fd=42 "/tmp/file.txt" ack-token=5@1001@xxh128:abc`)
+	req, err := ParseRequest(payload)
+	if err != nil {
+		t.Fatalf("ParseRequest err: %v", err)
+	}
+	if req.Verb != VerbACK {
+		t.Fatalf("verb=%v", req.Verb)
+	}
+	if len(req.Params) != 1 {
+		t.Fatalf("params len=%d", len(req.Params))
+	}
+	item := req.Params[0]
+	if item["txferid"] != "tx1" || item["fid"] != "42" || item["path"] != "/tmp/file.txt" {
+		t.Fatalf("unexpected ACK item: %#v", item)
+	}
+	if item["ack-token"] != "5@1001@xxh128:abc" {
+		t.Fatalf("unexpected ack-token: %q", item["ack-token"])
+	}
+}
+
+func TestParseRequestACKMultipleBlocksWithTelemetry(t *testing.T) {
+	payload := []byte(`ACK tx1 fd=1 "/tmp/a.txt" ack-token=5@1001@xxh128:aaa delta-bytes=5 recv-ms=1 sync-ms=2 foo=bar fd=2 10:/tmp/b.txt ack-token=-1`)
+	req, err := ParseRequest(payload)
+	if err != nil {
+		t.Fatalf("ParseRequest err: %v", err)
+	}
+	if len(req.Params) != 2 {
+		t.Fatalf("params len=%d", len(req.Params))
+	}
+	first := req.Params[0]
+	if first["fid"] != "1" || first["delta-bytes"] != "5" || first["recv-ms"] != "1" || first["sync-ms"] != "2" {
+		t.Fatalf("unexpected first ACK block: %#v", first)
+	}
+	second := req.Params[1]
+	if second["fid"] != "2" || second["ack-token"] != "-1" || second["path"] != "/tmp/b.txt" {
+		t.Fatalf("unexpected second ACK block: %#v", second)
 	}
 }
 
 func TestParseRequestMalformedLenValue(t *testing.T) {
-	_, err := ParseRequest([]byte("SEND tx1 1 0 10 10:/tmp"))
+	_, err := ParseRequest([]byte(`SEND tx1 fd=1 10:/tmp`))
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -39,6 +101,33 @@ func TestParseRequestMalformedLenValue(t *testing.T) {
 	}
 	if pe.code != "BAD_REQUEST" {
 		t.Fatalf("code=%s", pe.code)
+	}
+}
+
+func TestParseRequestMissingBlockStart(t *testing.T) {
+	_, err := ParseRequest([]byte(`SEND tx1 "/tmp/file.txt"`))
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func TestParseRequestInvalidUnquotedPath(t *testing.T) {
+	_, err := ParseRequest([]byte(`SEND tx1 fd=1 /tmp/plain`))
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func TestParseRequestACKMissingAckToken(t *testing.T) {
+	req, err := ParseRequest([]byte(`ACK tx1 fd=1 "/tmp/a.txt"`))
+	if err != nil {
+		t.Fatalf("ParseRequest err: %v", err)
+	}
+	if len(req.Params) != 1 {
+		t.Fatalf("params len=%d", len(req.Params))
+	}
+	if got := req.Params[0]["ack-token"]; got != "" {
+		t.Fatalf("unexpected ack-token value: %q", got)
 	}
 }
 
@@ -53,24 +142,6 @@ func TestParseRequestUnknownVerb(t *testing.T) {
 	}
 	if pe.code != "BAD_COMMAND" {
 		t.Fatalf("code=%s", pe.code)
-	}
-}
-
-func TestParseRequestQuotedPath(t *testing.T) {
-	payload := []byte(`SEND tx1 42 10 20 "/tmp/file with spaces.txt"`)
-	req, err := ParseRequest(payload)
-	if err != nil {
-		t.Fatalf("ParseRequest err: %v", err)
-	}
-	if got := req.Params[1]["path"]; got != "/tmp/file with spaces.txt" {
-		t.Fatalf("path=%q", got)
-	}
-}
-
-func TestParseRequestInvalidUnquotedPath(t *testing.T) {
-	_, err := ParseRequest([]byte(`SEND tx1 42 10 20 /tmp/plain`))
-	if err == nil {
-		t.Fatalf("expected error")
 	}
 }
 

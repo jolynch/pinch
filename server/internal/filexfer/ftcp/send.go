@@ -33,12 +33,12 @@ type sendItem struct {
 	FileID uint64
 	Offset int64
 	Size   int64
+	Comp   string
 	Path   string
 }
 
 type sendRequest struct {
 	TransferID string
-	Comp       string
 	Items      []sendItem
 }
 
@@ -59,16 +59,6 @@ func parseSENDRequest(req Request) (sendRequest, error) {
 	if txferID == "" {
 		return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
 	}
-	comp := strings.ToLower(strings.TrimSpace(header["comp"]))
-	if comp == "" {
-		comp = "none"
-	}
-	if comp == "identity" {
-		comp = "none"
-	}
-	if comp != "none" {
-		return sendRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "only comp=none is supported"}
-	}
 
 	items := make([]sendItem, 0, len(req.Params)-1)
 	for _, p := range req.Params[1:] {
@@ -76,21 +66,37 @@ func parseSENDRequest(req Request) (sendRequest, error) {
 		if err != nil {
 			return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND file id"}
 		}
-		offset, err := strconv.ParseInt(p["offset"], 10, 64)
-		if err != nil || offset < 0 {
-			return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND offset"}
+		offset := int64(0)
+		if raw := strings.TrimSpace(p["offset"]); raw != "" {
+			offset, err = strconv.ParseInt(raw, 10, 64)
+			if err != nil || offset < 0 {
+				return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND offset"}
+			}
 		}
-		size, err := strconv.ParseInt(p["size"], 10, 64)
-		if err != nil || size < 0 {
-			return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND size"}
+		size := int64(0)
+		if raw := strings.TrimSpace(p["size"]); raw != "" {
+			size, err = strconv.ParseInt(raw, 10, 64)
+			if err != nil || size < 0 {
+				return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND size"}
+			}
+		}
+		comp := strings.ToLower(strings.TrimSpace(p["comp"]))
+		if comp == "" {
+			comp = "none"
+		}
+		if comp == "identity" {
+			comp = "none"
+		}
+		if comp != "none" {
+			return sendRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "only comp=none is supported"}
 		}
 		path := p["path"]
 		if path == "" {
 			return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND path"}
 		}
-		items = append(items, sendItem{FileID: fid, Offset: offset, Size: size, Path: path})
+		items = append(items, sendItem{FileID: fid, Offset: offset, Size: size, Comp: comp, Path: path})
 	}
-	return sendRequest{TransferID: txferID, Comp: comp, Items: items}, nil
+	return sendRequest{TransferID: txferID, Items: items}, nil
 }
 
 func handleSEND(_ context.Context, req Request, out io.Writer, deps Deps) error {
@@ -158,7 +164,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 		}
 		frameOffset := cursor
 		wireSize := frameSize
-		headerLine := buildFrameHeaderLine(item.FileID, cursor, frameSize, wireSize, "none", maxHint, headerTS)
+		headerLine := buildFrameHeaderLine(item.FileID, cursor, frameSize, wireSize, item.Comp, maxHint, headerTS)
 		if _, err := io.WriteString(out, headerLine); err != nil {
 			_ = hashPipeW.Close()
 			<-hashDone

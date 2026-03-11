@@ -64,33 +64,48 @@ func ParseRequest(payload []byte) (Request, error) {
 		if readErr != nil || txferID == "" {
 			return Request{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
 		}
-		header := map[string]string{"txferid": txferID, "comp": "none"}
-		if c.hasPrefix("comp=") {
-			tok, tokErr := c.readToken()
-			if tokErr != nil {
-				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND comp"}
-			}
-			_, v, _ := strings.Cut(tok, "=")
-			header["comp"] = strings.TrimSpace(v)
-		}
+		header := map[string]string{"txferid": txferID}
 		req.Params = append(req.Params, header)
 		for !c.eof() {
-			fid, fidErr := c.readToken()
-			offset, offErr := c.readToken()
-			size, sizeErr := c.readToken()
-			if fidErr != nil || offErr != nil || sizeErr != nil {
+			fdToken, fdErr := c.readToken()
+			if fdErr != nil {
 				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND item"}
+			}
+			if !strings.HasPrefix(fdToken, "fd=") {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND file id"}
+			}
+			fid := strings.TrimSpace(strings.TrimPrefix(fdToken, "fd="))
+			if fid == "" {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND file id"}
 			}
 			path, pathErr := c.readPathValue()
 			if pathErr != nil {
 				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND path"}
 			}
-			req.Params = append(req.Params, map[string]string{
-				"fid":    fid,
-				"offset": offset,
-				"size":   size,
-				"path":   string(path),
-			})
+			item := map[string]string{
+				"fid":  fid,
+				"path": string(path),
+			}
+			for !c.eof() {
+				if c.hasPrefix("fd=") {
+					break
+				}
+				tok, tokErr := c.readToken()
+				if tokErr != nil {
+					return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND item option"}
+				}
+				key, val, ok := strings.Cut(tok, "=")
+				if !ok {
+					return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND item option"}
+				}
+				switch key {
+				case "offset", "size", "comp":
+					item[key] = val
+				default:
+					// Unknown keys are ignored for forward compatibility.
+				}
+			}
+			req.Params = append(req.Params, item)
 		}
 		if len(req.Params) == 1 {
 			return Request{}, protocolErr{code: "BAD_REQUEST", message: "SEND requires at least one item"}
@@ -98,30 +113,54 @@ func ParseRequest(payload []byte) (Request, error) {
 		return req, nil
 	case VerbACK:
 		txferID, txErr := c.readToken()
-		fid, fidErr := c.readToken()
-		ackToken, ackErr := c.readToken()
-		delta, deltaErr := c.readToken()
-		recvMS, recvErr := c.readToken()
-		syncMS, syncErr := c.readToken()
-		if txErr != nil || fidErr != nil || ackErr != nil || deltaErr != nil || recvErr != nil || syncErr != nil {
+		if txErr != nil || txferID == "" {
 			return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK arguments"}
 		}
-		path, pathErr := c.readPathValue()
-		if pathErr != nil {
-			return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK path"}
+		for !c.eof() {
+			fdToken, fdErr := c.readToken()
+			if fdErr != nil {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK arguments"}
+			}
+			if !strings.HasPrefix(fdToken, "fd=") {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK file id"}
+			}
+			fid := strings.TrimSpace(strings.TrimPrefix(fdToken, "fd="))
+			if fid == "" {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK file id"}
+			}
+			path, pathErr := c.readPathValue()
+			if pathErr != nil {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK path"}
+			}
+			item := map[string]string{
+				"txferid": txferID,
+				"fid":     fid,
+				"path":    string(path),
+			}
+			for !c.eof() {
+				if c.hasPrefix("fd=") {
+					break
+				}
+				tok, tokErr := c.readToken()
+				if tokErr != nil {
+					return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK arguments"}
+				}
+				key, val, ok := strings.Cut(tok, "=")
+				if !ok {
+					return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK arguments"}
+				}
+				switch key {
+				case "ack-token", "delta-bytes", "recv-ms", "sync-ms":
+					item[key] = val
+				default:
+					// Unknown keys are ignored for forward compatibility.
+				}
+			}
+			req.Params = append(req.Params, item)
 		}
-		if !c.eof() {
-			return Request{}, protocolErr{code: "BAD_REQUEST", message: "unexpected ACK arguments"}
+		if len(req.Params) == 0 {
+			return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK arguments"}
 		}
-		req.Params = append(req.Params, map[string]string{
-			"txferid":     txferID,
-			"fid":         fid,
-			"ack-token":   ackToken,
-			"delta-bytes": delta,
-			"recv-ms":     recvMS,
-			"sync-ms":     syncMS,
-			"path":        string(path),
-		})
 		return req, nil
 	case VerbCXSUM:
 		txferID, txErr := c.readToken()

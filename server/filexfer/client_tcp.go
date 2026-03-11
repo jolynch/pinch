@@ -353,8 +353,22 @@ func (c *Client) fetchFileWindowTCP(
 	if effectiveSize < 0 {
 		effectiveSize = 0
 	}
-	cmd := fmt.Sprintf("SEND %s %d %d %d %s", txferID, fileID, offset, effectiveSize, makeLenToken(fullPath))
-	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
+	var cmd strings.Builder
+	cmd.WriteString("SEND ")
+	cmd.WriteString(txferID)
+	cmd.WriteString(" fd=")
+	cmd.WriteString(strconv.FormatUint(fileID, 10))
+	cmd.WriteString(" ")
+	cmd.WriteString(makeLenToken(fullPath))
+	if offset != 0 {
+		cmd.WriteString(" offset=")
+		cmd.WriteString(strconv.FormatInt(offset, 10))
+	}
+	if effectiveSize > 0 {
+		cmd.WriteString(" size=")
+		cmd.WriteString(strconv.FormatInt(effectiveSize, 10))
+	}
+	if err := c.sendTCPCommand(conn, state, cmd.String()); err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("send SEND: %w", err)
 	}
@@ -431,9 +445,9 @@ func (c *Client) fetchFileBatchTCP(
 			conn.Close()
 			return nil, errors.New("missing full path")
 		}
-		b.WriteString(" ")
+		b.WriteString(" fd=")
 		b.WriteString(strconv.FormatUint(t.FileID, 10))
-		b.WriteString(" 0 0 ")
+		b.WriteString(" ")
 		b.WriteString(makeLenToken(t.FullPath))
 	}
 	if err := c.sendTCPCommand(conn, state, b.String()); err != nil {
@@ -480,6 +494,19 @@ func readTCPStatus(br *bufio.Reader) (string, error) {
 }
 
 func (c *Client) acknowledgeFileProgressTCP(ctx context.Context, request AcknowledgeFileProgressRequest, ackToken string) (AcknowledgeFileProgressResponse, error) {
+	return c.acknowledgeFileProgressBatchTCP(ctx, []acknowledgeFileProgressCommand{
+		{request: request, ackToken: ackToken},
+	})
+}
+
+func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands []acknowledgeFileProgressCommand) (AcknowledgeFileProgressResponse, error) {
+	if len(commands) == 0 {
+		return AcknowledgeFileProgressResponse{}, errors.New("missing ack requests")
+	}
+	txferID := strings.TrimSpace(commands[0].request.TransferID)
+	if txferID == "" {
+		return AcknowledgeFileProgressResponse{}, errors.New("missing transfer id")
+	}
 	state, err := c.resolveTCPAuthState("", "")
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, err
@@ -493,17 +520,30 @@ func (c *Client) acknowledgeFileProgressTCP(ctx context.Context, request Acknowl
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("send AUTH: %w", err)
 	}
 
-	cmd := fmt.Sprintf(
-		"ACK %s %d %s %d %d %d %s",
-		request.TransferID,
-		request.FileID,
-		ackToken,
-		request.DeltaBytes,
-		request.RecvMS,
-		request.SyncMS,
-		makeLenToken(request.FullPath),
-	)
-	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
+	var cmd strings.Builder
+	cmd.WriteString("ACK ")
+	cmd.WriteString(txferID)
+	for _, ack := range commands {
+		request := ack.request
+		if request.TransferID != txferID {
+			return AcknowledgeFileProgressResponse{}, errors.New("ack requests must share transfer id")
+		}
+		cmd.WriteString(" fd=")
+		cmd.WriteString(strconv.FormatUint(request.FileID, 10))
+		cmd.WriteString(" ")
+		cmd.WriteString(makeLenToken(request.FullPath))
+		cmd.WriteString(" ack-token=")
+		cmd.WriteString(ack.ackToken)
+		if request.AckBytes >= 0 {
+			cmd.WriteString(" delta-bytes=")
+			cmd.WriteString(strconv.FormatInt(request.DeltaBytes, 10))
+			cmd.WriteString(" recv-ms=")
+			cmd.WriteString(strconv.FormatInt(request.RecvMS, 10))
+			cmd.WriteString(" sync-ms=")
+			cmd.WriteString(strconv.FormatInt(request.SyncMS, 10))
+		}
+	}
+	if err := c.sendTCPCommand(conn, state, cmd.String()); err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("send ACK: %w", err)
 	}
 	responseReader, err := c.responseReaderForTCP(conn, state)

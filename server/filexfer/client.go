@@ -595,6 +595,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			FileID:          req.FileID,
 			FullPath:        serverPath,
 			TargetBytes:     entry.Size,
+			AckEveryBytes:   req.AckEveryBytes,
 			OnAck:           req.OnAck,
 			ProgressUpdates: req.ProgressUpdates,
 		})
@@ -627,7 +628,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		if err != nil {
 			var missingErr *fileMissingError
 			if errors.Is(err, ErrFileMissing) && errors.As(err, &missingErr) && shouldAcknowledgeMissing404(missingErr.Body) {
-				if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{AckBytes: -1, Final: true}); qErr != nil {
+				if qErr := enqueueAck(ctx, ackQueue, ackErrCh, ackEvent{AckBytes: -1, Flush: true}); qErr != nil {
 					_ = closeWriter()
 					return DownloadFileResponse{}, fmt.Errorf("%w (failed to ack missing: %v)", err, qErr)
 				}
@@ -682,7 +683,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			DeltaBytes: windowMeta.Size,
 			RecvMS:     recvMS,
 			SyncMS:     syncMS,
-			Final:      true,
+			Flush:      offset >= totalSize,
 		}); qErr != nil {
 			_ = closeWriter()
 			return DownloadFileResponse{}, fmt.Errorf("enqueue window ack failed: %w", qErr)
@@ -799,6 +800,13 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 	br := bufio.NewReader(stream)
 
 	results := make([]DownloadFileResponse, 0, len(planned))
+	type ackProgress struct {
+		fileID      uint64
+		ackBytes    int64
+		targetBytes int64
+	}
+	pendingAcks := make([]AcknowledgeFileProgressRequest, 0, len(planned))
+	ackProgresses := make([]ackProgress, 0, len(planned))
 	var (
 		frameBuf        []byte
 		releaseFrameBuf func()
@@ -956,34 +964,12 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 			RecvMS:     recvMS,
 			SyncMS:     syncMS,
 		}
-		ackErr := retryAck(ctx, func(callCtx context.Context) error {
-			ackCtx, cancel := context.WithTimeout(callCtx, ackTimeout)
-			defer cancel()
-			_, err := c.AcknowledgeFileProgress(ackCtx, ackReq)
-			return err
+		pendingAcks = append(pendingAcks, ackReq)
+		ackProgresses = append(ackProgresses, ackProgress{
+			fileID:      pf.entry.ID,
+			ackBytes:    offset,
+			targetBytes: pf.entry.Size,
 		})
-		if ackErr != nil {
-			return DownloadBatchResponse{}, fmt.Errorf("acknowledge download failed: %w", ackErr)
-		}
-
-		if req.ProgressUpdates != nil {
-			select {
-			case req.ProgressUpdates <- DownloadProgressUpdate{FileID: pf.entry.ID, AckBytes: offset}:
-			default:
-			}
-		}
-		if req.OnAck != nil {
-			ackTime := time.Now()
-			req.OnAck(AckProgressEvent{
-				TransferID:  req.Manifest.TransferID,
-				FileID:      pf.entry.ID,
-				AckBytes:    offset,
-				TargetBytes: pf.entry.Size,
-				PrevAckTime: prevAckTime,
-				AckTime:     ackTime,
-			})
-			prevAckTime = ackTime
-		}
 
 		meta.TrailerTS = lastTrailerTS
 		meta.FileHashToken = localHash
@@ -1004,6 +990,37 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 	}
 	if _, ok := parseOKStatusLine(statusLine); !ok {
 		return DownloadBatchResponse{}, fmt.Errorf("unexpected batch terminal response: %s", statusLine)
+	}
+	if len(pendingAcks) > 0 {
+		ackErr := retryAck(ctx, func(callCtx context.Context) error {
+			ackCtx, cancel := context.WithTimeout(callCtx, ackTimeout)
+			defer cancel()
+			_, err := c.acknowledgeFileProgressBatch(ackCtx, pendingAcks)
+			return err
+		})
+		if ackErr != nil {
+			return DownloadBatchResponse{}, fmt.Errorf("acknowledge download failed: %w", ackErr)
+		}
+	}
+	for _, progress := range ackProgresses {
+		if req.ProgressUpdates != nil {
+			select {
+			case req.ProgressUpdates <- DownloadProgressUpdate{FileID: progress.fileID, AckBytes: progress.ackBytes}:
+			default:
+			}
+		}
+		if req.OnAck != nil {
+			ackTime := time.Now()
+			req.OnAck(AckProgressEvent{
+				TransferID:  req.Manifest.TransferID,
+				FileID:      progress.fileID,
+				AckBytes:    progress.ackBytes,
+				TargetBytes: progress.targetBytes,
+				PrevAckTime: prevAckTime,
+				AckTime:     ackTime,
+			})
+			prevAckTime = ackTime
+		}
 	}
 	return DownloadBatchResponse{Files: results}, nil
 }
@@ -1140,29 +1157,53 @@ func shouldAcknowledgeMissing404(body string) bool {
 	return strings.EqualFold(strings.TrimSpace(body), "file not found")
 }
 
-func (c *Client) AcknowledgeFileProgress(ctx context.Context, request AcknowledgeFileProgressRequest) (AcknowledgeFileProgressResponse, error) {
+type acknowledgeFileProgressCommand struct {
+	request  AcknowledgeFileProgressRequest
+	ackToken string
+}
+
+func buildAcknowledgeFileProgressCommand(request AcknowledgeFileProgressRequest) (acknowledgeFileProgressCommand, error) {
 	if request.TransferID == "" {
-		return AcknowledgeFileProgressResponse{}, errors.New("missing transfer id")
+		return acknowledgeFileProgressCommand{}, errors.New("missing transfer id")
 	}
 	if request.FullPath == "" {
-		return AcknowledgeFileProgressResponse{}, errors.New("missing full path")
+		return acknowledgeFileProgressCommand{}, errors.New("missing full path")
 	}
 	ackToken, err := buildAckToken(request.AckBytes, request.ServerTS, request.HashToken)
 	if err != nil {
-		return AcknowledgeFileProgressResponse{}, err
+		return acknowledgeFileProgressCommand{}, err
 	}
 	if request.AckBytes >= 0 {
 		if request.DeltaBytes < 0 {
-			return AcknowledgeFileProgressResponse{}, errors.New("ack delta bytes must be >= 0")
+			return acknowledgeFileProgressCommand{}, errors.New("ack delta bytes must be >= 0")
 		}
 		if request.RecvMS < 0 {
-			return AcknowledgeFileProgressResponse{}, errors.New("ack recv-ms must be >= 0")
+			return acknowledgeFileProgressCommand{}, errors.New("ack recv-ms must be >= 0")
 		}
 		if request.SyncMS < 0 {
-			return AcknowledgeFileProgressResponse{}, errors.New("ack sync-ms must be >= 0")
+			return acknowledgeFileProgressCommand{}, errors.New("ack sync-ms must be >= 0")
 		}
 	}
-	return c.acknowledgeFileProgressTCP(ctx, request, ackToken)
+	return acknowledgeFileProgressCommand{request: request, ackToken: ackToken}, nil
+}
+
+func (c *Client) acknowledgeFileProgressBatch(ctx context.Context, requests []AcknowledgeFileProgressRequest) (AcknowledgeFileProgressResponse, error) {
+	if len(requests) == 0 {
+		return AcknowledgeFileProgressResponse{}, errors.New("missing ack requests")
+	}
+	commands := make([]acknowledgeFileProgressCommand, 0, len(requests))
+	for _, request := range requests {
+		cmd, err := buildAcknowledgeFileProgressCommand(request)
+		if err != nil {
+			return AcknowledgeFileProgressResponse{}, err
+		}
+		commands = append(commands, cmd)
+	}
+	return c.acknowledgeFileProgressBatchTCP(ctx, commands)
+}
+
+func (c *Client) AcknowledgeFileProgress(ctx context.Context, request AcknowledgeFileProgressRequest) (AcknowledgeFileProgressResponse, error) {
+	return c.acknowledgeFileProgressBatch(ctx, []AcknowledgeFileProgressRequest{request})
 }
 
 func buildAckToken(ackBytes int64, serverTS int64, hashToken string) (string, error) {
@@ -1192,7 +1233,7 @@ type ackEvent struct {
 	DeltaBytes int64
 	RecvMS     int64
 	SyncMS     int64
-	Final      bool
+	Flush      bool
 }
 
 type ackRequestBase struct {
@@ -1200,6 +1241,7 @@ type ackRequestBase struct {
 	FileID          uint64
 	FullPath        string
 	TargetBytes     int64
+	AckEveryBytes   int64
 	OnAck           func(AckProgressEvent)
 	ProgressUpdates chan<- DownloadProgressUpdate
 }
@@ -1234,8 +1276,16 @@ func (c *Client) runAckWorker(ctx context.Context, ackQueue <-chan ackEvent, ack
 	if ackTimeout <= 0 {
 		ackTimeout = defaultClientAckRequestTimeout
 	}
+	ackEveryBytes := base.AckEveryBytes
+	if ackEveryBytes <= 0 {
+		ackEveryBytes = 1
+	}
 	var prevAckTime time.Time
-	for evt := range ackQueue {
+	var pending ackEvent
+	var pendingBytes int64
+	pendingSet := false
+
+	sendACK := func(evt ackEvent) error {
 		req := AcknowledgeFileProgressRequest{
 			TransferID: base.TransferID,
 			FileID:     base.FileID,
@@ -1254,21 +1304,7 @@ func (c *Client) runAckWorker(ctx context.Context, ackQueue <-chan ackEvent, ack
 			return err
 		})
 		if err != nil {
-			if evt.Final {
-				select {
-				case ackErrCh <- err:
-				default:
-				}
-				return
-			}
-			log.Printf(
-				"filexfer client: non-final ack failed tid=%s fid=%d bytes=%d err=%v",
-				base.TransferID,
-				base.FileID,
-				evt.AckBytes,
-				err,
-			)
-			continue
+			return err
 		}
 		if evt.AckBytes >= 0 && base.ProgressUpdates != nil {
 			select {
@@ -1287,6 +1323,70 @@ func (c *Client) runAckWorker(ctx context.Context, ackQueue <-chan ackEvent, ack
 				AckTime:     ackTime,
 			})
 			prevAckTime = ackTime
+		}
+		return nil
+	}
+
+	flushPending := func() error {
+		if !pendingSet {
+			return nil
+		}
+		if err := sendACK(pending); err != nil {
+			return err
+		}
+		pending = ackEvent{}
+		pendingBytes = 0
+		pendingSet = false
+		return nil
+	}
+
+	for evt := range ackQueue {
+		if evt.AckBytes < 0 {
+			if err := flushPending(); err != nil {
+				select {
+				case ackErrCh <- err:
+				default:
+				}
+				return
+			}
+			if err := sendACK(evt); err != nil {
+				select {
+				case ackErrCh <- err:
+				default:
+				}
+				return
+			}
+			continue
+		}
+
+		if !pendingSet {
+			pending = evt
+			pendingSet = true
+		} else {
+			pending.AckBytes = evt.AckBytes
+			pending.ServerTS = evt.ServerTS
+			pending.HashToken = evt.HashToken
+			pending.DeltaBytes += evt.DeltaBytes
+			pending.RecvMS += evt.RecvMS
+			pending.SyncMS += evt.SyncMS
+		}
+		pendingBytes += evt.DeltaBytes
+
+		if pendingBytes >= ackEveryBytes || evt.Flush {
+			if err := flushPending(); err != nil {
+				select {
+				case ackErrCh <- err:
+				default:
+				}
+				return
+			}
+		}
+	}
+
+	if err := flushPending(); err != nil {
+		select {
+		case ackErrCh <- err:
+		default:
 		}
 	}
 }

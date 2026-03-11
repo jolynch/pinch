@@ -46,7 +46,7 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			if _, ok := err.(net.Error); ok {
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}

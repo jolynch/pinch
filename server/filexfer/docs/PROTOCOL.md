@@ -96,13 +96,17 @@ Streams one or more file windows as `FX/1` frames.
 
 ### Request
 
-`SEND <txferid> [comp=<name>] <fid> <offset> <size> <path> [<fid> <offset> <size> <path> ...]`
+`SEND <txferid> fd=<fid> <path> [offset=<n>] [size=<n>] [comp=<name>] [<unknown key=value>...] [fd=<fid> <path> ...]`
 
+- each `fd=` starts a new file block.
+- required per block: `fd`, `path`.
+- `offset` defaults to `0`.
+- `size` defaults to `0` (means "from offset to EOF").
 - `comp` defaults to `none`.
 - accepted compression values: `none` and `identity`.
 - others are rejected with `ERR UNSUPPORTED_COMP ...`.
 - each `<path>` is quoted or length-prefixed.
-- `size=0` means "from offset to EOF".
+- unknown `key=value` fields are ignored.
 
 ### Response
 
@@ -115,7 +119,12 @@ Acknowledges file progress/window completion.
 
 ### Request
 
-`ACK <txferid> <fid> <ack-token> <delta-bytes> <recv-ms> <sync-ms> <path>`
+`ACK <txferid> fd=<fid> <path> ack-token=<token> [delta-bytes=<n>] [recv-ms=<n>] [sync-ms=<n>] [<unknown key=value>...] [fd=<fid> <path> ...]`
+
+- each `fd=` starts a new ack block.
+- required per block: `fd`, `path`, `ack-token`.
+- telemetry fields default to `0` when omitted.
+- unknown `key=value` fields are ignored.
 
 `ack-token` forms:
 
@@ -126,7 +135,6 @@ Rules:
 
 - non-`-1` ack must include hash token.
 - hash is validated against stored window hash at ack offset.
-- telemetry fields are required by grammar.
 
 ### Response
 

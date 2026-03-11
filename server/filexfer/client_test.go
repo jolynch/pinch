@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -979,6 +980,249 @@ func TestDownloadFileFromManifestOnAckCallback(t *testing.T) {
 	}
 	if len(events) > 1 && last.PrevAckTime.IsZero() {
 		t.Fatalf("expected non-zero previous ack time when multiple events are present")
+	}
+}
+
+func TestDownloadFileFromManifestPoolsACKByAckEvery(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txackpool",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 10, Path: "a.txt"},
+		},
+	}
+	partA := []byte("hello")
+	partB := []byte("world")
+
+	var acks []map[string]string
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			rawOffset := req.Params[1]["offset"]
+			if rawOffset == "" {
+				rawOffset = "0"
+			}
+			offset, err := strconv.ParseInt(rawOffset, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid offset: %v", err)
+			}
+			switch offset {
+			case 0:
+				_, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, partA, nil))
+				return err
+			case 5:
+				_, err := io.WriteString(out, buildFXFrame(t, 0, "none", 5, partB, nil))
+				return err
+			default:
+				return fmt.Errorf("unexpected offset: %d", offset)
+			}
+		case intftcp.VerbACK:
+			item := map[string]string{}
+			for k, v := range req.Params[0] {
+				item[k] = v
+			}
+			acks = append(acks, item)
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL, WithFileRequestWindowBytes(5))
+	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:      manifest,
+		FileID:        0,
+		OutRoot:       outRoot,
+		AckEveryBytes: 10,
+		NoSync:        true,
+	})
+	if err != nil {
+		t.Fatalf("DownloadFileFromManifest failed: %v", err)
+	}
+	if len(acks) != 1 {
+		t.Fatalf("expected one pooled ACK, got %d", len(acks))
+	}
+	ack := acks[0]
+	expectedAck := "10@1006@xxh128:" + xxh128HexTest(partB)
+	if got := ack["ack-token"]; got != expectedAck {
+		t.Fatalf("expected ack-token=%s, got %q", expectedAck, got)
+	}
+	if got := ack["delta-bytes"]; got != "10" {
+		t.Fatalf("expected pooled delta-bytes=10, got %q", got)
+	}
+}
+
+func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txbatchack",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+			{ID: 1, Size: 6, Path: "b.txt"},
+		},
+	}
+	dataA := []byte("hello")
+	dataB := []byte("world!")
+	finalNext := int64(0)
+
+	var ackRequests int
+	var ackBlocks []map[string]string
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			if len(req.Params) != 3 {
+				return fmt.Errorf("expected txfer header + 2 SEND items, got %d params", len(req.Params))
+			}
+			if got := req.Params[0]["txferid"]; got != manifest.TransferID {
+				return fmt.Errorf("unexpected transfer id: %q", got)
+			}
+			if got := req.Params[1]["path"]; got != "/remote/a.txt" {
+				return fmt.Errorf("unexpected first path: %q", got)
+			}
+			if got := req.Params[2]["path"]; got != "/remote/b.txt" {
+				return fmt.Errorf("unexpected second path: %q", got)
+			}
+			if _, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, dataA, &finalNext)); err != nil {
+				return err
+			}
+			if _, err := io.WriteString(out, buildFXFrame(t, 1, "none", 0, dataB, &finalNext)); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			ackRequests++
+			for _, p := range req.Params {
+				item := map[string]string{}
+				for k, v := range p {
+					item[k] = v
+				}
+				ackBlocks = append(ackBlocks, item)
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	resp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+		Manifest: manifest,
+		FileIDs:  []uint64{0, 1},
+		OutRoot:  outRoot,
+		NoSync:   true,
+	})
+	if err != nil {
+		t.Fatalf("DownloadFilesFromManifestBatch failed: %v", err)
+	}
+	if len(resp.Files) != 2 {
+		t.Fatalf("expected two downloaded files, got %d", len(resp.Files))
+	}
+	if ackRequests != 1 {
+		t.Fatalf("expected one ACK request, got %d", ackRequests)
+	}
+	if len(ackBlocks) != 2 {
+		t.Fatalf("expected two ACK blocks, got %d", len(ackBlocks))
+	}
+
+	acksByFID := map[string]map[string]string{}
+	for _, block := range ackBlocks {
+		acksByFID[block["fid"]] = block
+	}
+	ack0, ok := acksByFID["0"]
+	if !ok {
+		t.Fatalf("missing ACK block for fid=0")
+	}
+	ack1, ok := acksByFID["1"]
+	if !ok {
+		t.Fatalf("missing ACK block for fid=1")
+	}
+	expectedAck0 := "5@1001@xxh128:" + xxh128HexTest(dataA)
+	expectedAck1 := "6@1001@xxh128:" + xxh128HexTest(dataB)
+	if got := ack0["ack-token"]; got != expectedAck0 {
+		t.Fatalf("unexpected fid=0 ack-token: %q", got)
+	}
+	if got := ack1["ack-token"]; got != expectedAck1 {
+		t.Fatalf("unexpected fid=1 ack-token: %q", got)
+	}
+	if got := ack0["delta-bytes"]; got != "5" {
+		t.Fatalf("unexpected fid=0 delta-bytes: %q", got)
+	}
+	if got := ack1["delta-bytes"]; got != "6" {
+		t.Fatalf("unexpected fid=1 delta-bytes: %q", got)
+	}
+
+	gotA, err := os.ReadFile(filepath.Join(outRoot, "a.txt"))
+	if err != nil {
+		t.Fatalf("read output a.txt: %v", err)
+	}
+	gotB, err := os.ReadFile(filepath.Join(outRoot, "b.txt"))
+	if err != nil {
+		t.Fatalf("read output b.txt: %v", err)
+	}
+	if !bytes.Equal(gotA, dataA) {
+		t.Fatalf("unexpected output for a.txt: %q", gotA)
+	}
+	if !bytes.Equal(gotB, dataB) {
+		t.Fatalf("unexpected output for b.txt: %q", gotB)
+	}
+}
+
+func TestDownloadFileFromManifestMissingFileACKImmediate(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txmissingack",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "missing.txt"},
+		},
+	}
+	var acks []map[string]string
+	var requests int
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		requests++
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, "ERR NOT_FOUND file not found\r\n")
+			return err
+		case intftcp.VerbACK:
+			item := map[string]string{}
+			for k, v := range req.Params[0] {
+				item[k] = v
+			}
+			acks = append(acks, item)
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+		Manifest:      manifest,
+		FileID:        0,
+		OutRoot:       outRoot,
+		AckEveryBytes: 1024,
+	})
+	if err == nil || !errors.Is(err, ErrFileMissing) {
+		t.Fatalf("expected ErrFileMissing, got %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("expected SEND + ACK requests, got %d", requests)
+	}
+	if len(acks) != 1 {
+		t.Fatalf("expected exactly one missing ACK, got %d", len(acks))
+	}
+	if got := acks[0]["ack-token"]; got != "-1" {
+		t.Fatalf("expected missing ack-token -1, got %q", got)
 	}
 }
 

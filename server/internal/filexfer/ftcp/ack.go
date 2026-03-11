@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -13,7 +12,7 @@ import (
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 )
 
-type ackRequest struct {
+type ackItem struct {
 	TransferID string
 	FileID     uint64
 	AckToken   string
@@ -23,51 +22,57 @@ type ackRequest struct {
 	Path       string
 }
 
+type ackRequest struct {
+	Items []ackItem
+}
+
+type validatedAckItem struct {
+	item         ackItem
+	ackBytes     int64
+	ackTS        int64
+	ackHashToken string
+}
+
 func parseACKRequest(req Request) (ackRequest, error) {
 	if req.Verb != VerbACK {
 		return ackRequest{}, protocolErr{code: "BAD_COMMAND", message: "not ACK"}
 	}
-	if len(req.Params) != 1 {
+	if len(req.Params) == 0 {
 		return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK arguments"}
 	}
-	p := req.Params[0]
-	txferID := p["txferid"]
-	if txferID == "" {
-		return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
+	items := make([]ackItem, 0, len(req.Params))
+	for _, p := range req.Params {
+		txferID := p["txferid"]
+		if txferID == "" {
+			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
+		}
+		fid, err := strconv.ParseUint(p["fid"], 10, 64)
+		if err != nil {
+			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid file id"}
+		}
+		ackToken := p["ack-token"]
+		if strings.TrimSpace(ackToken) == "" {
+			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing ack token"}
+		}
+		deltaBytes, recvMS, syncMS, err := parseAckTelemetryFields(p["delta-bytes"], p["recv-ms"], p["sync-ms"])
+		if err != nil {
+			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK telemetry"}
+		}
+		path := p["path"]
+		if path == "" {
+			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing path"}
+		}
+		items = append(items, ackItem{
+			TransferID: txferID,
+			FileID:     fid,
+			AckToken:   ackToken,
+			DeltaBytes: deltaBytes,
+			RecvMS:     recvMS,
+			SyncMS:     syncMS,
+			Path:       path,
+		})
 	}
-	fid, err := strconv.ParseUint(p["fid"], 10, 64)
-	if err != nil {
-		return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid file id"}
-	}
-	ackToken := p["ack-token"]
-	if strings.TrimSpace(ackToken) == "" {
-		return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing ack token"}
-	}
-	deltaBytes, recvMS, syncMS, err := parseAckTelemetryQuery(url.Values{
-		"delta-bytes": []string{p["delta-bytes"]},
-		"recv-ms":     []string{p["recv-ms"]},
-		"sync-ms":     []string{p["sync-ms"]},
-	}, 0)
-	if ackToken == "-1" {
-		deltaBytes, recvMS, syncMS = 0, 0, 0
-		err = nil
-	}
-	if err != nil {
-		return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK telemetry"}
-	}
-	path := p["path"]
-	if path == "" {
-		return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing path"}
-	}
-	return ackRequest{
-		TransferID: txferID,
-		FileID:     fid,
-		AckToken:   ackToken,
-		DeltaBytes: deltaBytes,
-		RecvMS:     recvMS,
-		SyncMS:     syncMS,
-		Path:       path,
-	}, nil
+	return ackRequest{Items: items}, nil
 }
 
 func handleACK(_ context.Context, req Request, out io.Writer, deps Deps) error {
@@ -75,71 +80,85 @@ func handleACK(_ context.Context, req Request, out io.Writer, deps Deps) error {
 	if err != nil {
 		return err
 	}
-	ackBytes, ackTS, ackHashToken, ackProvided, err := parseAckToken(parsed.AckToken)
-	if err != nil || !ackProvided {
-		return protocolErr{code: "BAD_REQUEST", message: "invalid ack token"}
-	}
-
-	fileRef, err := deps.GetFileRef(parsed.TransferID, parsed.FileID, parsed.Path)
-	if err != nil {
-		return mapLookupError(err)
-	}
-
-	maxAck := fileRef.FileSize
-	ackTarget := ackBytes
-	if ackTarget > maxAck {
-		ackTarget = maxAck
-	}
-	if ackTarget < 0 {
-		ackTarget = 0
-	}
-	if ackBytes >= 0 {
-		if ackHashToken == "" {
-			return protocolErr{code: "BAD_REQUEST", message: "missing window ack hash token"}
+	validated := make([]validatedAckItem, 0, len(parsed.Items))
+	for _, item := range parsed.Items {
+		ackBytes, ackTS, ackHashToken, ackProvided, err := parseAckToken(item.AckToken)
+		if err != nil || !ackProvided {
+			return protocolErr{code: "BAD_REQUEST", message: "invalid ack token"}
 		}
-		if !deps.VerifyTransferFileWindowHash(parsed.TransferID, parsed.FileID, ackTarget, ackHashToken) {
-			return protocolErr{code: "CONFLICT", message: "window ack hash token mismatch"}
+		if ackBytes == -1 {
+			item.DeltaBytes, item.RecvMS, item.SyncMS = 0, 0, 0
 		}
-	}
-	if ok := deps.AcknowledgeTransferFile(parsed.TransferID, parsed.FileID, ackBytes); !ok {
-		return protocolErr{code: "INTERNAL", message: "failed to acknowledge file progress"}
-	}
 
-	if ackBytes >= 0 {
-		nowTS := time.Now().UnixMilli()
-		lagMS := nowTS - ackTS
-		receiverMS := parsed.RecvMS + parsed.SyncMS
-		receiverBps := 0.0
-		recvBps := 0.0
-		syncBps := 0.0
-		if parsed.DeltaBytes > 0 {
-			if receiverMS > 0 {
-				receiverBps = float64(parsed.DeltaBytes) / (float64(receiverMS) / 1000.0)
+		fileRef, err := deps.GetFileRef(item.TransferID, item.FileID, item.Path)
+		if err != nil {
+			return mapLookupError(err)
+		}
+
+		maxAck := fileRef.FileSize
+		ackTarget := ackBytes
+		if ackTarget > maxAck {
+			ackTarget = maxAck
+		}
+		if ackTarget < 0 {
+			ackTarget = 0
+		}
+		if ackBytes >= 0 {
+			if ackHashToken == "" {
+				return protocolErr{code: "BAD_REQUEST", message: "missing window ack hash token"}
 			}
-			if parsed.RecvMS > 0 {
-				recvBps = float64(parsed.DeltaBytes) / (float64(parsed.RecvMS) / 1000.0)
-			}
-			if parsed.SyncMS > 0 {
-				syncBps = float64(parsed.DeltaBytes) / (float64(parsed.SyncMS) / 1000.0)
+			if !deps.VerifyTransferFileWindowHash(item.TransferID, item.FileID, ackTarget, ackHashToken) {
+				return protocolErr{code: "CONFLICT", message: "window ack hash token mismatch"}
 			}
 		}
-		log.Printf(
-			"filexfer ack tid=%s fid=%d ack_bytes=%d ack_hash=%s acked_server_ts=%d ack_recv_ts=%d lag_ms=%d delta_bytes=%d recv_ms=%d sync_ms=%d receiver_ms=%d receiver_throughput=%s recv_throughput=%s sync_throughput=%s",
-			parsed.TransferID,
-			parsed.FileID,
-			ackBytes,
-			ackHashToken,
-			ackTS,
-			nowTS,
-			lagMS,
-			parsed.DeltaBytes,
-			parsed.RecvMS,
-			parsed.SyncMS,
-			receiverMS,
-			intencoding.HumanRate(receiverBps),
-			intencoding.HumanRate(recvBps),
-			intencoding.HumanRate(syncBps),
-		)
+		validated = append(validated, validatedAckItem{
+			item:         item,
+			ackBytes:     ackBytes,
+			ackTS:        ackTS,
+			ackHashToken: ackHashToken,
+		})
+	}
+
+	for _, v := range validated {
+		if ok := deps.AcknowledgeTransferFile(v.item.TransferID, v.item.FileID, v.ackBytes); !ok {
+			return protocolErr{code: "INTERNAL", message: "failed to acknowledge file progress"}
+		}
+		if v.ackBytes >= 0 {
+			nowTS := time.Now().UnixMilli()
+			lagMS := nowTS - v.ackTS
+			receiverMS := v.item.RecvMS + v.item.SyncMS
+			receiverBps := 0.0
+			recvBps := 0.0
+			syncBps := 0.0
+			if v.item.DeltaBytes > 0 {
+				if receiverMS > 0 {
+					receiverBps = float64(v.item.DeltaBytes) / (float64(receiverMS) / 1000.0)
+				}
+				if v.item.RecvMS > 0 {
+					recvBps = float64(v.item.DeltaBytes) / (float64(v.item.RecvMS) / 1000.0)
+				}
+				if v.item.SyncMS > 0 {
+					syncBps = float64(v.item.DeltaBytes) / (float64(v.item.SyncMS) / 1000.0)
+				}
+			}
+			log.Printf(
+				"filexfer ack tid=%s fid=%d ack_bytes=%d ack_hash=%s acked_server_ts=%d ack_recv_ts=%d lag_ms=%d delta_bytes=%d recv_ms=%d sync_ms=%d receiver_ms=%d receiver_throughput=%s recv_throughput=%s sync_throughput=%s",
+				v.item.TransferID,
+				v.item.FileID,
+				v.ackBytes,
+				v.ackHashToken,
+				v.ackTS,
+				nowTS,
+				lagMS,
+				v.item.DeltaBytes,
+				v.item.RecvMS,
+				v.item.SyncMS,
+				receiverMS,
+				intencoding.HumanRate(receiverBps),
+				intencoding.HumanRate(recvBps),
+				intencoding.HumanRate(syncBps),
+			)
+		}
 	}
 	return writeOKLine(out, "")
 }
@@ -173,27 +192,33 @@ func parseAckToken(raw string) (ackBytes int64, ackTS int64, ackHashToken string
 	return ackBytes, ackTS, ackHashToken, true, nil
 }
 
-func parseAckTelemetryQuery(values url.Values, ackBytes int64) (deltaBytes int64, recvMS int64, syncMS int64, err error) {
-	if ackBytes < 0 {
-		return 0, 0, 0, nil
+func parseAckTelemetryFields(deltaRaw string, recvRaw string, syncRaw string) (deltaBytes int64, recvMS int64, syncMS int64, err error) {
+	deltaRaw = strings.TrimSpace(deltaRaw)
+	recvRaw = strings.TrimSpace(recvRaw)
+	syncRaw = strings.TrimSpace(syncRaw)
+	if deltaRaw == "" {
+		deltaBytes = 0
+	} else {
+		deltaBytes, err = strconv.ParseInt(deltaRaw, 10, 64)
+		if err != nil || deltaBytes < 0 {
+			return 0, 0, 0, fmt.Errorf("invalid delta-bytes")
+		}
 	}
-	deltaRaw := strings.TrimSpace(values.Get("delta-bytes"))
-	recvRaw := strings.TrimSpace(values.Get("recv-ms"))
-	syncRaw := strings.TrimSpace(values.Get("sync-ms"))
-	if deltaRaw == "" || recvRaw == "" || syncRaw == "" {
-		return 0, 0, 0, fmt.Errorf("missing required ack telemetry")
+	if recvRaw == "" {
+		recvMS = 0
+	} else {
+		recvMS, err = strconv.ParseInt(recvRaw, 10, 64)
+		if err != nil || recvMS < 0 {
+			return 0, 0, 0, fmt.Errorf("invalid recv-ms")
+		}
 	}
-	deltaBytes, err = strconv.ParseInt(deltaRaw, 10, 64)
-	if err != nil || deltaBytes < 0 {
-		return 0, 0, 0, fmt.Errorf("invalid delta-bytes")
-	}
-	recvMS, err = strconv.ParseInt(recvRaw, 10, 64)
-	if err != nil || recvMS < 0 {
-		return 0, 0, 0, fmt.Errorf("invalid recv-ms")
-	}
-	syncMS, err = strconv.ParseInt(syncRaw, 10, 64)
-	if err != nil || syncMS < 0 {
-		return 0, 0, 0, fmt.Errorf("invalid sync-ms")
+	if syncRaw == "" {
+		syncMS = 0
+	} else {
+		syncMS, err = strconv.ParseInt(syncRaw, 10, 64)
+		if err != nil || syncMS < 0 {
+			return 0, 0, 0, fmt.Errorf("invalid sync-ms")
+		}
 	}
 	return deltaBytes, recvMS, syncMS, nil
 }
