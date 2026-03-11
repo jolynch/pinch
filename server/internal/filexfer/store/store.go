@@ -3,7 +3,6 @@ package store
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jolynch/pinch/internal/filexfer/codec"
+	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/jolynch/pinch/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 )
@@ -741,18 +740,6 @@ func GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileR
 	return fd, ref, nil
 }
 
-func writeLookupErr(w http.ResponseWriter, err error) {
-	if err == nil {
-		return
-	}
-	var lookupErr *FileLookupError
-	if errors.As(err, &lookupErr) {
-		http.Error(w, lookupErr.Msg, lookupErr.Code)
-		return
-	}
-	http.Error(w, "internal server error", http.StatusInternalServerError)
-}
-
 func GetTransferFileStates(txferID string) ([]TransferFileState, bool) {
 	return manager.getFileStates(txferID)
 }
@@ -830,7 +817,7 @@ func transferID() (string, error) {
 }
 
 func formatXXH128HashToken(v xxh3.Uint128) string {
-	return codec.FormatXXH128HashToken(v)
+	return intencoding.FormatXXH128HashToken(v)
 }
 
 func pathWithinRoot(root string, p string) bool {

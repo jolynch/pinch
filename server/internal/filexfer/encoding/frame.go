@@ -1,4 +1,4 @@
-package frame
+package encoding
 
 import (
 	"errors"
@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jolynch/pinch/internal/filexfer/codec"
 	"github.com/zeebo/xxh3"
 )
 
@@ -24,8 +23,6 @@ type FileFrameMetadata struct {
 	User    string
 	Group   string
 }
-
-type fileFrameMetadata = FileFrameMetadata
 
 func CollectFileFrameMetadata(path string, info os.FileInfo) FileFrameMetadata {
 	meta := FileFrameMetadata{
@@ -49,10 +46,6 @@ func CollectFileFrameMetadata(path string, info os.FileInfo) FileFrameMetadata {
 	}
 	_ = path
 	return meta
-}
-
-func collectFileFrameMetadata(path string, info os.FileInfo) fileFrameMetadata {
-	return CollectFileFrameMetadata(path, info)
 }
 
 func (m FileFrameMetadata) trailerTokens() []string {
@@ -85,14 +78,10 @@ type WriteArgs struct {
 	Metadata     *FileFrameMetadata
 }
 
-type frameWriteArgs = WriteArgs
-
 type WriteStats struct {
 	WriteLatency      time.Duration
 	WireThroughputBps float64
 }
-
-type frameWriteStats = WriteStats
 
 func WriteFrame(w io.Writer, args WriteArgs) (WriteStats, error) {
 	start := time.Now()
@@ -159,10 +148,6 @@ func WriteFrame(w io.Writer, args WriteArgs) (WriteStats, error) {
 		WriteLatency:      writeLatency,
 		WireThroughputBps: wireBps,
 	}, nil
-}
-
-func writeFrame(w io.Writer, args frameWriteArgs) (frameWriteStats, error) {
-	return WriteFrame(w, args)
 }
 
 type FileFrameMeta struct {
@@ -348,8 +333,8 @@ func DecodePayloadReaderByComp(payload io.Reader, comp string) (io.ReadCloser, e
 	switch comp {
 	case "none":
 		return io.NopCloser(payload), nil
-	case codec.EncodingZstd, codec.EncodingLz4:
-		reader, err := codec.WrapDecompressedReader(payload, comp)
+	case EncodingZstd, EncodingLz4:
+		reader, err := WrapDecompressedReader(payload, comp)
 		if err != nil {
 			return nil, err
 		}

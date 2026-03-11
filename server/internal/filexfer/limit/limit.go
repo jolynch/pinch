@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
+	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 	"golang.org/x/time/rate"
 )
 
@@ -30,71 +30,75 @@ type fileStreamLimitConfig struct {
 	TimeLimit  time.Duration
 }
 
-type FileStreamLimitState = fileStreamLimitState
 type FileStreamLimitConfig = fileStreamLimitConfig
 
-var fileStreamLimiterState atomic.Pointer[fileStreamLimitState]
-
-func ConfigureFileStreamLimiter(rateRaw string, burstRaw string, timeLimit time.Duration) error {
-	parsedRateBps, err := parseRateBytesPerSecond(rateRaw)
-	if err != nil {
-		return fmt.Errorf("invalid rate: %w", err)
-	}
-	parsedBurstBytes, err := parseByteSize(burstRaw)
-	if err != nil {
-		return fmt.Errorf("invalid burst: %w", err)
-	}
-	if parsedRateBps > 0 && parsedBurstBytes <= 0 {
-		return errors.New("burst must be > 0 when rate limiting is enabled")
-	}
-	return configureFileStreamLimits(fileStreamLimitConfig{
-		RateBps:    parsedRateBps,
-		BurstBytes: parsedBurstBytes,
-		TimeLimit:  timeLimit,
-	})
+type Config struct {
+	Rate      string
+	Burst     string
+	TimeLimit time.Duration
 }
 
-func configureFileStreamLimits(cfg fileStreamLimitConfig) error {
+type Limiter struct {
+	state fileStreamLimitState
+}
+
+func NewLimiter(cfg Config) (*Limiter, error) {
+	parsedRateBps, err := parseRateBytesPerSecond(cfg.Rate)
+	if err != nil {
+		return nil, fmt.Errorf("invalid rate: %w", err)
+	}
+	parsedBurstBytes, err := intencoding.ParseByteSize(cfg.Burst)
+	if err != nil {
+		return nil, fmt.Errorf("invalid burst: %w", err)
+	}
+	state, err := newFileStreamLimitState(fileStreamLimitConfig{
+		RateBps:    parsedRateBps,
+		BurstBytes: parsedBurstBytes,
+		TimeLimit:  cfg.TimeLimit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Limiter{state: state}, nil
+}
+
+func newFileStreamLimitState(cfg fileStreamLimitConfig) (fileStreamLimitState, error) {
 	if cfg.RateBps < 0 {
-		return errors.New("file stream rate must be >= 0")
+		return fileStreamLimitState{}, errors.New("file stream rate must be >= 0")
 	}
 	if cfg.BurstBytes < 0 {
-		return errors.New("file stream burst must be >= 0")
+		return fileStreamLimitState{}, errors.New("file stream burst must be >= 0")
 	}
 	if cfg.TimeLimit < 0 {
-		return errors.New("file stream time limit must be >= 0")
+		return fileStreamLimitState{}, errors.New("file stream time limit must be >= 0")
 	}
 	if cfg.RateBps > 0 && cfg.BurstBytes <= 0 {
-		return errors.New("file stream burst must be > 0 when rate limiting is enabled")
+		return fileStreamLimitState{}, errors.New("burst must be > 0 when rate limiting is enabled")
 	}
 
-	state := &fileStreamLimitState{cfg: cfg}
+	state := fileStreamLimitState{cfg: cfg}
 	if cfg.RateBps > 0 {
 		state.bucket = rate.NewLimiter(rate.Limit(float64(cfg.RateBps)), int(cfg.BurstBytes))
 	}
-	fileStreamLimiterState.Store(state)
-	return nil
+	return state, nil
 }
 
-func ConfigureFileStreamLimits(cfg FileStreamLimitConfig) error {
-	return configureFileStreamLimits(cfg)
-}
-
-func currentFileStreamLimitState() fileStreamLimitState {
-	if state := fileStreamLimiterState.Load(); state != nil {
-		return *state
+func (l *Limiter) WrapRateLimitedWriter(w io.Writer, ctx context.Context) *RateLimitedWriter {
+	if l == nil {
+		return wrapRateLimitedWriter(w, ctx, fileStreamLimitState{})
 	}
-	return fileStreamLimitState{
-		cfg: fileStreamLimitConfig{},
+	return wrapRateLimitedWriter(w, ctx, l.state)
+}
+
+func (l *Limiter) Config() FileStreamLimitConfig {
+	if l == nil {
+		return FileStreamLimitConfig{}
 	}
+	return l.state.cfg
 }
 
-func CurrentFileStreamLimitState() FileStreamLimitState {
-	return currentFileStreamLimitState()
-}
-
-type limitedResponseWriter struct {
-	w         http.ResponseWriter
+type rateLimitedWriter struct {
+	w         io.Writer
 	ctx       context.Context
 	bucket    *rate.Limiter
 	deadline  time.Time
@@ -102,10 +106,10 @@ type limitedResponseWriter struct {
 	wroteBody bool
 }
 
-type LimitedResponseWriter = limitedResponseWriter
+type RateLimitedWriter = rateLimitedWriter
 
-func wrapLimitedResponseWriter(w http.ResponseWriter, ctx context.Context, state fileStreamLimitState) *limitedResponseWriter {
-	lw := &limitedResponseWriter{
+func wrapRateLimitedWriter(w io.Writer, ctx context.Context, state fileStreamLimitState) *rateLimitedWriter {
+	lw := &rateLimitedWriter{
 		w:      w,
 		ctx:    ctx,
 		bucket: state.bucket,
@@ -117,19 +121,7 @@ func wrapLimitedResponseWriter(w http.ResponseWriter, ctx context.Context, state
 	return lw
 }
 
-func WrapLimitedResponseWriter(w http.ResponseWriter, ctx context.Context, state FileStreamLimitState) *LimitedResponseWriter {
-	return wrapLimitedResponseWriter(w, ctx, state)
-}
-
-func (w *limitedResponseWriter) Header() http.Header {
-	return w.w.Header()
-}
-
-func (w *limitedResponseWriter) WriteHeader(statusCode int) {
-	w.w.WriteHeader(statusCode)
-}
-
-func (w *limitedResponseWriter) Write(p []byte) (int, error) {
+func (w *rateLimitedWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -148,17 +140,11 @@ func (w *limitedResponseWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (w *limitedResponseWriter) Flush() {
-	if fl, ok := w.w.(http.Flusher); ok {
-		fl.Flush()
-	}
-}
-
-func (w *limitedResponseWriter) wroteAnyBody() bool {
+func (w *rateLimitedWriter) wroteAnyBody() bool {
 	return w.wroteBody
 }
 
-func (w *limitedResponseWriter) WroteAnyBody() bool {
+func (w *rateLimitedWriter) WroteAnyBody() bool {
 	return w.wroteAnyBody()
 }
 
@@ -229,32 +215,6 @@ func parseRateBytesPerSecond(raw string) (int64, error) {
 		}
 		return floatToInt64(value * mult)
 	}
-}
-
-func parseByteSize(raw string) (int64, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return 0, errors.New("size is required")
-	}
-	value, unit, err := parseHumanValueAndUnit(raw)
-	if err != nil {
-		return 0, err
-	}
-	if value < 0 {
-		return 0, errors.New("size must be >= 0")
-	}
-	if unit == "" {
-		return floatToInt64(value)
-	}
-	mult, ok := byteUnitMultiplier(strings.ToLower(strings.TrimSpace(unit)))
-	if !ok {
-		return 0, fmt.Errorf("unsupported size unit: %s", unit)
-	}
-	return floatToInt64(value * mult)
-}
-
-func ParseByteSize(raw string) (int64, error) {
-	return parseByteSize(raw)
 }
 
 func parseHumanValueAndUnit(raw string) (float64, string, error) {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	intframe "github.com/jolynch/pinch/internal/filexfer/frame"
+	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 )
 
 type ackRequest struct {
@@ -136,9 +136,9 @@ func handleACK(_ context.Context, req Request, out io.Writer, deps Deps) error {
 			parsed.RecvMS,
 			parsed.SyncMS,
 			receiverMS,
-			humanRate(receiverBps),
-			humanRate(recvBps),
-			humanRate(syncBps),
+			intencoding.HumanRate(receiverBps),
+			intencoding.HumanRate(recvBps),
+			intencoding.HumanRate(syncBps),
 		)
 	}
 	return writeOKLine(out, "")
@@ -166,7 +166,7 @@ func parseAckToken(raw string) (ackBytes int64, ackTS int64, ackHashToken string
 	}
 	if len(parts) == 3 {
 		ackHashToken = strings.TrimSpace(parts[2])
-		if !intframe.ValidHashToken(ackHashToken) {
+		if !intencoding.ValidHashToken(ackHashToken) {
 			return 0, 0, "", true, fmt.Errorf("invalid ack hash token")
 		}
 	}

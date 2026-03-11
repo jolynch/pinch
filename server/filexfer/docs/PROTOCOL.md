@@ -1,6 +1,6 @@
 # FTCP Protocol (`-file-listen`)
 
-This document defines the TCP file-transfer command protocol implemented by `internal/filexfer/ftcp`.
+This document defines the TCP file-transfer command protocol implemented by Pinch.
 
 ## Transport
 

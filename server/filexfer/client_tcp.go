@@ -2,7 +2,6 @@ package filexfer
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -36,13 +35,16 @@ func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
 	}
 	dialer := c.contextDialer
 	if dialer == nil {
-		dialer := net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return nil, err
 		}
 		if tc, ok := conn.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
+			if c.SocketReadBufferBytes > 0 {
+				_ = tc.SetReadBuffer(c.SocketReadBufferBytes)
+			}
 		}
 		return conn, nil
 	}
@@ -52,6 +54,9 @@ func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
+		if c.SocketReadBufferBytes > 0 {
+			_ = tc.SetReadBuffer(c.SocketReadBufferBytes)
+		}
 	}
 	return conn, nil
 }
@@ -154,17 +159,6 @@ func encodeAUTHBlobToken(blob []byte, encrypted bool) string {
 	return quoteToken(string(blob))
 }
 
-func decodeAUTHBlobToken(raw string) ([]byte, error) {
-	if strings.HasPrefix(raw, "b64:") {
-		decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(raw, "b64:"))
-		if err != nil {
-			return nil, err
-		}
-		return decoded, nil
-	}
-	return []byte(raw), nil
-}
-
 func (c *Client) resolveTCPAuthState(requestPub string, requestIdentity string) (tcpAuthState, error) {
 	state := tcpAuthState{}
 	requestPub = strings.TrimSpace(requestPub)
@@ -219,8 +213,9 @@ func (c *Client) sendTCPAuth(conn net.Conn, state tcpAuthState) error {
 		if err != nil {
 			return err
 		}
-		var encrypted bytes.Buffer
-		ew, err := age.Encrypt(&encrypted, recipient)
+		encrypted := c.acquireScratchBuffer()
+		defer c.releaseScratchBuffer(encrypted)
+		ew, err := age.Encrypt(encrypted, recipient)
 		if err != nil {
 			return err
 		}
@@ -302,7 +297,8 @@ func (c *Client) fetchManifestTCP(ctx context.Context, request FetchManifestRequ
 	}
 	br := bufio.NewReader(responseReader)
 
-	var raw bytes.Buffer
+	raw := c.acquireScratchBuffer()
+	defer c.releaseScratchBuffer(raw)
 	for {
 		line, err := readTCPLine(br, maxTCPLineBytes)
 		if err != nil {

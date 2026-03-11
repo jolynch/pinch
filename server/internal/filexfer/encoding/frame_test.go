@@ -1,4 +1,4 @@
-package frame
+package encoding
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 func TestWriteFrameReturnsStats(t *testing.T) {
 	w := httptest.NewRecorder()
 	payload := bytes.Repeat([]byte("x"), 1<<20)
-	stats, err := writeFrame(w, frameWriteArgs{
+	stats, err := WriteFrame(w, WriteArgs{
 		FileID:     1,
 		Offset:     0,
 		Size:       int64(len(payload)),
@@ -25,7 +25,7 @@ func TestWriteFrameReturnsStats(t *testing.T) {
 		Next:       0,
 	})
 	if err != nil {
-		t.Fatalf("writeFrame failed: %v", err)
+		t.Fatalf("WriteFrame failed: %v", err)
 	}
 	if stats.WriteLatency <= 0 {
 		t.Fatalf("expected positive write latency, got %v", stats.WriteLatency)

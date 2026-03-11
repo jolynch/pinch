@@ -77,23 +77,6 @@ func loadServerAgeIdentity(dir string) (*age.X25519Identity, error) {
 	return identity, nil
 }
 
-func maxSocketWriteBufferBytes() int {
-	// 4MiB baseline if kernel cap cannot be read.
-	const baseline = 4 * 1024 * 1024
-	raw, err := os.ReadFile("/proc/sys/net/core/wmem_max")
-	if err != nil {
-		return baseline
-	}
-	v, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || v <= 0 {
-		return baseline
-	}
-	if v > baseline {
-		return v
-	}
-	return baseline
-}
-
 func compress(
 	fifos utils.FifoPair,
 	timeout time.Duration,
@@ -715,17 +698,22 @@ func main() {
 	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
 	flag.StringVar(&keysDir, "keys", keysDir, "The directory to create output pipes in")
 	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
-	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should buffers be")
-	flag.StringVar(&fsFileRate, "fs-file-rate", fsFileRate, "Global /fs/file rate limit (examples: 100MiB, 1000mbps). Empty/0 disables limiting")
-	flag.StringVar(&fsFileBurst, "fs-file-rate-burst", fsFileBurst, "Token-bucket burst for /fs/file rate limit (examples: 1MiB, 4MB)")
-	fsFileTimeLimit := flag.Duration("fs-file-time-limit", 0, "Per-request wall-clock limit for GET /fs/file (0 disables)")
+	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should pipe buffers be")
+	flag.StringVar(&fsFileRate, "fs-file-rate", fsFileRate, "Global file-listener response rate limit (examples: 100MiB, 1000mbps). Empty/0 disables limiting")
+	flag.StringVar(&fsFileBurst, "fs-file-rate-burst", fsFileBurst, "Token-bucket burst for file-listener response rate limit (examples: 1MiB, 4MB)")
+	fsFileTimeLimit := flag.Duration("fs-file-time-limit", 0, "Per-request wall-clock limit for file-listener responses (0 disables)")
 	fsRequireAuth := flag.Bool("fs-require-auth", false, "Require AUTH before using file-listen commands")
 	dieAfter := flag.Duration("die-after", 0, "Die after this duration. Zero seconds indicates live forever")
 
 	flag.Parse()
 
-	if err := limit.ConfigureFileStreamLimiter(fsFileRate, fsFileBurst, *fsFileTimeLimit); err != nil {
-		log.Fatalf("Invalid file stream limiter configuration: %v", err)
+	fileStreamLimiter, limiterErr := limit.NewLimiter(limit.Config{
+		Rate:      fsFileRate,
+		Burst:     fsFileBurst,
+		TimeLimit: *fsFileTimeLimit,
+	})
+	if limiterErr != nil {
+		log.Fatalf("Invalid file stream limiter configuration: %v", limiterErr)
 	}
 
 	if !makeDirs(inputDir) {
@@ -759,6 +747,8 @@ func main() {
 	mux.HandleFunc("/unpinch", unpinch)
 	mux.HandleFunc("/io/", handleIO)
 	mux.HandleFunc("/status/", getStatus)
+	socketWriteBufBytes := utils.MaxSocketWriteBufferBytes()
+	log.Printf("Detected ideal socket write buffer of size %d", socketWriteBufBytes)
 
 	fileLn, err := net.Listen("tcp", fileListener)
 	if err != nil {
@@ -768,8 +758,10 @@ func main() {
 	go func() {
 		log.Printf("File transfer listener at %s", fileListener)
 		if serveErr := ftcp.Serve(fileLn, ftcp.ServerOptions{
-			RequireAuth:    *fsRequireAuth,
-			ServerIdentity: serverKey,
+			RequireAuth:            *fsRequireAuth,
+			ServerIdentity:         serverKey,
+			Limiter:                fileStreamLimiter,
+			SocketWriteBufferBytes: socketWriteBufBytes,
 		}); serveErr != nil {
 			log.Fatalf("File transfer listener stopped: %v", serveErr)
 		}
@@ -780,8 +772,6 @@ func main() {
 	}
 
 	log.Printf("Listening at %s/pinch", listen)
-	socketWriteBufBytes := maxSocketWriteBufferBytes()
-	log.Printf("Detected ideal socket write buffer of size %d", socketWriteBufBytes)
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           mux,

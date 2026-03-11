@@ -1,4 +1,4 @@
-package codec
+package encoding
 
 import (
 	"encoding/hex"
@@ -28,6 +28,8 @@ type zstdMaxEncodedSizeCache struct {
 }
 
 var zstdMaxSizer zstdMaxEncodedSizeCache
+var zstdDecoderPool sync.Pool
+var lz4ReaderPool sync.Pool
 
 func (c *zstdMaxEncodedSizeCache) maxEncodedSize(n int) (int, error) {
 	c.once.Do(func() {
@@ -136,16 +138,97 @@ func WrapDecompressedReader(src io.Reader, contentEncoding string) (io.ReadClose
 	case "", EncodingIdentity:
 		return io.NopCloser(src), nil
 	case EncodingZstd:
-		zr, err := zstd.NewReader(src)
+		zr, err := acquirePooledZstdDecoder(src)
 		if err != nil {
 			return nil, err
 		}
-		return zr.IOReadCloser(), nil
+		return &pooledZstdReadCloser{decoder: zr}, nil
 	case EncodingLz4:
-		return io.NopCloser(lz4.NewReader(src)), nil
+		return &pooledLZ4ReadCloser{reader: acquirePooledLZ4Reader(src)}, nil
 	default:
 		return nil, errors.New("unsupported content encoding")
 	}
+}
+
+type pooledZstdReadCloser struct {
+	decoder *zstd.Decoder
+}
+
+func (r *pooledZstdReadCloser) Read(p []byte) (int, error) {
+	if r == nil || r.decoder == nil {
+		return 0, io.EOF
+	}
+	return r.decoder.Read(p)
+}
+
+func (r *pooledZstdReadCloser) Close() error {
+	if r == nil || r.decoder == nil {
+		return nil
+	}
+	releasePooledZstdDecoder(r.decoder)
+	r.decoder = nil
+	return nil
+}
+
+type pooledLZ4ReadCloser struct {
+	reader *lz4.Reader
+}
+
+func (r *pooledLZ4ReadCloser) Read(p []byte) (int, error) {
+	if r == nil || r.reader == nil {
+		return 0, io.EOF
+	}
+	return r.reader.Read(p)
+}
+
+func (r *pooledLZ4ReadCloser) Close() error {
+	if r == nil || r.reader == nil {
+		return nil
+	}
+	releasePooledLZ4Reader(r.reader)
+	r.reader = nil
+	return nil
+}
+
+func acquirePooledZstdDecoder(src io.Reader) (*zstd.Decoder, error) {
+	if raw := zstdDecoderPool.Get(); raw != nil {
+		if decoder, ok := raw.(*zstd.Decoder); ok && decoder != nil {
+			if err := decoder.Reset(src); err == nil {
+				return decoder, nil
+			}
+			decoder.Close()
+		}
+	}
+	return zstd.NewReader(src)
+}
+
+func releasePooledZstdDecoder(decoder *zstd.Decoder) {
+	if decoder == nil {
+		return
+	}
+	if err := decoder.Reset(nil); err != nil {
+		decoder.Close()
+		return
+	}
+	zstdDecoderPool.Put(decoder)
+}
+
+func acquirePooledLZ4Reader(src io.Reader) *lz4.Reader {
+	if raw := lz4ReaderPool.Get(); raw != nil {
+		if reader, ok := raw.(*lz4.Reader); ok && reader != nil {
+			reader.Reset(src)
+			return reader
+		}
+	}
+	return lz4.NewReader(src)
+}
+
+func releasePooledLZ4Reader(reader *lz4.Reader) {
+	if reader == nil {
+		return
+	}
+	reader.Reset(nil)
+	lz4ReaderPool.Put(reader)
 }
 
 func MaxFrameWireSizeHintBytes(comp string, logicalSize int64) (int64, error) {
@@ -201,10 +284,6 @@ func ceilingMaxWSizeBucketBytes(size int64) int64 {
 		return maxWSizeBucket32MiB
 	}
 	return maxWSizeBucket64MiB
-}
-
-func maxFrameWireSizeHintBytes(comp string, logicalSize int64) (int64, error) {
-	return MaxFrameWireSizeHintBytes(comp, logicalSize)
 }
 
 func maxEncodedFrameSizeBytes(comp string, logicalSize int64) (int64, error) {

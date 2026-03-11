@@ -17,12 +17,10 @@ import (
 	"time"
 
 	"filippo.io/age"
-	intcodec "github.com/jolynch/pinch/internal/filexfer/codec"
+	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 	"github.com/zeebo/xxh3"
 )
-
-const defaultCLIEncodings = "zstd,lz4,identity"
 
 type ftcpTestServer struct {
 	URL      string
@@ -130,13 +128,54 @@ func readCompatLine(br *bufio.Reader) (string, error) {
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
+func TestNewClientOptions(t *testing.T) {
+	t.Setenv("PINCH_FILE_SERVER_AGE_PUBLIC_KEY", "age1envvalue")
+	dialer := func(context.Context, string) (net.Conn, error) { return nil, errors.New("unused") }
+
+	client := NewClient(
+		" 127.0.0.1:3453 ",
+		WithServerAgePublicKey(""),
+		WithFileRequestWindowBytes(123),
+		WithFrameBufferBytes(456),
+		WithMaxFrameReadBufferBytes(789),
+		WithAckRequestTimeout(2*time.Second),
+		WithSocketReadBufferBytes(321),
+		WithContextDialer(dialer),
+	)
+
+	if client.FileAddr != "127.0.0.1:3453" {
+		t.Fatalf("unexpected file addr: %q", client.FileAddr)
+	}
+	if client.ServerAgePublicKey != "" {
+		t.Fatalf("expected option to override env, got %q", client.ServerAgePublicKey)
+	}
+	if client.FileRequestWindowBytes != 123 {
+		t.Fatalf("unexpected file request window bytes: %d", client.FileRequestWindowBytes)
+	}
+	if client.FrameBufferBytes != 456 {
+		t.Fatalf("unexpected frame buffer bytes: %d", client.FrameBufferBytes)
+	}
+	if client.MaxFrameReadBufferBytes != 789 {
+		t.Fatalf("unexpected max frame read buffer bytes: %d", client.MaxFrameReadBufferBytes)
+	}
+	if client.AckRequestTimeout != 2*time.Second {
+		t.Fatalf("unexpected ack request timeout: %s", client.AckRequestTimeout)
+	}
+	if client.SocketReadBufferBytes != 321 {
+		t.Fatalf("unexpected socket read buffer bytes: %d", client.SocketReadBufferBytes)
+	}
+	if client.contextDialer == nil {
+		t.Fatalf("expected context dialer to be configured")
+	}
+}
+
 func encodeSingleFramePayload(data []byte, comp string) ([]byte, error) {
 	switch comp {
 	case "none":
 		return data, nil
 	case EncodingZstd, EncodingLz4:
 		var buf bytes.Buffer
-		out, closeEncoded, _, err := intcodec.WrapCompressedWriter(&buf, comp)
+		out, closeEncoded, _, err := intencoding.WrapCompressedWriter(&buf, comp)
 		if err != nil {
 			return nil, err
 		}
@@ -174,7 +213,7 @@ func frameHash64Token(header string, payload []byte, trailerPrefix string) strin
 		_, _ = h.Write(payload)
 	}
 	_, _ = h.Write([]byte(trailerPrefix))
-	return intcodec.FormatXXH64HashToken(h.Sum64())
+	return intencoding.FormatXXH64HashToken(h.Sum64())
 }
 
 func buildFXFrame(t *testing.T, fileID uint64, comp string, offset int64, logical []byte, next *int64) string {
@@ -716,10 +755,9 @@ func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 
 	client := NewClient(srv.URL)
 	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-		Manifest:       manifest,
-		FileID:         0,
-		OutRoot:        outRoot,
-		AcceptEncoding: defaultCLIEncodings,
+		Manifest: manifest,
+		FileID:   0,
+		OutRoot:  outRoot,
 	})
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
@@ -767,10 +805,9 @@ func TestDownloadFileFromManifestAppliesModeAfterVerify(t *testing.T) {
 
 	client := NewClient(srv.URL)
 	resp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-		Manifest:       manifest,
-		FileID:         0,
-		OutRoot:        outRoot,
-		AcceptEncoding: defaultCLIEncodings,
+		Manifest: manifest,
+		FileID:   0,
+		OutRoot:  outRoot,
 	})
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
@@ -810,10 +847,9 @@ func TestDownloadFileFromManifestMetadataStrictFailure(t *testing.T) {
 
 	client := NewClient(srv.URL)
 	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-		Manifest:       manifest,
-		FileID:         0,
-		OutRoot:        outRoot,
-		AcceptEncoding: defaultCLIEncodings,
+		Manifest: manifest,
+		FileID:   0,
+		OutRoot:  outRoot,
 	})
 	if err == nil || !strings.Contains(err.Error(), "invalid trailer uid") {
 		t.Fatalf("expected strict metadata failure, got %v", err)
@@ -849,7 +885,6 @@ func TestDownloadFileFromManifestMetadataBestEffort(t *testing.T) {
 		Manifest:                manifest,
 		FileID:                  0,
 		OutRoot:                 outRoot,
-		AcceptEncoding:          defaultCLIEncodings,
 		MetadataApplyBestEffort: true,
 	})
 	if err != nil {
@@ -884,10 +919,9 @@ func TestDownloadFileFromManifestVerifiesBeforeMetadataApply(t *testing.T) {
 
 	client := NewClient(srv.URL)
 	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-		Manifest:       manifest,
-		FileID:         0,
-		OutRoot:        outRoot,
-		AcceptEncoding: defaultCLIEncodings,
+		Manifest: manifest,
+		FileID:   0,
+		OutRoot:  outRoot,
 	})
 	if err == nil || !strings.Contains(err.Error(), "window hash mismatch") {
 		t.Fatalf("expected hash verification failure before metadata apply, got %v", err)
@@ -922,11 +956,10 @@ func TestDownloadFileFromManifestOnAckCallback(t *testing.T) {
 
 	client := NewClient(srv.URL)
 	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-		Manifest:       manifest,
-		FileID:         0,
-		OutRoot:        outRoot,
-		AcceptEncoding: defaultCLIEncodings,
-		AckEveryBytes:  1,
+		Manifest:      manifest,
+		FileID:        0,
+		OutRoot:       outRoot,
+		AckEveryBytes: 1,
 		OnAck: func(evt AckProgressEvent) {
 			events = append(events, evt)
 		},
@@ -973,14 +1006,12 @@ func TestDownloadFileFromManifestAckTimeoutDoesNotHang(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := NewClient(srv.URL)
-	client.AckRequestTimeout = 50 * time.Millisecond
+	client := NewClient(srv.URL, WithAckRequestTimeout(50*time.Millisecond))
 	start := time.Now()
 	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-		Manifest:       manifest,
-		FileID:         0,
-		OutRoot:        outRoot,
-		AcceptEncoding: defaultCLIEncodings,
+		Manifest: manifest,
+		FileID:   0,
+		OutRoot:  outRoot,
 	})
 	elapsed := time.Since(start)
 	if err == nil {
@@ -1019,12 +1050,11 @@ func TestDownloadFileFromManifestWritesToStdout(t *testing.T) {
 	var out bytes.Buffer
 	client := NewClient(srv.URL)
 	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-		Manifest:       manifest,
-		FileID:         0,
-		OutRoot:        ".",
-		OutFile:        "-",
-		Stdout:         &out,
-		AcceptEncoding: defaultCLIEncodings,
+		Manifest: manifest,
+		FileID:   0,
+		OutRoot:  ".",
+		OutFile:  "-",
+		Stdout:   &out,
 	})
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
@@ -1093,8 +1123,7 @@ func TestClientUsesInjectedDialContext(t *testing.T) {
 		}()
 		return clientConn, nil
 	}
-	client := NewClient("ignored:0", WithContextDialer(dialContext))
-	client.ServerAgePublicKey = ""
+	client := NewClient("ignored:0", WithContextDialer(dialContext), WithServerAgePublicKey(""))
 
 	resp, err := client.GetTransferStatus(context.Background(), GetTransferStatusRequest{TransferID: "tx123"})
 	if err != nil {

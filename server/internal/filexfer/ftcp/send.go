@@ -6,14 +6,15 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
+
 	//"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	intcodec "github.com/jolynch/pinch/internal/filexfer/codec"
-	intframe "github.com/jolynch/pinch/internal/filexfer/frame"
+	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
 )
@@ -145,8 +146,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 		return protocolErr{code: "INTERNAL", message: "failed to initialize window hash pipe"}
 	}
 	hashDone := startWindowHashWorker(hashPipeR)
-	useLinuxSplice := false
-	//:= runtime.GOOS == "linux"
+	useLinuxSplice := runtime.GOOS == "linux"
 	firstFrame := true
 
 	for remaining := windowLen; remaining > 0; {
@@ -192,7 +192,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 
 		trailerTS := time.Now().UnixMilli()
 		windowHashToken := ""
-		var terminalMD *intframe.FileFrameMetadata
+		var terminalMD *intencoding.FileFrameMetadata
 		if isTerminal {
 			_ = hashPipeW.Close()
 			result := <-hashDone
@@ -203,7 +203,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 			if !deps.SetTransferFileWindowHash(txferID, item.FileID, cursor, windowHashToken) {
 				return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
 			}
-			md := intframe.CollectFileFrameMetadata(fileRef.Path, fileInfo)
+			md := intencoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
 			terminalMD = &md
 		}
 		trailerLine := buildFrameTrailerLine(item.FileID, trailerTS, nextValue, windowHashToken, terminalMD)
@@ -232,8 +232,8 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 		windowTS0,
 		windowTS1,
 		windowMS,
-		humanRate(logicalBps),
-		humanRate(wireBps),
+		intencoding.HumanRate(logicalBps),
+		intencoding.HumanRate(wireBps),
 	)
 	return nil
 }
@@ -254,7 +254,7 @@ func startWindowHashWorker(pipeR *os.File) <-chan windowHashResult {
 			done <- windowHashResult{err: err}
 			return
 		}
-		done <- windowHashResult{token: intcodec.FormatXXH128HashToken(hasher.Sum128())}
+		done <- windowHashResult{token: intencoding.FormatXXH128HashToken(hasher.Sum128())}
 	}()
 	return done
 }
@@ -317,7 +317,7 @@ func buildFrameHeaderLine(fileID uint64, offset int64, size int64, wireSize int6
 		" ts=" + strconv.FormatInt(ts, 10) + "\n"
 }
 
-func buildFrameTrailerLine(fileID uint64, ts int64, next int64, windowHashToken string, metadata *intframe.FileFrameMetadata) string {
+func buildFrameTrailerLine(fileID uint64, ts int64, next int64, windowHashToken string, metadata *intencoding.FileFrameMetadata) string {
 	var b strings.Builder
 	b.WriteString("FXT/1 ")
 	b.WriteString(strconv.FormatUint(fileID, 10))
@@ -341,7 +341,7 @@ func buildFrameTrailerLine(fileID uint64, ts int64, next int64, windowHashToken 
 	return b.String()
 }
 
-func metadataTrailerTokens(metadata *intframe.FileFrameMetadata) []string {
+func metadataTrailerTokens(metadata *intencoding.FileFrameMetadata) []string {
 	if metadata == nil {
 		return nil
 	}

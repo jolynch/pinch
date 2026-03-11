@@ -8,8 +8,7 @@ import (
 	"strings"
 	"time"
 
-	intcodec "github.com/jolynch/pinch/internal/filexfer/codec"
-	intframe "github.com/jolynch/pinch/internal/filexfer/frame"
+	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 )
 
@@ -85,7 +84,7 @@ func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error
 		return protocolErr{code: "BAD_REQUEST", message: "invalid checksum parameter"}
 	}
 
-	metadata := intframe.CollectFileFrameMetadata(fileRef.Path, fileInfo)
+	metadata := intencoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
 	full128 := xxh3.New128()
 	full64 := xxh3.New()
 
@@ -97,7 +96,7 @@ func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error
 		if len(fileHashes) > 0 {
 			headerHash = fileHashes[0]
 		}
-		_, err := intframe.WriteFrame(out, intframe.WriteArgs{
+		_, err := intencoding.WriteFrame(out, intencoding.WriteArgs{
 			FileID:     parsed.FileID,
 			Offset:     0,
 			Size:       0,
@@ -158,7 +157,7 @@ func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error
 		isTerminal := nextOffset == fileSize
 		nextValue := nextOffset
 		fileHashes := rollingFileHashes
-		var meta *intframe.FileFrameMetadata
+		var meta *intencoding.FileFrameMetadata
 		if isTerminal {
 			nextValue = 0
 			meta = &metadata
@@ -170,7 +169,7 @@ func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error
 
 		headerTS := time.Now().UnixMilli()
 		trailerTS := time.Now().UnixMilli()
-		_, err := intframe.WriteFrame(out, intframe.WriteArgs{
+		_, err := intencoding.WriteFrame(out, intencoding.WriteArgs{
 			FileID:     parsed.FileID,
 			Offset:     cursor,
 			Size:       chunkSize,
@@ -251,9 +250,9 @@ func finalChecksumTokens(algorithms []string, full128 *xxh3.Hasher128, full64 *x
 	for _, name := range algorithms {
 		switch name {
 		case "xxh128":
-			tokens = append(tokens, intcodec.FormatXXH128HashToken(full128.Sum128()))
+			tokens = append(tokens, intencoding.FormatXXH128HashToken(full128.Sum128()))
 		case "xxh64":
-			tokens = append(tokens, intcodec.FormatXXH64HashToken(full64.Sum64()))
+			tokens = append(tokens, intencoding.FormatXXH64HashToken(full64.Sum64()))
 		}
 	}
 	return tokens

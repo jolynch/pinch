@@ -15,11 +15,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"filippo.io/age"
-	intcodec "github.com/jolynch/pinch/internal/filexfer/codec"
+	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/utils"
 	"github.com/zeebo/xxh3"
 )
 
@@ -64,6 +66,42 @@ func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) C
 	})
 }
 
+func WithServerAgePublicKey(publicKey string) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.ServerAgePublicKey = strings.TrimSpace(publicKey)
+	})
+}
+
+func WithFileRequestWindowBytes(windowBytes int64) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.FileRequestWindowBytes = windowBytes
+	})
+}
+
+func WithFrameBufferBytes(bufferBytes int) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.FrameBufferBytes = bufferBytes
+	})
+}
+
+func WithMaxFrameReadBufferBytes(bufferBytes int) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.MaxFrameReadBufferBytes = bufferBytes
+	})
+}
+
+func WithAckRequestTimeout(timeout time.Duration) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.AckRequestTimeout = timeout
+	})
+}
+
+func WithSocketReadBufferBytes(bufferBytes int) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.SocketReadBufferBytes = bufferBytes
+	})
+}
+
 type Client struct {
 	FileAddr                string
 	ServerAgePublicKey      string
@@ -71,13 +109,17 @@ type Client struct {
 	FrameBufferBytes        int
 	MaxFrameReadBufferBytes int
 	AckRequestTimeout       time.Duration
+	SocketReadBufferBytes   int
 
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
-	contextDialer           func(context.Context, string) (net.Conn, error)
+	contextDialer func(context.Context, string) (net.Conn, error)
 
 	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
 	bufferPool sync.Map // map[int]*sync.Pool
+
+	// scratchBufferPool caches reusable temporary byte buffers.
+	scratchBufferPool sync.Pool
 }
 
 type Manifest struct {
@@ -127,8 +169,6 @@ type DownloadFileRequest struct {
 	OutRoot                 string
 	OutFile                 string
 	Stdout                  io.Writer
-	UseZeroCopy             bool
-	AcceptEncoding          string
 	AgePublicKey            string
 	AgeIdentity             string
 	AckEveryBytes           int64
@@ -174,13 +214,39 @@ type DownloadBatchResponse struct {
 	Files []DownloadFileResponse
 }
 
+type StartFromManifestRequest struct {
+	Manifest        *Manifest
+	Entries         []ManifestEntry
+	OutRoot         string
+	AgePublicKey    string
+	AgeIdentity     string
+	NoSync          bool
+	Concurrency     int
+	BatchMaxBytes   int64
+	ProgressUpdates chan<- DownloadProgressUpdate
+	OnAck           func(AckProgressEvent)
+	OnFileDone      func(StartFileDoneEvent)
+}
+
+type StartFileDoneEvent struct {
+	File    DownloadFileResponse
+	Elapsed time.Duration
+}
+
+type StartFromManifestResponse struct {
+	Requested        int
+	Downloaded       int
+	Failed           int
+	TransferredBytes int64
+	Errors           []error
+}
+
 type FetchManifestRequest struct {
-	Directory      string
-	Verbose        bool
-	MaxChunkSize   int
-	AcceptEncoding string
-	AgePublicKey   string
-	AgeIdentity    string
+	Directory    string
+	Verbose      bool
+	MaxChunkSize int
+	AgePublicKey string
+	AgeIdentity  string
 }
 
 type FetchManifestResponse struct {
@@ -257,7 +323,8 @@ const (
 	defaultClientFrameBufferBytes        int   = 8 * 1024 * 1024
 	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024
 	minClientFrameReadBufferBytes        int   = 32 * 1024
-	defaultClientAckEveryBytes           int64 = 256 * 1024 * 1024
+	defaultClientScratchBufferBytes      int   = 64 * 1024
+	maxClientScratchBufferPoolBytes      int   = 16 * 1024 * 1024
 	defaultClientAckRequestTimeout             = 15 * time.Second
 )
 
@@ -270,6 +337,7 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 		FrameBufferBytes:        defaultClientFrameBufferBytes,
 		MaxFrameReadBufferBytes: defaultClientMaxFrameReadBufferBytes,
 		AckRequestTimeout:       defaultClientAckRequestTimeout,
+		SocketReadBufferBytes:   utils.MaxSocketReadBufferBytes(),
 	}
 	for _, opt := range opts {
 		if opt == nil {
@@ -278,6 +346,11 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 		opt.apply(c)
 	}
 	c.bufferPool = sync.Map{}
+	c.scratchBufferPool = sync.Pool{
+		New: func() any {
+			return bytes.NewBuffer(make([]byte, 0, defaultClientScratchBufferBytes))
+		},
+	}
 	return c
 }
 
@@ -347,8 +420,6 @@ func (c *Client) FetchFile(ctx context.Context, request FetchFileRequest) (Fetch
 		request.TransferID,
 		target.FileID,
 		target.FullPath,
-		false,
-		"",
 		request.AgePublicKey,
 		request.AgeIdentity,
 		0,
@@ -368,8 +439,6 @@ func (c *Client) fetchFileWindow(
 	txferID string,
 	fileID uint64,
 	fullPath string,
-	useZeroCopy bool,
-	acceptEncoding string,
 	agePublicKey string,
 	ageIdentity string,
 	offset int64,
@@ -384,10 +453,6 @@ func (c *Client) fetchFileWindow(
 	if fullPath == "" {
 		return nil, nil, errors.New("missing full path")
 	}
-	if useZeroCopy {
-		return nil, nil, errors.New("zerocopy mode is unsupported with tcp file transport")
-	}
-	_ = acceptEncoding
 	return c.fetchFileWindowTCP(
 		ctx,
 		txferID,
@@ -471,13 +536,9 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		windowSize = defaultClientRequestWindowBytes
 	}
 
-	if req.UseZeroCopy {
-		return DownloadFileResponse{}, errors.New("zerocopy mode is unsupported with tcp file transport")
-	}
-
 	if fileWriter == nil {
 		localHasher := xxh3.New128()
-		reader, meta, err := c.fetchFileWindow(ctx, req.Manifest.TransferID, req.FileID, serverPath, false, req.AcceptEncoding, req.AgePublicKey, req.AgeIdentity, 0, -1)
+		reader, meta, err := c.fetchFileWindow(ctx, req.Manifest.TransferID, req.FileID, serverPath, req.AgePublicKey, req.AgeIdentity, 0, -1)
 		if err != nil {
 			return DownloadFileResponse{}, err
 		}
@@ -494,7 +555,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 		if closeWriteErr != nil {
 			return DownloadFileResponse{}, fmt.Errorf("close output file: %w", closeWriteErr)
 		}
-		localHash := intcodec.FormatXXH128HashToken(localHasher.Sum128())
+		localHash := intencoding.FormatXXH128HashToken(localHasher.Sum128())
 		if meta.FileHashToken != "" && !strings.EqualFold(meta.FileHashToken, localHash) {
 			return DownloadFileResponse{}, fmt.Errorf("file hash mismatch: server=%s client=%s", meta.FileHashToken, localHash)
 		}
@@ -558,8 +619,6 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			req.Manifest.TransferID,
 			req.FileID,
 			serverPath,
-			false,
-			req.AcceptEncoding,
 			req.AgePublicKey,
 			req.AgeIdentity,
 			offset,
@@ -596,7 +655,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 			_ = closeWriter()
 			return DownloadFileResponse{}, fmt.Errorf("window size mismatch: requested=%d got=%d", window, windowMeta.Size)
 		}
-		windowHash := intcodec.FormatXXH128HashToken(windowHasher.Sum128())
+		windowHash := intencoding.FormatXXH128HashToken(windowHasher.Sum128())
 		if windowMeta.FileHashToken == "" {
 			_ = closeWriter()
 			return DownloadFileResponse{}, errors.New("window hash missing from trailer")
@@ -666,7 +725,7 @@ func (c *Client) DownloadFileFromManifest(ctx context.Context, req DownloadFileR
 	if mixedComp {
 		resultMeta.Comp = "mixed"
 	}
-	fullHash := intcodec.FormatXXH128HashToken(fileHasher.Sum128())
+	fullHash := intencoding.FormatXXH128HashToken(fileHasher.Sum128())
 	if err := applyVerifiedFileMetadata(fileWriter, resultMeta.TrailerMetadata, req.MetadataApplyBestEffort); err != nil {
 		_ = closeWriter()
 		return DownloadFileResponse{}, err
@@ -877,7 +936,7 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 			return DownloadBatchResponse{}, fmt.Errorf("close output file: %w", err)
 		}
 
-		localHash := intcodec.FormatXXH128HashToken(fileHasher.Sum128())
+		localHash := intencoding.FormatXXH128HashToken(fileHasher.Sum128())
 		if serverHash == "" {
 			return DownloadBatchResponse{}, errors.New("window hash missing from trailer")
 		}
@@ -947,6 +1006,134 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 		return DownloadBatchResponse{}, fmt.Errorf("unexpected batch terminal response: %s", statusLine)
 	}
 	return DownloadBatchResponse{Files: results}, nil
+}
+
+func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestRequest) (StartFromManifestResponse, error) {
+	if c == nil {
+		return StartFromManifestResponse{}, errors.New("nil client")
+	}
+	if req.Manifest == nil {
+		return StartFromManifestResponse{}, errors.New("nil manifest")
+	}
+	entries := req.Entries
+	if entries == nil {
+		entries = req.Manifest.Entries
+	}
+	resp := StartFromManifestResponse{
+		Requested: len(entries),
+	}
+	if len(entries) == 0 {
+		return resp, nil
+	}
+	if req.OutRoot == "" {
+		req.OutRoot = "."
+	}
+	if req.Concurrency <= 0 {
+		req.Concurrency = 1
+	}
+	batches := buildManifestBatchesByBytes(entries, req.BatchMaxBytes)
+	workCh := make(chan []ManifestEntry)
+	errCh := make(chan error, len(entries))
+	var wg sync.WaitGroup
+	var downloaded atomic.Int64
+	var transferred atomic.Int64
+
+	worker := func() {
+		defer wg.Done()
+		for batch := range workCh {
+			if len(batch) == 0 {
+				continue
+			}
+			fileIDs := make([]uint64, 0, len(batch))
+			for _, entry := range batch {
+				fileIDs = append(fileIDs, entry.ID)
+			}
+			startOne := time.Now()
+			downloadBatchResp, err := c.DownloadFilesFromManifestBatch(ctx, DownloadBatchRequest{
+				Manifest:        req.Manifest,
+				FileIDs:         fileIDs,
+				OutRoot:         req.OutRoot,
+				AgePublicKey:    req.AgePublicKey,
+				AgeIdentity:     req.AgeIdentity,
+				NoSync:          req.NoSync,
+				ProgressUpdates: req.ProgressUpdates,
+				OnAck:           req.OnAck,
+			})
+			if err != nil {
+				errCh <- fmt.Errorf("batch first-id=%d count=%d: %w", batch[0].ID, len(batch), err)
+				continue
+			}
+			elapsedBatch := time.Since(startOne)
+			for _, downloadResp := range downloadBatchResp.Files {
+				downloaded.Add(1)
+				transferred.Add(downloadResp.Meta.Size)
+				if req.OnFileDone != nil {
+					req.OnFileDone(StartFileDoneEvent{
+						File:    downloadResp,
+						Elapsed: elapsedBatch,
+					})
+				}
+			}
+		}
+	}
+
+	for i := 0; i < req.Concurrency; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	submitBatch := func(batch []ManifestEntry) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case workCh <- batch:
+			return true
+		}
+	}
+	for _, batch := range batches {
+		if !submitBatch(batch) {
+			break
+		}
+	}
+	close(workCh)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		resp.Errors = append(resp.Errors, err)
+	}
+	resp.Downloaded = int(downloaded.Load())
+	resp.TransferredBytes = transferred.Load()
+	resp.Failed = len(resp.Errors)
+	return resp, nil
+}
+
+func buildManifestBatchesByBytes(entries []ManifestEntry, maxBytes int64) [][]ManifestEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = 1
+	}
+	batches := make([][]ManifestEntry, 0, len(entries))
+	current := make([]ManifestEntry, 0, 8)
+	var currentBytes int64
+	for _, entry := range entries {
+		size := entry.Size
+		if size < 0 {
+			size = 0
+		}
+		if len(current) > 0 && currentBytes+size > maxBytes {
+			batches = append(batches, current)
+			current = make([]ManifestEntry, 0, 8)
+			currentBytes = 0
+		}
+		current = append(current, entry)
+		currentBytes += size
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
+	}
+	return batches
 }
 
 func shouldAcknowledgeMissing404(body string) bool {
@@ -1256,6 +1443,29 @@ func (c *Client) acquireFrameReadBuffer(maxWireHint int64) ([]byte, func()) {
 	return buf, func() {
 		pool.Put(buf[:size])
 	}
+}
+
+func (c *Client) acquireScratchBuffer() *bytes.Buffer {
+	if c == nil {
+		return bytes.NewBuffer(make([]byte, 0, defaultClientScratchBufferBytes))
+	}
+	raw := c.scratchBufferPool.Get()
+	if buf, ok := raw.(*bytes.Buffer); ok && buf != nil {
+		buf.Reset()
+		return buf
+	}
+	return bytes.NewBuffer(make([]byte, 0, defaultClientScratchBufferBytes))
+}
+
+func (c *Client) releaseScratchBuffer(buf *bytes.Buffer) {
+	if c == nil || buf == nil {
+		return
+	}
+	if buf.Cap() > maxClientScratchBufferPoolBytes {
+		return
+	}
+	buf.Reset()
+	c.scratchBufferPool.Put(buf)
 }
 
 func dataSyncFile(fd *os.File) error {
@@ -2064,50 +2274,12 @@ func parseAgeIdentity(raw string) (age.Identity, error) {
 	return identity, nil
 }
 
-func decryptAgeBytes(ciphertext []byte, ageIdentity string) ([]byte, error) {
-	identity, err := parseAgeIdentity(ageIdentity)
-	if err != nil {
-		return nil, err
-	}
-	if identity == nil {
-		return nil, errors.New("missing age identity for encrypted response")
-	}
-	reader, err := age.Decrypt(bytes.NewReader(ciphertext), identity)
-	if err != nil {
-		return nil, err
-	}
-	plaintext, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, err
-	}
-	return plaintext, nil
-}
-
 func validHashToken(raw string) bool {
 	if raw == "" {
 		return false
 	}
 	parts := strings.SplitN(raw, ":", 2)
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
-}
-
-func validateFrameHashToken(token string, actual uint64) error {
-	parts := strings.SplitN(token, ":", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return errors.New("invalid frame hash token")
-	}
-	algo := strings.ToLower(parts[0])
-	switch algo {
-	case "xxh64":
-		expected := fmt.Sprintf("%016x", actual)
-		value := strings.ToLower(parts[1])
-		if value != expected {
-			return fmt.Errorf("xxh64 mismatch: trailer=%s actual=%s", value, expected)
-		}
-		return nil
-	default:
-		return fmt.Errorf("unsupported frame hash algorithm: %s", parts[0])
-	}
 }
 
 func decodePayloadReader(payload io.Reader, comp string, enc string, identity age.Identity) (io.ReadCloser, error) {
@@ -2133,7 +2305,7 @@ func decodePayloadReaderByComp(payload io.Reader, comp string) (io.ReadCloser, e
 	case "none":
 		return io.NopCloser(payload), nil
 	case EncodingZstd, EncodingLz4:
-		reader, err := intcodec.WrapDecompressedReader(payload, comp)
+		reader, err := intencoding.WrapDecompressedReader(payload, comp)
 		if err != nil {
 			return nil, err
 		}

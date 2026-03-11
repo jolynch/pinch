@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,14 +16,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
 )
 
-const defaultCLIEncodings = "zstd,lz4,identity"
 const defaultVerboseStatusInterval = 10 * time.Second
 const defaultCLIAckEveryBytes int64 = 256 * 1024 * 1024
 
@@ -78,22 +76,12 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 }
 
 func validateServerURL(raw string) error {
-	errMsg := "first argument must be server URL or file-listener address, for example http://localhost:8080 or 127.0.0.1:3453"
+	errMsg := "first argument must be file-listener address, for example 127.0.0.1:3453"
 	if strings.TrimSpace(raw) == "" {
 		return errors.New(errMsg)
 	}
 	if strings.HasPrefix(raw, "-") {
 		return errors.New(errMsg)
-	}
-	if strings.Contains(raw, "://") {
-		u, err := url.Parse(raw)
-		if err != nil {
-			return errors.New(errMsg)
-		}
-		if u.Host == "" {
-			return errors.New(errMsg)
-		}
-		return nil
 	}
 	host, port, splitErr := net.SplitHostPort(raw)
 	if splitErr != nil || strings.TrimSpace(host) == "" || strings.TrimSpace(port) == "" {
@@ -104,10 +92,10 @@ func validateServerURL(raw string) error {
 
 func printCLIUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  pinch cli <server-url> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--encrypt age] [-v|--verbose] [--max-manifest-chunk-size N]")
-	fmt.Fprintln(w, "  pinch cli <server-url> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--zerocopy] [--accept-encoding <csv>] [--encrypt age] [--concurrency N] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
-	fmt.Fprintln(w, "  pinch cli <server-url> status --tid <id>")
-	fmt.Fprintln(w, "  pinch cli <server-url> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--zerocopy] [--accept-encoding <csv>] [--encrypt age] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <file-listener> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--encrypt age] [-v|--verbose] [--max-manifest-chunk-size N]")
+	fmt.Fprintln(w, "  pinch cli <file-listener> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--encrypt age] [--concurrency N] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <file-listener> status --tid <id>")
+	fmt.Fprintln(w, "  pinch cli <file-listener> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--encrypt age] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
 }
 
 func resolveEncryptionOptions(mode string) (string, string, error) {
@@ -161,12 +149,11 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	client := NewClient(serverURL)
 	start := time.Now()
 	manifestResp, err := client.FetchManifest(context.Background(), FetchManifestRequest{
-		Directory:      sourceDir,
-		Verbose:        verbose,
-		MaxChunkSize:   maxChunk,
-		AcceptEncoding: defaultCLIEncodings,
-		AgePublicKey:   agePublicKey,
-		AgeIdentity:    ageIdentity,
+		Directory:    sourceDir,
+		Verbose:      verbose,
+		MaxChunkSize: maxChunk,
+		AgePublicKey: agePublicKey,
+		AgeIdentity:  ageIdentity,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "transfer failed: %v\n", err)
@@ -255,9 +242,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var fileIDRaw string
 	var outRoot string
 	var outFile string
-	var acceptEncoding string
 	var encryptMode string
-	var zeroCopy bool
 	var ackEveryRaw string
 	var noSync bool
 	var verbose bool
@@ -266,15 +251,13 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	fs.StringVar(&fileIDRaw, "fd", "", "file id to download")
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
 	fs.StringVar(&outFile, "o", "", "output file path, or '-' for stdout")
-	fs.BoolVar(&zeroCopy, "zerocopy", false, "download file via /fs/file/{txferid}/{fid}/zerocopy endpoint")
-	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
 	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
-	ackEveryRaw = humanBytes(defaultCLIAckEveryBytes)
+	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	fs.StringVar(&ackEveryRaw, "A", ackEveryRaw, "bytes between progress acks")
 	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
-	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")
+	fs.BoolVar(&noSync, "no-sync", false, "ack without disk sync")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -282,18 +265,13 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintln(stderr, "get requires --fd")
 		return 2
 	}
-	ackEvery, err := parseByteSize(ackEveryRaw)
+	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
 	}
 	if ackEvery <= 0 {
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
-		return 2
-	}
-	_ = acceptEncoding
-	if zeroCopy {
-		fmt.Fprintln(stderr, "--zerocopy is unsupported with tcp file transport")
 		return 2
 	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
@@ -348,8 +326,6 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		OutRoot:         outRoot,
 		OutFile:         outFile,
 		Stdout:          stdout,
-		UseZeroCopy:     zeroCopy,
-		AcceptEncoding:  acceptEncoding,
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
 		AckEveryBytes:   ackEvery,
@@ -377,9 +353,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var txferID string
 	var manifestPath string
 	var outRoot string
-	var acceptEncoding string
 	var encryptMode string
-	var zeroCopy bool
 	var concurrency int
 	var ackEveryRaw string
 	var noSync bool
@@ -387,13 +361,11 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	fs.StringVar(&txferID, "tid", "", "transfer id")
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm1)")
 	fs.StringVar(&outRoot, "out-root", ".", "output root")
-	fs.BoolVar(&zeroCopy, "zerocopy", false, "download files via /fs/file/{txferid}/{fid}/zerocopy endpoint")
-	fs.StringVar(&acceptEncoding, "accept-encoding", defaultCLIEncodings, "accept-encoding header")
 	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
 	fs.IntVar(&concurrency, "concurrency", defaultClientConcurrency(), "parallel download workers")
-	ackEveryRaw = humanBytes(defaultCLIAckEveryBytes)
+	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	fs.StringVar(&ackEveryRaw, "A", ackEveryRaw, "bytes between progress acks")
 	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
 	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")
@@ -404,17 +376,13 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintln(stderr, "--concurrency must be > 0")
 		return 2
 	}
-	ackEvery, err := parseByteSize(ackEveryRaw)
+	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
 	}
 	if ackEvery <= 0 {
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
-		return 2
-	}
-	if zeroCopy && strings.TrimSpace(encryptMode) != "" {
-		fmt.Fprintln(stderr, "--zerocopy cannot be combined with --encrypt")
 		return 2
 	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
@@ -445,11 +413,9 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	client := NewClient(serverURL)
 
 	startAll := time.Now()
-	workCh := make(chan []ManifestEntry)
-	errCh := make(chan error, len(manifest.Entries))
-	var wg sync.WaitGroup
-	var completed atomic.Int64
-	var totalTransferred atomic.Int64
+	var completed int64
+	var totalTransferred int64
+	var failures []error
 	var stopStatusPolling func()
 	if verbose {
 		stopStatusPolling = startVerboseStatusPolling(txferID, client, stderr)
@@ -459,90 +425,63 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	for _, entry := range manifest.Entries {
 		if st, ok := progressState[entry.ID]; ok && st.AckBytes >= entry.Size {
 			if st.MetadataDone {
-				completed.Add(1)
+				completed++
 				continue
 			}
 			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, "", agePublicKey, ageIdentity); err != nil {
-				errCh <- fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err)
+				failures = append(failures, fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err))
 				continue
 			}
 			markMetadataDone(entry.ID)
-			completed.Add(1)
+			completed++
 			continue
 		}
 		pendingEntries = append(pendingEntries, entry)
 	}
-	batches := buildManifestBatchesByBytes(pendingEntries, ackEvery)
-
-	worker := func() {
-		defer wg.Done()
-		for batch := range workCh {
-			if len(batch) == 0 {
-				continue
-			}
-			fileIDs := make([]uint64, 0, len(batch))
-			for _, entry := range batch {
-				fileIDs = append(fileIDs, entry.ID)
-			}
-			startOne := time.Now()
-			downloadBatchResp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
-				Manifest:        manifest,
-				FileIDs:         fileIDs,
-				OutRoot:         outRoot,
-				AgePublicKey:    agePublicKey,
-				AgeIdentity:     ageIdentity,
-				NoSync:          noSync,
-				ProgressUpdates: progressUpdates,
-				OnAck:           onAck,
-			})
-			if err != nil {
-				errCh <- fmt.Errorf("batch first-id=%d count=%d: %w", batch[0].ID, len(batch), err)
-				continue
-			}
-			elapsedBatch := time.Since(startOne)
-			for _, downloadResp := range downloadBatchResp.Files {
-				markMetadataDone(downloadResp.Meta.FileID)
-				completed.Add(1)
-				totalTransferred.Add(downloadResp.Meta.Size)
-				printStartFileSummary(stdout, downloadResp.Meta.FileID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsedBatch)
-			}
-		}
+	startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
+		Manifest:        manifest,
+		Entries:         pendingEntries,
+		OutRoot:         outRoot,
+		AgePublicKey:    agePublicKey,
+		AgeIdentity:     ageIdentity,
+		NoSync:          noSync,
+		Concurrency:     concurrency,
+		BatchMaxBytes:   ackEvery,
+		ProgressUpdates: progressUpdates,
+		OnAck:           onAck,
+		OnFileDone: func(evt StartFileDoneEvent) {
+			markMetadataDone(evt.File.Meta.FileID)
+			printStartFileSummary(stdout, evt.File.Meta.FileID, evt.File.DestinationPath, evt.File.Meta, evt.File.LocalFileHash, evt.Elapsed)
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "start failed: %v\n", err)
+		return 1
 	}
-
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go worker()
-	}
-	for _, batch := range batches {
-		workCh <- batch
-	}
-	close(workCh)
-	wg.Wait()
-	close(errCh)
-
-	var failures int
-	for err := range errCh {
-		failures++
+	completed += int64(startResp.Downloaded)
+	totalTransferred += startResp.TransferredBytes
+	failures = append(failures, startResp.Errors...)
+	for _, err := range failures {
 		fmt.Fprintf(stderr, "start error: %v\n", err)
 	}
 
 	elapsedAll := time.Since(startAll)
 	overallSpeed := 0.0
 	if elapsedAll > 0 {
-		overallSpeed = float64(totalTransferred.Load()) / elapsedAll.Seconds()
+		overallSpeed = float64(totalTransferred) / elapsedAll.Seconds()
 	}
 	fmt.Fprintf(
 		stdout,
 		"start complete: tid=%s requested=%d downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
 		txferID,
 		len(manifest.Entries),
-		completed.Load(),
-		failures,
-		humanBytes(totalTransferred.Load()),
-		humanRate(overallSpeed),
+		completed,
+		len(failures),
+		encoding.HumanBytes(totalTransferred),
+		encoding.HumanRate(overallSpeed),
 		elapsedAll.Round(time.Millisecond),
 	)
-	if failures > 0 {
+	if len(failures) > 0 {
 		return 1
 	}
 	return 0
@@ -566,37 +505,8 @@ func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta Fi
 		path,
 		checksum,
 		compSummary,
-		humanRate(speed),
+		encoding.HumanRate(speed),
 	)
-}
-
-func buildManifestBatchesByBytes(entries []ManifestEntry, maxBytes int64) [][]ManifestEntry {
-	if len(entries) == 0 {
-		return nil
-	}
-	if maxBytes <= 0 {
-		maxBytes = 1
-	}
-	batches := make([][]ManifestEntry, 0, len(entries))
-	current := make([]ManifestEntry, 0, 8)
-	var currentBytes int64
-	for _, entry := range entries {
-		size := entry.Size
-		if size < 0 {
-			size = 0
-		}
-		if len(current) > 0 && currentBytes+size > maxBytes {
-			batches = append(batches, current)
-			current = make([]ManifestEntry, 0, 8)
-			currentBytes = 0
-		}
-		current = append(current, entry)
-		currentBytes += size
-	}
-	if len(current) > 0 {
-		batches = append(batches, current)
-	}
-	return batches
 }
 
 func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer) func() {
@@ -1132,7 +1042,7 @@ func (r *ackMilestoneReporter) Report(evt AckProgressEvent) {
 			next,
 			evt.AckBytes,
 			evt.TargetBytes,
-			humanRate(rateBps),
+			encoding.HumanRate(rateBps),
 			eta,
 		)
 		next += 10
@@ -1186,7 +1096,7 @@ func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path stri
 		compSummary,
 		meta.Size,
 		meta.WireSize,
-		humanRate(speed),
+		encoding.HumanRate(speed),
 		ratio,
 		serverFileHash,
 		localFileHash,
@@ -1194,8 +1104,8 @@ func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path stri
 		meta.HeaderTS,
 		meta.TrailerTS,
 		serverFrameMS,
-		humanRate(serverLogicalBps),
-		humanRate(serverWireBps),
+		encoding.HumanRate(serverLogicalBps),
+		encoding.HumanRate(serverWireBps),
 	)
 }
 
@@ -1222,37 +1132,4 @@ func formatCompSummary(meta FileFrameMeta) string {
 	sort.Strings(other)
 	parts = append(parts, other...)
 	return "[" + strings.Join(parts, ", ") + "]"
-}
-
-func humanRate(bps float64) string {
-	if bps <= 0 {
-		return "0 B/s"
-	}
-	units := []string{"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"}
-	unit := 0
-	for bps >= 1024 && unit < len(units)-1 {
-		bps /= 1024
-		unit++
-	}
-	if unit == 0 {
-		return fmt.Sprintf("%.0f %s", bps, units[unit])
-	}
-	return fmt.Sprintf("%.2f %s", bps, units[unit])
-}
-
-func humanBytes(v int64) string {
-	if v <= 0 {
-		return "0 B"
-	}
-	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
-	value := float64(v)
-	unit := 0
-	for value >= 1024 && unit < len(units)-1 {
-		value /= 1024
-		unit++
-	}
-	if unit == 0 {
-		return fmt.Sprintf("%.0f %s", value, units[unit])
-	}
-	return fmt.Sprintf("%.2f %s", value, units[unit])
 }

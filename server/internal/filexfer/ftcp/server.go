@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/jolynch/pinch/internal/filexfer/limit"
 )
 
 const (
@@ -16,9 +17,11 @@ const (
 )
 
 type ServerOptions struct {
-	RequireAuth    bool
-	ServerIdentity *age.X25519Identity
-	Deps           Deps
+	RequireAuth            bool
+	ServerIdentity         *age.X25519Identity
+	Deps                   Deps
+	Limiter                *limit.Limiter
+	SocketWriteBufferBytes int
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -54,27 +57,34 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 }
 
 type connSession struct {
-	conn        net.Conn
-	requireAuth bool
-	serverID    *age.X25519Identity
-	deps        Deps
-	respOut     io.Writer
-	closeResp   func() error
-	wroteBytes  bool
+	conn                   net.Conn
+	requireAuth            bool
+	serverID               *age.X25519Identity
+	deps                   Deps
+	limiter                *limit.Limiter
+	socketWriteBufferBytes int
+	respOut                io.Writer
+	closeResp              func() error
+	wroteBytes             bool
 }
 
 func handleConn(conn net.Conn, opts ServerOptions, deps Deps) {
 	defer conn.Close()
 	s := &connSession{
-		conn:        conn,
-		requireAuth: opts.RequireAuth,
-		serverID:    opts.ServerIdentity,
-		deps:        deps,
-		respOut:     conn,
-		closeResp:   func() error { return nil },
+		conn:                   conn,
+		requireAuth:            opts.RequireAuth,
+		serverID:               opts.ServerIdentity,
+		deps:                   deps,
+		limiter:                opts.Limiter,
+		socketWriteBufferBytes: opts.SocketWriteBufferBytes,
+		respOut:                conn,
+		closeResp:              func() error { return nil },
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
+		if s.socketWriteBufferBytes > 0 {
+			_ = tc.SetWriteBuffer(s.socketWriteBufferBytes)
+		}
 	}
 	if err := s.run(); err != nil {
 		_ = writeErrFrame(s.respOut, err)
@@ -134,8 +144,13 @@ func (s *connSession) run() error {
 		return protocolErr{code: "NOT_AUTHORIZED", message: "missing AUTH"}
 	}
 
-	countingOut := &countingWriter{w: s.respOut}
-	if err := s.handleCommand(context.Background(), cmdReq, countingOut); err != nil {
+	cmdCtx := context.Background()
+	cmdOut := s.respOut
+	if s.limiter != nil {
+		cmdOut = s.limiter.WrapRateLimitedWriter(cmdOut, cmdCtx)
+	}
+	countingOut := &countingWriter{w: cmdOut}
+	if err := s.handleCommand(cmdCtx, cmdReq, countingOut); err != nil {
 		s.wroteBytes = countingOut.n > 0
 		return err
 	}
