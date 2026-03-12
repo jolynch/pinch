@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -262,6 +261,55 @@ func buildFXFrameWithTrailerTokens(t *testing.T, fileID uint64, comp string, off
 	return header + string(payload) + trailer + "\n"
 }
 
+type singleDownloadRequest struct {
+	Manifest                *Manifest
+	FileID                  uint64
+	OutRoot                 string
+	OutFile                 string
+	Stdout                  io.Writer
+	AgePublicKey            string
+	AgeIdentity             string
+	AckEveryBytes           int64
+	ResumeFromBytes         int64
+	NoSync                  bool
+	MetadataApplyBestEffort bool
+	ProgressUpdates         chan<- DownloadProgressUpdate
+}
+
+func downloadSingle(ctx context.Context, client *Client, req singleDownloadRequest) (DownloadFileResponse, error) {
+	_ = req.AckEveryBytes
+	if req.Manifest != nil && req.ResumeFromBytes > 0 {
+		if req.Manifest.Progress == nil {
+			req.Manifest.Progress = make(map[uint64]ManifestProgress)
+		}
+		progress := req.Manifest.Progress[req.FileID]
+		progress.AckBytes = req.ResumeFromBytes
+		req.Manifest.Progress[req.FileID] = progress
+	}
+	if req.ResumeFromBytes != 0 {
+		// Keep backward-compatible helper signature, but resume is now sourced from manifest progress.
+	}
+	resp, err := client.DownloadFilesFromManifestBatch(ctx, DownloadBatchRequest{
+		Manifest:                req.Manifest,
+		FileIDs:                 []uint64{req.FileID},
+		OutRoot:                 req.OutRoot,
+		OutFile:                 req.OutFile,
+		Stdout:                  req.Stdout,
+		AgePublicKey:            req.AgePublicKey,
+		AgeIdentity:             req.AgeIdentity,
+		NoSync:                  req.NoSync,
+		MetadataApplyBestEffort: req.MetadataApplyBestEffort,
+		ProgressUpdates:         req.ProgressUpdates,
+	})
+	if err != nil {
+		return DownloadFileResponse{}, err
+	}
+	if len(resp.Files) != 1 {
+		return DownloadFileResponse{}, fmt.Errorf("expected one downloaded file, got %d", len(resp.Files))
+	}
+	return resp.Files[0], nil
+}
+
 func encryptAgeBlob(t *testing.T, plaintext []byte, recipient age.Recipient) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -310,6 +358,22 @@ func TestParseFXTrailerParsesMetadata(t *testing.T) {
 	}
 	if trailer.Metadata.User != "alice" || trailer.Metadata.Group != "dev" {
 		t.Fatalf("unexpected user/group metadata: %+v", trailer.Metadata)
+	}
+}
+
+func TestParseFXTrailerWithoutTrailerHash(t *testing.T) {
+	trailer, err := parseFXTrailer("FXT/1 7 status=ok ts=1001 next=0 file-hash=xxh128:0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatalf("parseFXTrailer failed: %v", err)
+	}
+	if trailer.FileID != 7 {
+		t.Fatalf("unexpected file id: %d", trailer.FileID)
+	}
+	if trailer.HashToken != "" {
+		t.Fatalf("expected empty trailer hash token, got %q", trailer.HashToken)
+	}
+	if trailer.FileHashToken == "" {
+		t.Fatalf("expected file-hash token")
 	}
 }
 
@@ -380,6 +444,39 @@ func TestParseManifestMultiChunk(t *testing.T) {
 	}
 	if len(manifest.Entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(manifest.Entries))
+	}
+}
+
+func TestMarshalManifestRoundTrip(t *testing.T) {
+	manifest := &Manifest{
+		TransferID: "txrt",
+		Root:       "/root",
+		Entries: []ManifestEntry{
+			{ID: 1, Size: 5, Mtime: 100, Mode: 0o644, Path: "a.txt"},
+			{ID: 2, Size: 9, Mtime: 100, Mode: 0o600, Path: "dir/b.txt"},
+		},
+	}
+	raw, err := MarshalManifest(manifest)
+	if err != nil {
+		t.Fatalf("MarshalManifest failed: %v", err)
+	}
+	parsed, err := parseManifest(raw)
+	if err != nil {
+		t.Fatalf("parseManifest failed: %v", err)
+	}
+	if parsed.TransferID != manifest.TransferID {
+		t.Fatalf("transfer id mismatch: got=%q want=%q", parsed.TransferID, manifest.TransferID)
+	}
+	if parsed.Root != manifest.Root {
+		t.Fatalf("root mismatch: got=%q want=%q", parsed.Root, manifest.Root)
+	}
+	if len(parsed.Entries) != len(manifest.Entries) {
+		t.Fatalf("entry count mismatch: got=%d want=%d", len(parsed.Entries), len(manifest.Entries))
+	}
+	for i := range parsed.Entries {
+		if parsed.Entries[i] != manifest.Entries[i] {
+			t.Fatalf("entry %d mismatch: got=%+v want=%+v", i, parsed.Entries[i], manifest.Entries[i])
+		}
 	}
 }
 
@@ -569,7 +666,7 @@ func TestFetchFileIgnoresPerFrameChecksumMismatch(t *testing.T) {
 func TestFetchFileRejectsMalformedTrailer(t *testing.T) {
 	logical := []byte("hello")
 	frame := fmt.Sprintf(
-		"FX/1 0 offset=0 size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n%sFXT/1 0 status=ok ts=1001\n",
+		"FX/1 0 offset=0 size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n%sFXT/1 0 ts=1001 next=0\n",
 		len(logical),
 		len(logical),
 		xxh128HexTest(logical),
@@ -755,7 +852,7 @@ func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	downloadResp, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest: manifest,
 		FileID:   0,
 		OutRoot:  outRoot,
@@ -805,7 +902,7 @@ func TestDownloadFileFromManifestAppliesModeAfterVerify(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	resp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	resp, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest: manifest,
 		FileID:   0,
 		OutRoot:  outRoot,
@@ -847,7 +944,7 @@ func TestDownloadFileFromManifestMetadataStrictFailure(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest: manifest,
 		FileID:   0,
 		OutRoot:  outRoot,
@@ -882,7 +979,7 @@ func TestDownloadFileFromManifestMetadataBestEffort(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest:                manifest,
 		FileID:                  0,
 		OutRoot:                 outRoot,
@@ -919,7 +1016,7 @@ func TestDownloadFileFromManifestVerifiesBeforeMetadataApply(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest: manifest,
 		FileID:   0,
 		OutRoot:  outRoot,
@@ -929,7 +1026,7 @@ func TestDownloadFileFromManifestVerifiesBeforeMetadataApply(t *testing.T) {
 	}
 }
 
-func TestDownloadFileFromManifestOnAckCallback(t *testing.T) {
+func TestDownloadFileFromManifestProgressUpdatesIncludeACK(t *testing.T) {
 	outRoot := t.TempDir()
 	manifest := &Manifest{
 		TransferID: "txack",
@@ -939,7 +1036,7 @@ func TestDownloadFileFromManifestOnAckCallback(t *testing.T) {
 		},
 	}
 	logical := []byte("hello")
-	var events []AckProgressEvent
+	progressUpdates := make(chan DownloadProgressUpdate, 32)
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		if req.Verb == intftcp.VerbSEND {
@@ -956,34 +1053,51 @@ func TestDownloadFileFromManifestOnAckCallback(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
-		Manifest:      manifest,
-		FileID:        0,
-		OutRoot:       outRoot,
-		AckEveryBytes: 1,
-		OnAck: func(evt AckProgressEvent) {
-			events = append(events, evt)
-		},
+	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
+		Manifest:        manifest,
+		FileID:          0,
+		OutRoot:         outRoot,
+		AckEveryBytes:   1,
+		ProgressUpdates: progressUpdates,
 	})
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
 	}
-	if len(events) == 0 {
+	var lastProgress DownloadProgressUpdate
+	var sawProgress bool
+	var lastAck DownloadProgressUpdate
+	var sawAck bool
+	for {
+		select {
+		case update := <-progressUpdates:
+			if update.CopiedBytes > 0 {
+				lastProgress = update
+				sawProgress = true
+			}
+			if update.AckBytes > 0 {
+				lastAck = update
+				sawAck = true
+			}
+		default:
+			goto doneProgress
+		}
+	}
+doneProgress:
+	if !sawProgress {
+		t.Fatalf("expected at least one file progress event")
+	}
+	if lastProgress.CopiedBytes != 5 || lastProgress.TargetBytes != 5 {
+		t.Fatalf("unexpected final progress event: %+v", lastProgress)
+	}
+	if !sawAck {
 		t.Fatalf("expected at least one ack progress event")
 	}
-	last := events[len(events)-1]
-	if last.AckBytes != 5 || last.TargetBytes != 5 {
-		t.Fatalf("unexpected final ack bytes/target: %+v", last)
-	}
-	if last.AckTime.IsZero() {
-		t.Fatalf("expected non-zero ack time")
-	}
-	if len(events) > 1 && last.PrevAckTime.IsZero() {
-		t.Fatalf("expected non-zero previous ack time when multiple events are present")
+	if lastAck.AckBytes != 5 || lastAck.TargetBytes != 5 {
+		t.Fatalf("unexpected final ack progress event: %+v", lastAck)
 	}
 }
 
-func TestDownloadFileFromManifestPoolsACKByAckEvery(t *testing.T) {
+func TestDownloadFileFromManifestUsesSingleBatchACK(t *testing.T) {
 	outRoot := t.TempDir()
 	manifest := &Manifest{
 		TransferID: "txackpool",
@@ -992,31 +1106,20 @@ func TestDownloadFileFromManifestPoolsACKByAckEvery(t *testing.T) {
 			{ID: 0, Size: 10, Path: "a.txt"},
 		},
 	}
-	partA := []byte("hello")
-	partB := []byte("world")
+	logical := []byte("helloworld")
 
 	var acks []map[string]string
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbSEND:
-			rawOffset := req.Params[1]["offset"]
-			if rawOffset == "" {
-				rawOffset = "0"
+			if got := req.Params[1]["offset"]; got != "" && got != "0" {
+				return fmt.Errorf("expected offset 0, got %q", got)
 			}
-			offset, err := strconv.ParseInt(rawOffset, 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid offset: %v", err)
+			if got := req.Params[1]["size"]; got != "10" {
+				return fmt.Errorf("expected size 10, got %q", got)
 			}
-			switch offset {
-			case 0:
-				_, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, partA, nil))
-				return err
-			case 5:
-				_, err := io.WriteString(out, buildFXFrame(t, 0, "none", 5, partB, nil))
-				return err
-			default:
-				return fmt.Errorf("unexpected offset: %d", offset)
-			}
+			_, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, logical, nil))
+			return err
 		case intftcp.VerbACK:
 			item := map[string]string{}
 			for k, v := range req.Params[0] {
@@ -1032,7 +1135,7 @@ func TestDownloadFileFromManifestPoolsACKByAckEvery(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, WithFileRequestWindowBytes(5))
-	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest:      manifest,
 		FileID:        0,
 		OutRoot:       outRoot,
@@ -1043,15 +1146,90 @@ func TestDownloadFileFromManifestPoolsACKByAckEvery(t *testing.T) {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
 	}
 	if len(acks) != 1 {
-		t.Fatalf("expected one pooled ACK, got %d", len(acks))
+		t.Fatalf("expected one ACK, got %d", len(acks))
 	}
 	ack := acks[0]
-	expectedAck := "10@1006@xxh128:" + xxh128HexTest(partB)
+	expectedAck := "10@1001@xxh128:" + xxh128HexTest(logical)
 	if got := ack["ack-token"]; got != expectedAck {
 		t.Fatalf("expected ack-token=%s, got %q", expectedAck, got)
 	}
 	if got := ack["delta-bytes"]; got != "10" {
-		t.Fatalf("expected pooled delta-bytes=10, got %q", got)
+		t.Fatalf("expected delta-bytes=10, got %q", got)
+	}
+}
+
+func TestDownloadFileFromManifestResumesFromOffsetAndTruncatesTail(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID: "txresume",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 10, Path: "a.txt"},
+		},
+	}
+	destPath := filepath.Join(outRoot, "a.txt")
+	if err := os.WriteFile(destPath, []byte("helloSTALETAIL"), 0o644); err != nil {
+		t.Fatalf("write stale output file: %v", err)
+	}
+	partB := []byte("world")
+
+	var sawSend bool
+	var sawAck bool
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			sawSend = true
+			if got := req.Params[1]["offset"]; got != "5" {
+				return fmt.Errorf("expected resume offset 5, got %q", got)
+			}
+			if got := req.Params[1]["size"]; got != "5" {
+				return fmt.Errorf("expected resume size 5, got %q", got)
+			}
+			_, err := io.WriteString(out, buildFXFrame(t, 0, "none", 5, partB, nil))
+			return err
+		case intftcp.VerbACK:
+			sawAck = true
+			expectedAck := "10@1006@xxh128:" + xxh128HexTest(partB)
+			if got := req.Params[0]["ack-token"]; got != expectedAck {
+				return fmt.Errorf("expected ack-token=%s, got %q", expectedAck, got)
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
+		Manifest:                manifest,
+		FileID:                  0,
+		OutRoot:                 outRoot,
+		ResumeFromBytes:         5,
+		AckEveryBytes:           1,
+		NoSync:                  true,
+		ProgressUpdates:         make(chan DownloadProgressUpdate, 1),
+		AgePublicKey:            "",
+		AgeIdentity:             "",
+		MetadataApplyBestEffort: false,
+	})
+	if err != nil {
+		t.Fatalf("DownloadFileFromManifest failed: %v", err)
+	}
+	if !sawSend {
+		t.Fatalf("expected SEND request")
+	}
+	if !sawAck {
+		t.Fatalf("expected ACK request")
+	}
+
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("read resumed output: %v", err)
+	}
+	if string(got) != "helloworld" {
+		t.Fatalf("unexpected resumed output: %q", got)
 	}
 }
 
@@ -1067,10 +1245,10 @@ func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
 	}
 	dataA := []byte("hello")
 	dataB := []byte("world!")
-	finalNext := int64(0)
 
 	var ackRequests int
 	var ackBlocks []map[string]string
+	progressUpdates := make(chan DownloadProgressUpdate, 64)
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbSEND:
@@ -1086,10 +1264,10 @@ func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
 			if got := req.Params[2]["path"]; got != "/remote/b.txt" {
 				return fmt.Errorf("unexpected second path: %q", got)
 			}
-			if _, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, dataA, &finalNext)); err != nil {
+			if _, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, dataA, nil)); err != nil {
 				return err
 			}
-			if _, err := io.WriteString(out, buildFXFrame(t, 1, "none", 0, dataB, &finalNext)); err != nil {
+			if _, err := io.WriteString(out, buildFXFrame(t, 1, "none", 0, dataB, nil)); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -1113,10 +1291,11 @@ func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
 
 	client := NewClient(srv.URL)
 	resp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
-		Manifest: manifest,
-		FileIDs:  []uint64{0, 1},
-		OutRoot:  outRoot,
-		NoSync:   true,
+		Manifest:        manifest,
+		FileIDs:         []uint64{0, 1},
+		OutRoot:         outRoot,
+		NoSync:          true,
+		ProgressUpdates: progressUpdates,
 	})
 	if err != nil {
 		t.Fatalf("DownloadFilesFromManifestBatch failed: %v", err)
@@ -1172,6 +1351,24 @@ func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
 	if !bytes.Equal(gotB, dataB) {
 		t.Fatalf("unexpected output for b.txt: %q", gotB)
 	}
+	finalProgress := make(map[uint64]int64)
+	for {
+		select {
+		case update := <-progressUpdates:
+			if update.CopiedBytes > 0 {
+				finalProgress[update.FileID] = update.CopiedBytes
+			}
+		default:
+			goto doneBatchProgress
+		}
+	}
+doneBatchProgress:
+	if got := finalProgress[0]; got != int64(len(dataA)) {
+		t.Fatalf("unexpected final progress for fid=0: %d", got)
+	}
+	if got := finalProgress[1]; got != int64(len(dataB)) {
+		t.Fatalf("unexpected final progress for fid=1: %d", got)
+	}
 }
 
 func TestDownloadFileFromManifestMissingFileACKImmediate(t *testing.T) {
@@ -1206,7 +1403,7 @@ func TestDownloadFileFromManifestMissingFileACKImmediate(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest:      manifest,
 		FileID:        0,
 		OutRoot:       outRoot,
@@ -1252,7 +1449,7 @@ func TestDownloadFileFromManifestAckTimeoutDoesNotHang(t *testing.T) {
 
 	client := NewClient(srv.URL, WithAckRequestTimeout(50*time.Millisecond))
 	start := time.Now()
-	_, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest: manifest,
 		FileID:   0,
 		OutRoot:  outRoot,
@@ -1293,7 +1490,7 @@ func TestDownloadFileFromManifestWritesToStdout(t *testing.T) {
 
 	var out bytes.Buffer
 	client := NewClient(srv.URL)
-	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	downloadResp, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest: manifest,
 		FileID:   0,
 		OutRoot:  ".",

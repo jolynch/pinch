@@ -102,9 +102,11 @@ Streams one or more file windows as `FX/1` frames.
 - required per block: `fd`, `path`.
 - `offset` defaults to `0`.
 - `size` defaults to `0` (means "from offset to EOF").
-- `comp` defaults to `none`.
-- accepted compression values: `none` and `identity`.
-- others are rejected with `ERR UNSUPPORTED_COMP ...`.
+- `comp` defaults to `adapt`.
+- accepted compression values: `adapt`, `none`, `identity`, `lz4`, `zstd`.
+- `identity` is normalized to `none`.
+- in `adapt`, server may emit different per-frame `comp` values as it adjusts compression.
+- unknown compression values are rejected with `ERR UNSUPPORTED_COMP ...`.
 - each `<path>` is quoted or length-prefixed.
 - unknown `key=value` fields are ignored.
 

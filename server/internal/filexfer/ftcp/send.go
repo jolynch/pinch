@@ -1,31 +1,32 @@
 package ftcp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log"
 	"os"
 	"runtime"
-
-	//"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	intpolicy "github.com/jolynch/pinch/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
 )
 
 const defaultFileFrameLogicalSize int64 = 8 * 1024 * 1024
 const defaultMaxLinuxPipeSizeBytes int64 = 1 * 1024 * 1024
-const hashWorkerBufferSize = 256 * 1024
+const defaultCompressedFrameBufferBytes = 8 * 1024 * 1024
+const maxCompressedFrameBufferPoolBytes = 32 * 1024 * 1024
 const placeholderHeaderHashToken = "xxh128:00000000000000000000000000000000"
-const placeholderTrailerHashToken = "xxh64:0000000000000000"
 
 var logicalBufferPools sync.Map
+var compressedFrameBufferPool sync.Pool
 var pipeMaxSizeOnce sync.Once
 var pipeMaxSizeBytes int64 = defaultMaxLinuxPipeSizeBytes
 
@@ -42,9 +43,28 @@ type sendRequest struct {
 	Items      []sendItem
 }
 
-type windowHashResult struct {
-	token string
-	err   error
+type frameStreamArgs struct {
+	FileID        uint64
+	Offset        int64
+	FrameSize     int64
+	Comp          string
+	MaxWSizeHint  *int64
+	HeaderTS      int64
+	Next          int64
+	IsTerminal    bool
+	TerminalMD    *intencoding.FileFrameMetadata
+	WindowHasher  *xxh3.Hasher128
+	Output        io.Writer
+	PipeSizeBytes int
+}
+
+type frameStreamStats struct {
+	LogicalSize     int64
+	WireSize        int64
+	PrepareLatency  time.Duration
+	WriteLatency    time.Duration
+	NextOffset      int64
+	WindowHashToken string
 }
 
 func parseSENDRequest(req Request) (sendRequest, error) {
@@ -82,13 +102,15 @@ func parseSENDRequest(req Request) (sendRequest, error) {
 		}
 		comp := strings.ToLower(strings.TrimSpace(p["comp"]))
 		if comp == "" {
+			comp = "adapt"
+		}
+		if comp == intencoding.EncodingIdentity {
 			comp = "none"
 		}
-		if comp == "identity" {
-			comp = "none"
-		}
-		if comp != "none" {
-			return sendRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "only comp=none is supported"}
+		switch comp {
+		case "adapt", "none", intencoding.EncodingLz4, intencoding.EncodingZstd:
+		default:
+			return sendRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: adapt, none, lz4, zstd"}
 		}
 		path := p["path"]
 		if path == "" {
@@ -145,76 +167,104 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 	windowFrames := 0
 	windowTS0 := time.Now().UnixMilli()
 
-	maxWSizeHint := min(windowLen, defaultFileFrameLogicalSize)
-	pipeSizeBytes := desiredPipeSizeBytes(windowLen, defaultFileFrameLogicalSize)
-	hashPipeR, hashPipeW, err := os.Pipe()
+	firstFrameLogical := min(windowLen, defaultFileFrameLogicalSize)
+	maxWSizeHint, err := maxFrameWireHint(item.Comp, firstFrameLogical)
 	if err != nil {
-		return protocolErr{code: "INTERNAL", message: "failed to initialize window hash pipe"}
+		return protocolErr{code: "INTERNAL", message: "failed to compute max frame size hint"}
 	}
-	hashDone := startWindowHashWorker(hashPipeR)
+	pipeSizeBytes := desiredPipeSizeBytes(windowLen, defaultFileFrameLogicalSize)
 	useLinuxSplice := runtime.GOOS == "linux"
 	firstFrame := true
 
+	adaptive := item.Comp == "adapt"
+	currentMode := initialCompressionMode(item.Comp)
+	compressPolicy := intpolicy.NewCompressionPolicy()
+	windowHasher := xxh3.New128()
+
 	for remaining := windowLen; remaining > 0; {
 		frameSize := min(remaining, defaultFileFrameLogicalSize)
-		headerTS := time.Now().UnixMilli()
+		nextOffset := cursor + frameSize
+		isTerminal := nextOffset == item.Offset+windowLen
+		nextValue := nextOffset
+		if isTerminal {
+			nextValue = 0
+		}
 		var maxHint *int64
 		if firstFrame && maxWSizeHint > 0 {
 			maxHint = &maxWSizeHint
 		}
-		frameOffset := cursor
-		wireSize := frameSize
-		headerLine := buildFrameHeaderLine(item.FileID, cursor, frameSize, wireSize, item.Comp, maxHint, headerTS)
-		if _, err := io.WriteString(out, headerLine); err != nil {
-			_ = hashPipeW.Close()
-			<-hashDone
-			return err
-		}
 
-		var payloadErr error
-		if useLinuxSplice {
-			payloadErr = streamFramePayloadLinuxSplice(fd, &frameOffset, frameSize, out, hashPipeW, pipeSizeBytes)
-		} else {
-			payloadErr = streamFramePayloadBuffered(fd, &frameOffset, frameSize, out, hashPipeW)
-		}
-		if payloadErr != nil {
-			_ = hashPipeW.Close()
-			<-hashDone
-			return payloadErr
-		}
-
-		cursor = frameOffset
-		remaining -= frameSize
-		firstFrame = false
-		windowFrames++
-		windowLogicalTotal += frameSize
-		windowWireTotal += wireSize
-
-		isTerminal := remaining == 0
-		nextValue := cursor
-		if isTerminal {
-			nextValue = 0
-		}
-
-		trailerTS := time.Now().UnixMilli()
-		windowHashToken := ""
+		frameComp := intpolicy.FrameCompTokenForMode(currentMode)
 		var terminalMD *intencoding.FileFrameMetadata
 		if isTerminal {
-			_ = hashPipeW.Close()
-			result := <-hashDone
-			if result.err != nil {
-				return protocolErr{code: "INTERNAL", message: "failed to finalize window hash"}
-			}
-			windowHashToken = result.token
-			if !deps.SetTransferFileWindowHash(txferID, item.FileID, cursor, windowHashToken) {
-				return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
-			}
 			md := intencoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
 			terminalMD = &md
 		}
-		trailerLine := buildFrameTrailerLine(item.FileID, trailerTS, nextValue, windowHashToken, terminalMD)
-		if _, err := io.WriteString(out, trailerLine); err != nil {
+
+		frameArgs := frameStreamArgs{
+			FileID:        item.FileID,
+			Offset:        cursor,
+			FrameSize:     frameSize,
+			Comp:          frameComp,
+			MaxWSizeHint:  maxHint,
+			HeaderTS:      time.Now().UnixMilli(),
+			Next:          nextValue,
+			IsTerminal:    isTerminal,
+			TerminalMD:    terminalMD,
+			WindowHasher:  windowHasher,
+			Output:        out,
+			PipeSizeBytes: pipeSizeBytes,
+		}
+
+		frameOffset := cursor
+		var stats frameStreamStats
+		if useLinuxSplice {
+			stats, err = streamFramePayloadLinuxSplice(fd, &frameOffset, frameArgs)
+		} else {
+			stats, err = streamFramePayloadBuffered(fd, &frameOffset, frameArgs)
+		}
+		if err != nil {
 			return err
+		}
+
+		cursor = stats.NextOffset
+		remaining -= frameSize
+		firstFrame = false
+		windowFrames++
+		windowLogicalTotal += stats.LogicalSize
+		windowWireTotal += stats.WireSize
+
+		if isTerminal {
+			if stats.WindowHashToken == "" {
+				return protocolErr{code: "INTERNAL", message: "failed to finalize window hash"}
+			}
+			if !deps.SetTransferFileWindowHash(txferID, item.FileID, cursor, stats.WindowHashToken) {
+				return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
+			}
+		}
+
+		if adaptive {
+			decision := compressPolicy.Decide(currentMode, intpolicy.CompressionMetrics{
+				LogicalSize:    stats.LogicalSize,
+				WireSize:       stats.WireSize,
+				PrepareLatency: stats.PrepareLatency,
+				WriteLatency:   stats.WriteLatency,
+			})
+			if decision.Next != currentMode {
+				prevComp := intpolicy.FrameCompTokenForMode(currentMode)
+				nextComp := intpolicy.FrameCompTokenForMode(decision.Next)
+				log.Printf(
+					"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f read_over_write=%.3f",
+					txferID,
+					item.FileID,
+					prevComp,
+					nextComp,
+					decision.Reason,
+					decision.Ratio,
+					decision.ReadOverWrite,
+				)
+				currentMode = decision.Next
+			}
 		}
 	}
 
@@ -244,25 +294,37 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 	return nil
 }
 
-func startWindowHashWorker(pipeR *os.File) <-chan windowHashResult {
-	done := make(chan windowHashResult, 1)
-	go func() {
-		defer close(done)
-		defer pipeR.Close()
-		hasher := xxh3.New128()
-		buf, release, err := acquireLogicalBuffer(hashWorkerBufferSize)
-		if err != nil {
-			done <- windowHashResult{err: err}
-			return
+func initialCompressionMode(comp string) intpolicy.CompressionMode {
+	switch comp {
+	case intencoding.EncodingLz4:
+		return intpolicy.CompressionModeLz4
+	case intencoding.EncodingZstd:
+		return intpolicy.CompressionModeZstdLevel1
+	default:
+		return intpolicy.CompressionModeNone
+	}
+}
+
+func maxFrameWireHint(comp string, logicalSize int64) (int64, error) {
+	if logicalSize <= 0 {
+		return 0, nil
+	}
+	switch comp {
+	case "adapt":
+		maxHint := int64(0)
+		for _, candidate := range []string{"none", intencoding.EncodingLz4, intencoding.EncodingZstd} {
+			hint, err := intencoding.MaxFrameWireSizeHintBytes(candidate, logicalSize)
+			if err != nil {
+				return 0, err
+			}
+			if hint > maxHint {
+				maxHint = hint
+			}
 		}
-		defer release()
-		if _, err := io.CopyBuffer(hasher, pipeR, buf); err != nil {
-			done <- windowHashResult{err: err}
-			return
-		}
-		done <- windowHashResult{token: intencoding.FormatXXH128HashToken(hasher.Sum128())}
-	}()
-	return done
+		return maxHint, nil
+	default:
+		return intencoding.MaxFrameWireSizeHintBytes(comp, logicalSize)
+	}
 }
 
 func desiredPipeSizeBytes(windowLen int64, frameSize int64) int {
@@ -341,8 +403,6 @@ func buildFrameTrailerLine(fileID uint64, ts int64, next int64, windowHashToken 
 			b.WriteString(token)
 		}
 	}
-	b.WriteString(" hash=")
-	b.WriteString(placeholderTrailerHashToken)
 	b.WriteString("\n")
 	return b.String()
 }
@@ -362,78 +422,417 @@ func metadataTrailerTokens(metadata *intencoding.FileFrameMetadata) []string {
 	}
 }
 
-func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, frameSize int64, frameWriter io.Writer, hashPipeW *os.File) error {
-	section := io.NewSectionReader(fd, *fileOffset, frameSize)
-	buf, release, err := acquireLogicalBuffer(1024 * 1024)
-	if err != nil {
+func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
+	if args.Comp == "none" {
+		return streamBufferedNone(fd, fileOffset, args)
+	}
+	return streamBufferedCompressed(fd, fileOffset, args)
+}
+
+func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
+	if args.Comp == "none" {
+		return streamSpliceNone(fd, fileOffset, args)
+	}
+	return streamSpliceCompressed(fd, fileOffset, args)
+}
+
+func writeFrameHeader(out io.Writer, args frameStreamArgs, wireSize int64, writeLatency *time.Duration) error {
+	headerLine := buildFrameHeaderLine(args.FileID, args.Offset, args.FrameSize, wireSize, args.Comp, args.MaxWSizeHint, args.HeaderTS)
+	writeStart := time.Now()
+	if _, err := io.WriteString(out, headerLine); err != nil {
 		return err
 	}
-	defer release()
-	written, err := io.CopyBuffer(io.MultiWriter(frameWriter, hashPipeW), section, buf)
-	*fileOffset += written
-	if err != nil {
-		return err
-	}
-	if written != frameSize {
-		return io.ErrUnexpectedEOF
+	if writeLatency != nil {
+		*writeLatency += time.Since(writeStart)
 	}
 	return nil
 }
 
-func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, frameSize int64, frameWriter io.Writer, hashPipeW *os.File, pipeSize int) error {
+func writeFrameTrailer(out io.Writer, args frameStreamArgs, writeLatency *time.Duration) (string, error) {
+	windowHashToken := ""
+	if args.IsTerminal {
+		windowHashToken = intencoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
+	}
+	trailerLine := buildFrameTrailerLine(args.FileID, time.Now().UnixMilli(), args.Next, windowHashToken, args.TerminalMD)
+	writeStart := time.Now()
+	if _, err := io.WriteString(out, trailerLine); err != nil {
+		return "", err
+	}
+	if writeLatency != nil {
+		*writeLatency += time.Since(writeStart)
+	}
+	return windowHashToken, nil
+}
+
+func streamBufferedRead(
+	fd *os.File,
+	fileOffset *int64,
+	frameSize int64,
+	buf []byte,
+	includeHandleInPrepare bool,
+	handle func([]byte) error,
+) (time.Duration, error) {
+	prepareLatency := time.Duration(0)
+	remaining := frameSize
+	for remaining > 0 {
+		readSize := len(buf)
+		if int64(readSize) > remaining {
+			readSize = int(remaining)
+		}
+		readStart := time.Now()
+		n, readErr := fd.ReadAt(buf[:readSize], *fileOffset)
+		prepareLatency += time.Since(readStart)
+		if n > 0 {
+			*fileOffset += int64(n)
+			remaining -= int64(n)
+			handleStart := time.Now()
+			if err := handle(buf[:n]); err != nil {
+				return 0, err
+			}
+			if includeHandleInPrepare {
+				prepareLatency += time.Since(handleStart)
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) && remaining == 0 {
+				break
+			}
+			return 0, readErr
+		}
+	}
+	if remaining != 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	return prepareLatency, nil
+}
+
+func streamBufferedNone(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
+	buf, release, err := acquireLogicalBuffer(logicalBufferBucketSize(args.FrameSize))
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+	defer release()
+
+	writeLatency := time.Duration(0)
+	if err := writeFrameHeader(args.Output, args, args.FrameSize, &writeLatency); err != nil {
+		return frameStreamStats{}, err
+	}
+
+	prepareLatency, err := streamBufferedRead(fd, fileOffset, args.FrameSize, buf, false, func(chunk []byte) error {
+		_, _ = args.WindowHasher.Write(chunk)
+		writeStart := time.Now()
+		written, writeErr := args.Output.Write(chunk)
+		writeLatency += time.Since(writeStart)
+		if writeErr != nil {
+			return writeErr
+		}
+		if written != len(chunk) {
+			return io.ErrShortWrite
+		}
+		return nil
+	})
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+
+	windowHashToken, err := writeFrameTrailer(args.Output, args, &writeLatency)
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+
+	return frameStreamStats{
+		LogicalSize:     args.FrameSize,
+		WireSize:        args.FrameSize,
+		PrepareLatency:  prepareLatency,
+		WriteLatency:    writeLatency,
+		NextOffset:      *fileOffset,
+		WindowHashToken: windowHashToken,
+	}, nil
+}
+
+func streamBufferedCompressed(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
+	readBuf, releaseRead, err := acquireLogicalBuffer(logicalBufferBucketSize(args.FrameSize))
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+	defer releaseRead()
+	frameBuf := acquireCompressedFrameBuffer()
+	defer releaseCompressedFrameBuffer(frameBuf)
+
+	compressedWriter, closeCompressedWriter, selected, err := intencoding.WrapCompressedWriter(frameBuf, args.Comp)
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+	if selected != args.Comp {
+		return frameStreamStats{}, errors.New("compression mode negotiation mismatch")
+	}
+
+	prepareLatency, err := streamBufferedRead(fd, fileOffset, args.FrameSize, readBuf, true, func(chunk []byte) error {
+		_, _ = args.WindowHasher.Write(chunk)
+		written, writeErr := compressedWriter.Write(chunk)
+		if writeErr != nil {
+			return writeErr
+		}
+		if written != len(chunk) {
+			return io.ErrShortWrite
+		}
+		return nil
+	})
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+	if err := closeCompressedWriter(); err != nil {
+		return frameStreamStats{}, err
+	}
+
+	wireSize := int64(frameBuf.Len())
+	writeLatency := time.Duration(0)
+	if err := writeFrameHeader(args.Output, args, wireSize, &writeLatency); err != nil {
+		return frameStreamStats{}, err
+	}
+
+	writeStart := time.Now()
+	if _, err := args.Output.Write(frameBuf.Bytes()); err != nil {
+		return frameStreamStats{}, err
+	}
+	writeLatency += time.Since(writeStart)
+
+	windowHashToken, err := writeFrameTrailer(args.Output, args, &writeLatency)
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+
+	return frameStreamStats{
+		LogicalSize:     args.FrameSize,
+		WireSize:        wireSize,
+		PrepareLatency:  prepareLatency,
+		WriteLatency:    writeLatency,
+		NextOffset:      *fileOffset,
+		WindowHashToken: windowHashToken,
+	}, nil
+}
+
+func streamSpliceNone(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
 	srcR, srcW, err := os.Pipe()
 	if err != nil {
-		return err
+		return frameStreamStats{}, err
 	}
 	defer srcR.Close()
 	defer srcW.Close()
 
-	growPipeBestEffort(srcR, pipeSize)
-	growPipeBestEffort(srcW, pipeSize)
-	growPipeBestEffort(hashPipeW, pipeSize)
+	growPipeBestEffort(srcR, args.PipeSizeBytes)
+	growPipeBestEffort(srcW, args.PipeSizeBytes)
 
-	copyBufSize := logicalBufferBucketSize(int64(pipeSize))
+	copyBufSize := logicalBufferBucketSize(int64(args.PipeSizeBytes))
 	copyBuf, releaseCopyBuf, err := acquireLogicalBuffer(copyBufSize)
 	if err != nil {
-		return err
+		return frameStreamStats{}, err
 	}
 	defer releaseCopyBuf()
 
-	remaining := frameSize
+	writeLatency := time.Duration(0)
+	headerLine := buildFrameHeaderLine(args.FileID, args.Offset, args.FrameSize, args.FrameSize, args.Comp, args.MaxWSizeHint, args.HeaderTS)
+	writeStart := time.Now()
+	if _, err := io.WriteString(args.Output, headerLine); err != nil {
+		return frameStreamStats{}, err
+	}
+	writeLatency += time.Since(writeStart)
+
+	prepareLatency := time.Duration(0)
+	remaining := args.FrameSize
 	for remaining > 0 {
 		step := remaining
-		if step > int64(pipeSize) {
-			step = int64(pipeSize)
+		if step > int64(args.PipeSizeBytes) {
+			step = int64(args.PipeSizeBytes)
 		}
+		spliceStart := time.Now()
 		splicedIn, spliceErr := unix.Splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), unix.SPLICE_F_MOVE)
+		prepareLatency += time.Since(spliceStart)
 		if spliceErr != nil {
-			return spliceErr
+			return frameStreamStats{}, spliceErr
 		}
 		if splicedIn <= 0 {
-			return io.ErrUnexpectedEOF
+			return frameStreamStats{}, io.ErrUnexpectedEOF
 		}
-		sourceRemaining := splicedIn
+
+		sourceRemaining := int64(splicedIn)
 		for sourceRemaining > 0 {
-			teed, teeErr := unix.Tee(int(srcR.Fd()), int(hashPipeW.Fd()), int(sourceRemaining), 0)
-			if teeErr != nil {
-				return teeErr
+			chunk := sourceRemaining
+			if chunk > int64(len(copyBuf)) {
+				chunk = int64(len(copyBuf))
 			}
-			if teed <= 0 {
-				return io.ErrUnexpectedEOF
+			readStart := time.Now()
+			n, readErr := io.ReadFull(srcR, copyBuf[:chunk])
+			prepareLatency += time.Since(readStart)
+			if n > 0 {
+				_, _ = args.WindowHasher.Write(copyBuf[:n])
+				writeStart = time.Now()
+				written, writeErr := args.Output.Write(copyBuf[:n])
+				writeLatency += time.Since(writeStart)
+				if writeErr != nil {
+					return frameStreamStats{}, writeErr
+				}
+				if written != n {
+					return frameStreamStats{}, io.ErrShortWrite
+				}
+				sourceRemaining -= int64(n)
 			}
-			limited := &io.LimitedReader{R: srcR, N: int64(teed)}
-			written, copyErr := io.CopyBuffer(frameWriter, limited, copyBuf)
-			if copyErr != nil {
-				return copyErr
+			if readErr != nil {
+				return frameStreamStats{}, readErr
 			}
-			if written != int64(teed) {
-				return io.ErrUnexpectedEOF
-			}
-			sourceRemaining -= teed
 		}
 		remaining -= int64(splicedIn)
 	}
-	return nil
+
+	windowHashToken := ""
+	if args.IsTerminal {
+		windowHashToken = intencoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
+	}
+	trailerLine := buildFrameTrailerLine(args.FileID, time.Now().UnixMilli(), args.Next, windowHashToken, args.TerminalMD)
+	writeStart = time.Now()
+	if _, err := io.WriteString(args.Output, trailerLine); err != nil {
+		return frameStreamStats{}, err
+	}
+	writeLatency += time.Since(writeStart)
+
+	return frameStreamStats{
+		LogicalSize:     args.FrameSize,
+		WireSize:        args.FrameSize,
+		PrepareLatency:  prepareLatency,
+		WriteLatency:    writeLatency,
+		NextOffset:      *fileOffset,
+		WindowHashToken: windowHashToken,
+	}, nil
+}
+
+func streamSpliceCompressed(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
+	srcR, srcW, err := os.Pipe()
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+	defer srcR.Close()
+	defer srcW.Close()
+
+	growPipeBestEffort(srcR, args.PipeSizeBytes)
+	growPipeBestEffort(srcW, args.PipeSizeBytes)
+
+	copyBufSize := logicalBufferBucketSize(int64(args.PipeSizeBytes))
+	copyBuf, releaseCopyBuf, err := acquireLogicalBuffer(copyBufSize)
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+	defer releaseCopyBuf()
+
+	frameBuf := acquireCompressedFrameBuffer()
+	defer releaseCompressedFrameBuffer(frameBuf)
+	compressedWriter, closeCompressedWriter, selected, err := intencoding.WrapCompressedWriter(frameBuf, args.Comp)
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+	if selected != args.Comp {
+		return frameStreamStats{}, errors.New("compression mode negotiation mismatch")
+	}
+
+	prepareStart := time.Now()
+	remaining := args.FrameSize
+	for remaining > 0 {
+		step := remaining
+		if step > int64(args.PipeSizeBytes) {
+			step = int64(args.PipeSizeBytes)
+		}
+		splicedIn, spliceErr := unix.Splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), unix.SPLICE_F_MOVE)
+		if spliceErr != nil {
+			return frameStreamStats{}, spliceErr
+		}
+		if splicedIn <= 0 {
+			return frameStreamStats{}, io.ErrUnexpectedEOF
+		}
+
+		sourceRemaining := int64(splicedIn)
+		for sourceRemaining > 0 {
+			chunk := sourceRemaining
+			if chunk > int64(len(copyBuf)) {
+				chunk = int64(len(copyBuf))
+			}
+			n, readErr := io.ReadFull(srcR, copyBuf[:chunk])
+			if n > 0 {
+				_, _ = args.WindowHasher.Write(copyBuf[:n])
+				written, writeErr := compressedWriter.Write(copyBuf[:n])
+				if writeErr != nil {
+					return frameStreamStats{}, writeErr
+				}
+				if written != n {
+					return frameStreamStats{}, io.ErrShortWrite
+				}
+				sourceRemaining -= int64(n)
+			}
+			if readErr != nil {
+				return frameStreamStats{}, readErr
+			}
+		}
+		remaining -= int64(splicedIn)
+	}
+	if err := closeCompressedWriter(); err != nil {
+		return frameStreamStats{}, err
+	}
+	prepareLatency := time.Since(prepareStart)
+
+	wireSize := int64(frameBuf.Len())
+	writeLatency := time.Duration(0)
+	headerLine := buildFrameHeaderLine(args.FileID, args.Offset, args.FrameSize, wireSize, args.Comp, args.MaxWSizeHint, args.HeaderTS)
+	writeStart := time.Now()
+	if _, err := io.WriteString(args.Output, headerLine); err != nil {
+		return frameStreamStats{}, err
+	}
+	writeLatency += time.Since(writeStart)
+
+	writeStart = time.Now()
+	if _, err := args.Output.Write(frameBuf.Bytes()); err != nil {
+		return frameStreamStats{}, err
+	}
+	writeLatency += time.Since(writeStart)
+
+	windowHashToken := ""
+	if args.IsTerminal {
+		windowHashToken = intencoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
+	}
+	trailerLine := buildFrameTrailerLine(args.FileID, time.Now().UnixMilli(), args.Next, windowHashToken, args.TerminalMD)
+	writeStart = time.Now()
+	if _, err := io.WriteString(args.Output, trailerLine); err != nil {
+		return frameStreamStats{}, err
+	}
+	writeLatency += time.Since(writeStart)
+
+	return frameStreamStats{
+		LogicalSize:     args.FrameSize,
+		WireSize:        wireSize,
+		PrepareLatency:  prepareLatency,
+		WriteLatency:    writeLatency,
+		NextOffset:      *fileOffset,
+		WindowHashToken: windowHashToken,
+	}, nil
+}
+
+func acquireCompressedFrameBuffer() *bytes.Buffer {
+	if raw := compressedFrameBufferPool.Get(); raw != nil {
+		if buf, ok := raw.(*bytes.Buffer); ok && buf != nil {
+			buf.Reset()
+			return buf
+		}
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, defaultCompressedFrameBufferBytes))
+	return buf
+}
+
+func releaseCompressedFrameBuffer(buf *bytes.Buffer) {
+	if buf == nil {
+		return
+	}
+	if buf.Cap() > maxCompressedFrameBufferPoolBytes {
+		return
+	}
+	buf.Reset()
+	compressedFrameBufferPool.Put(buf)
 }
 
 func acquireLogicalBuffer(size int) ([]byte, func(), error) {

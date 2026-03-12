@@ -230,12 +230,12 @@ Default logical frame size cap is `8 MiB`.
 
 For `SEND` responses, header properties are emitted in this order:
 `offset`, `size`, `wsize`, `comp`, `enc`, `hash`, optional `max-wsize`, then `ts`.
-Current implementation supports only `comp=none`; non-`none` requests are rejected.
+Current implementation supports adaptive compression and may vary `comp` per frame.
 
 Current trailer shape for `SEND`:
 
 ```text
-FXT/1 <file_id> status=ok ts=<unix_ms> [file-hash=<algo>:<value>] next=<offset> [meta:*=...] hash=<algo>:<value>
+FXT/1 <file_id> status=ok ts=<unix_ms> [file-hash=<algo>:<value>] next=<offset> [meta:*=...]
 ```
 
 `next` is the offset that the following frame starts at (`offset + size`).
@@ -246,10 +246,6 @@ The final trailer also includes file metadata tokens:
 `meta:size`, `meta:mtime_ns`, `meta:mode`, `meta:uid`, `meta:gid`, `meta:user`, `meta:group`.
 Clients may use `meta:mode`, `meta:uid`, and `meta:gid` to mirror ownership/permissions
 only after payload integrity verification succeeds.
-
-`hash=<algo>:<value>` remains present on every trailer for framing compatibility.
-Current implementation emits a placeholder trailer hash token and does not
-use it for cryptographic verification.
 
 `file-hash=<algo>:<value>` on terminal trailer is the authoritative per-window
 checksum token. Current implementation emits `file-hash=xxh128:<hex32>`.

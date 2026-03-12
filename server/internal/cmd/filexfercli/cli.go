@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -25,6 +24,7 @@ import (
 
 const defaultVerboseStatusInterval = 10 * time.Second
 const defaultCLIAckEveryBytes int64 = 256 * 1024 * 1024
+const defaultVerboseProgressInterval = 2 * time.Second
 
 type synchronizedWriter struct {
 	mu *sync.Mutex
@@ -35,14 +35,6 @@ func (sw *synchronizedWriter) Write(p []byte) (int, error) {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	return sw.w.Write(p)
-}
-
-func defaultClientConcurrency() int {
-	n := runtime.NumCPU() * 2
-	if n < 1 {
-		return 1
-	}
-	return n
 }
 
 func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -166,7 +158,12 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		total += e.Size
 	}
 	if manifestOut == "" || manifestOut == "-" {
-		if _, err := stdout.Write(manifest.Raw); err != nil {
+		manifestBytes, err := MarshalManifest(manifest)
+		if err != nil {
+			fmt.Fprintf(stderr, "encode manifest failed: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(manifestBytes); err != nil {
 			fmt.Fprintf(stderr, "write manifest failed: %v\n", err)
 			return 1
 		}
@@ -265,12 +262,10 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintln(stderr, "get requires --fd")
 		return 2
 	}
-	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
-	if err != nil {
+	if ackEvery, err := encoding.ParseByteSize(ackEveryRaw); err != nil {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
-	}
-	if ackEvery <= 0 {
+	} else if ackEvery <= 0 {
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
 		return 2
 	}
@@ -296,18 +291,24 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
 		return 1
 	}
+	manifest.Progress = progressState
 	progressUpdates := make(chan DownloadProgressUpdate, 128)
-	stopProgress, markMetadataDone := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
-	defer stopProgress()
-	var onAck func(AckProgressEvent)
+	var onProgressUpdate func(DownloadProgressUpdate)
 	if verbose {
-		ackReporter := newAckMilestoneReporter(stderr)
-		onAck = ackReporter.Report
+		progressReporter := newVerboseProgressReporter(stderr)
+		onProgressUpdate = progressReporter.ReportUpdate
 	}
+	stopProgress, markMetadataDone := startProgressWriter(progressPath, progressState, progressUpdates, onProgressUpdate, stderr)
+	defer stopProgress()
 
 	client := NewClient(serverURL)
 	start := time.Now()
-	if st, ok := progressState[fileID]; ok && st.AckBytes >= manifestEntrySize(manifest, fileID) {
+	entrySize := manifestEntrySize(manifest, fileID)
+	resumeFrom := int64(0)
+	if st, ok := manifest.Progress[fileID]; ok && st.AckBytes > 0 && st.AckBytes < entrySize && outFile != "-" {
+		resumeFrom = st.AckBytes
+	}
+	if st, ok := manifest.Progress[fileID]; ok && st.AckBytes >= entrySize {
 		if !st.MetadataDone {
 			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, fileID, outRoot, outFile, agePublicKey, ageIdentity); err != nil {
 				fmt.Fprintf(stderr, "get metadata refresh failed: %v\n", err)
@@ -320,24 +321,35 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "get skipped: already complete fd=%d ack=%d\n", fileID, st.AckBytes)
 		return 0
 	}
-	downloadResp, err := client.DownloadFileFromManifest(context.Background(), DownloadFileRequest{
+	if resumeFrom > 0 {
+		if manifest.Progress == nil {
+			manifest.Progress = make(map[uint64]ManifestProgress)
+		}
+		progress := manifest.Progress[fileID]
+		progress.AckBytes = resumeFrom
+		manifest.Progress[fileID] = progress
+	}
+	downloadBatchResp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
 		Manifest:        manifest,
-		FileID:          fileID,
+		FileIDs:         []uint64{fileID},
 		OutRoot:         outRoot,
 		OutFile:         outFile,
 		Stdout:          stdout,
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
-		AckEveryBytes:   ackEvery,
 		NoSync:          noSync,
 		ProgressUpdates: progressUpdates,
-		OnAck:           onAck,
 	})
 	elapsed := time.Since(start)
 	if err != nil {
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1
 	}
+	if len(downloadBatchResp.Files) != 1 {
+		fmt.Fprintf(stderr, "get failed: expected one downloaded file, got %d\n", len(downloadBatchResp.Files))
+		return 1
+	}
+	downloadResp := downloadBatchResp.Files[0]
 	markMetadataDone(fileID)
 	printFileMetrics(stdout, manifest.TransferID, fileID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
 	return 0
@@ -364,7 +376,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
-	fs.IntVar(&concurrency, "concurrency", defaultClientConcurrency(), "parallel download workers")
+	fs.IntVar(&concurrency, "concurrency", DefaultClientConcurrency(), "parallel download workers")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	fs.StringVar(&ackEveryRaw, "A", ackEveryRaw, "bytes between progress acks")
 	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
@@ -402,14 +414,15 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
 		return 1
 	}
+	manifest.Progress = progressState
 	progressUpdates := make(chan DownloadProgressUpdate, 1024)
-	stopProgress, markMetadataDone := startProgressWriter(progressPath, progressState, progressUpdates, stderr)
-	defer stopProgress()
-	var onAck func(AckProgressEvent)
+	var onStartProgressUpdate func(DownloadProgressUpdate)
 	if verbose {
-		ackReporter := newAckMilestoneReporter(stderr)
-		onAck = ackReporter.Report
+		progressReporter := newVerboseProgressReporter(stderr)
+		onStartProgressUpdate = progressReporter.ReportUpdate
 	}
+	stopProgress, markMetadataDone := startProgressWriter(progressPath, progressState, progressUpdates, onStartProgressUpdate, stderr)
+	defer stopProgress()
 	client := NewClient(serverURL)
 
 	startAll := time.Now()
@@ -423,7 +436,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	pendingEntries := make([]ManifestEntry, 0, len(manifest.Entries))
 	for _, entry := range manifest.Entries {
-		if st, ok := progressState[entry.ID]; ok && st.AckBytes >= entry.Size {
+		if st, ok := manifest.Progress[entry.ID]; ok && st.AckBytes >= entry.Size {
 			if st.MetadataDone {
 				completed++
 				continue
@@ -448,7 +461,6 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		Concurrency:     concurrency,
 		BatchMaxBytes:   ackEvery,
 		ProgressUpdates: progressUpdates,
-		OnAck:           onAck,
 		OnFileDone: func(evt StartFileDoneEvent) {
 			markMetadataDone(evt.File.Meta.FileID)
 			printStartFileSummary(stdout, evt.File.Meta.FileID, evt.File.DestinationPath, evt.File.Meta, evt.File.LocalFileHash, evt.Elapsed)
@@ -528,8 +540,7 @@ func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer)
 			} else {
 				fmt.Fprintf(
 					stderr,
-					"transfer-progress: tid=%s files=%.2f%% bytes=%.2f%%\n",
-					txferID,
+					"transfer-progress: files=%.2f%% bytes=%.2f%%\n",
 					statusResp.Status.PercentFiles,
 					statusResp.Status.PercentBytes,
 				)
@@ -590,13 +601,8 @@ func manifestEntrySize(manifest *Manifest, fileID uint64) int64 {
 	return entry.Size
 }
 
-type progressStateEntry struct {
-	AckBytes     int64
-	MetadataDone bool
-}
-
-func loadProgressState(progressPath string) (map[uint64]progressStateEntry, error) {
-	state := make(map[uint64]progressStateEntry)
+func loadProgressState(progressPath string) (map[uint64]ManifestProgress, error) {
+	state := make(map[uint64]ManifestProgress)
 	fd, err := os.Open(progressPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -637,7 +643,7 @@ func loadProgressState(progressPath string) (map[uint64]progressStateEntry, erro
 		}
 		prev, ok := state[fileID]
 		if !ok || ack > prev.AckBytes || (ack == prev.AckBytes && metadataDone && !prev.MetadataDone) {
-			state[fileID] = progressStateEntry{
+			state[fileID] = ManifestProgress{
 				AckBytes:     ack,
 				MetadataDone: metadataDone,
 			}
@@ -653,10 +659,10 @@ type metadataProgressUpdate struct {
 	FileID uint64
 }
 
-func startProgressWriter(progressPath string, initial map[uint64]progressStateEntry, updates <-chan DownloadProgressUpdate, stderr io.Writer) (func(), func(uint64)) {
-	state := make(map[uint64]progressStateEntry, len(initial))
-	for fileID, entry := range initial {
-		state[fileID] = entry
+func startProgressWriter(progressPath string, initial map[uint64]ManifestProgress, updates <-chan DownloadProgressUpdate, onUpdate func(DownloadProgressUpdate), stderr io.Writer) (func(), func(uint64)) {
+	state := initial
+	if state == nil {
+		state = make(map[uint64]ManifestProgress)
 	}
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
@@ -702,6 +708,9 @@ func startProgressWriter(progressPath string, initial map[uint64]progressStateEn
 		defer ticker.Stop()
 		dirty := false
 		applyProgress := func(update DownloadProgressUpdate) {
+			if onUpdate != nil {
+				onUpdate(update)
+			}
 			prev := state[update.FileID]
 			if update.AckBytes > prev.AckBytes {
 				prev.AckBytes = update.AckBytes
@@ -974,84 +983,158 @@ func applyTrailerMetadataToPath(path string, meta *FileTrailerMetadata) error {
 	return nil
 }
 
-type ackMilestoneReporter struct {
-	mu      sync.Mutex
-	stderr  io.Writer
-	nextPct map[string]int64
-	state   map[string]ackProgressState
+type verboseProgressReporter struct {
+	mu     sync.Mutex
+	stderr io.Writer
+	now    func() time.Time
+	state  map[uint64]*verboseProgressState
 }
 
-type ackProgressState struct {
-	lastAck   int64
-	firstAck  int64
-	firstTime time.Time
+type verboseProgressState struct {
+	targetBytes     int64
+	copiedBytes     int64
+	ackedBytes      int64
+	nextPct         int64
+	startedAt       time.Time
+	lastEmitAt      time.Time
+	lastEmitBytes   int64
+	completeEmitted bool
 }
 
-func newAckMilestoneReporter(stderr io.Writer) *ackMilestoneReporter {
-	return &ackMilestoneReporter{
-		stderr:  stderr,
-		nextPct: make(map[string]int64),
-		state:   make(map[string]ackProgressState),
+func newVerboseProgressReporter(stderr io.Writer) *verboseProgressReporter {
+	return &verboseProgressReporter{
+		stderr: stderr,
+		now:    time.Now,
+		state:  make(map[uint64]*verboseProgressState),
 	}
 }
 
-func (r *ackMilestoneReporter) Report(evt AckProgressEvent) {
-	if r == nil || r.stderr == nil || evt.TargetBytes <= 0 {
+func (r *verboseProgressReporter) ReportUpdate(update DownloadProgressUpdate) {
+	if r == nil || r.stderr == nil || update.TargetBytes <= 0 {
 		return
 	}
-	key := fmt.Sprintf("%s/%d", evt.TransferID, evt.FileID)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	st := r.state[key]
-	if st.firstTime.IsZero() {
-		st.firstTime = evt.AckTime
-		st.firstAck = evt.AckBytes
+	now := update.UpdateTime
+	if now.IsZero() {
+		now = r.now()
 	}
 
-	next := r.nextPct[key]
-	if next == 0 {
-		next = 10
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	st := r.ensureStateLocked(update.FileID, update.TargetBytes, now)
+	if st.targetBytes <= 0 {
+		return
 	}
-	progress := int64((evt.AckBytes * 100) / evt.TargetBytes)
-	if progress > 100 {
-		progress = 100
+	copied := clampInt64(update.CopiedBytes, 0, st.targetBytes)
+	if copied > st.copiedBytes {
+		st.copiedBytes = copied
 	}
-	for next <= 100 && progress >= next {
-		prevAck := st.lastAck
-		deltaBytes := evt.AckBytes - prevAck
-		rateBps := 0.0
-		if !evt.PrevAckTime.IsZero() && evt.AckTime.After(evt.PrevAckTime) && deltaBytes > 0 {
-			rateBps = float64(deltaBytes) / evt.AckTime.Sub(evt.PrevAckTime).Seconds()
+	acked := clampInt64(update.AckBytes, 0, st.targetBytes)
+	if acked > st.ackedBytes {
+		st.ackedBytes = acked
+	}
+
+	if st.completeEmitted {
+		return
+	}
+
+	shouldEmit := false
+	progressPct := (st.copiedBytes * 100) / st.targetBytes
+	for st.nextPct <= 100 && progressPct >= st.nextPct {
+		shouldEmit = true
+		st.nextPct += 20
+	}
+
+	lastActivity := st.lastEmitAt
+	if lastActivity.IsZero() {
+		lastActivity = st.startedAt
+	}
+	if !shouldEmit && now.Sub(lastActivity) >= defaultVerboseProgressInterval && st.copiedBytes > st.lastEmitBytes {
+		shouldEmit = true
+	}
+	if st.copiedBytes >= st.targetBytes {
+		shouldEmit = true
+	}
+	if shouldEmit {
+		r.emitLocked(update.FileID, st, now)
+	}
+}
+
+func (r *verboseProgressReporter) ensureStateLocked(fileID uint64, targetBytes int64, now time.Time) *verboseProgressState {
+	st := r.state[fileID]
+	if st == nil {
+		st = &verboseProgressState{
+			targetBytes: targetBytes,
+			nextPct:     20,
+			startedAt:   now,
 		}
-		if rateBps <= 0 && !st.firstTime.IsZero() && evt.AckTime.After(st.firstTime) {
-			totalBytes := evt.AckBytes - st.firstAck
-			if totalBytes > 0 {
-				rateBps = float64(totalBytes) / evt.AckTime.Sub(st.firstTime).Seconds()
-			}
-		}
-		eta := "n/a"
-		if rateBps > 0 && evt.AckBytes < evt.TargetBytes {
-			remaining := evt.TargetBytes - evt.AckBytes
-			eta = humanETA(time.Duration(float64(remaining) / rateBps * float64(time.Second)))
-		}
-		fmt.Fprintf(
-			r.stderr,
-			"progress: tid=%s fd=%d %d%% (bytes=%d/%d) rate=%s eta=%s\n",
-			evt.TransferID,
-			evt.FileID,
-			next,
-			evt.AckBytes,
-			evt.TargetBytes,
-			encoding.HumanRate(rateBps),
-			eta,
-		)
-		next += 10
+		r.state[fileID] = st
 	}
-	r.nextPct[key] = next
-	if evt.AckBytes > st.lastAck {
-		st.lastAck = evt.AckBytes
+	if st.startedAt.IsZero() {
+		st.startedAt = now
 	}
-	r.state[key] = st
+	if targetBytes > 0 {
+		st.targetBytes = targetBytes
+	}
+	if st.nextPct <= 0 {
+		st.nextPct = 20
+	}
+	return st
+}
+
+func (r *verboseProgressReporter) emitLocked(fileID uint64, st *verboseProgressState, now time.Time) {
+	if st == nil || st.targetBytes <= 0 {
+		return
+	}
+
+	copied := clampInt64(st.copiedBytes, 0, st.targetBytes)
+	acked := clampInt64(st.ackedBytes, 0, st.targetBytes)
+	pct := (copied * 100) / st.targetBytes
+	if pct > 100 {
+		pct = 100
+	}
+
+	rateBps := 0.0
+	if !st.lastEmitAt.IsZero() && now.After(st.lastEmitAt) && copied > st.lastEmitBytes {
+		rateBps = float64(copied-st.lastEmitBytes) / now.Sub(st.lastEmitAt).Seconds()
+	}
+	if rateBps <= 0 && !st.startedAt.IsZero() && now.After(st.startedAt) && copied > 0 {
+		rateBps = float64(copied) / now.Sub(st.startedAt).Seconds()
+	}
+
+	eta := "n/a"
+	if rateBps > 0 && copied < st.targetBytes {
+		remaining := st.targetBytes - copied
+		eta = humanETA(time.Duration(float64(remaining) / rateBps * float64(time.Second)))
+	}
+
+	fmt.Fprintf(
+		r.stderr,
+		"progress: fd=%d %d%% bytes=%s/%s [%s] rate=%s eta=%s\n",
+		fileID,
+		pct,
+		encoding.HumanBytes(copied),
+		encoding.HumanBytes(st.targetBytes),
+		encoding.HumanBytes(acked),
+		encoding.HumanRate(rateBps),
+		eta,
+	)
+
+	st.lastEmitAt = now
+	st.lastEmitBytes = copied
+	if copied >= st.targetBytes {
+		st.completeEmitted = true
+	}
+}
+
+func clampInt64(value int64, min int64, max int64) int64 {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
 }
 
 func humanETA(d time.Duration) string {

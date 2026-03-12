@@ -34,3 +34,16 @@ func TestWriteFrameReturnsStats(t *testing.T) {
 		t.Fatalf("expected positive wire throughput, got %f", stats.WireThroughputBps)
 	}
 }
+
+func TestParseFXTrailerAllowsMissingTrailerHash(t *testing.T) {
+	trailer, err := ParseFXTrailer("FXT/1 2 status=ok ts=1001 next=0 file-hash=xxh128:0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatalf("ParseFXTrailer failed: %v", err)
+	}
+	if trailer.FileID != 2 {
+		t.Fatalf("unexpected file id: %d", trailer.FileID)
+	}
+	if trailer.HashToken != "" {
+		t.Fatalf("expected empty trailer hash token, got %q", trailer.HashToken)
+	}
+}

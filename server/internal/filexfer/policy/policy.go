@@ -3,7 +3,7 @@ package policy
 import (
 	"time"
 
-	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
 )
 
 type CompressionMode uint8
@@ -167,11 +167,11 @@ func CompressionModeFromStored(raw uint8) CompressionMode {
 func FrameCompTokenForMode(mode CompressionMode) string {
 	switch mode {
 	case CompressionModeLz4:
-		return intencoding.EncodingLz4
+		return encoding.EncodingLz4
 	case CompressionModeNone:
 		return "none"
 	default:
-		return intencoding.EncodingZstd
+		return encoding.EncodingZstd
 	}
 }
 

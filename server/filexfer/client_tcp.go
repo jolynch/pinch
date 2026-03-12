@@ -449,6 +449,14 @@ func (c *Client) fetchFileBatchTCP(
 		b.WriteString(strconv.FormatUint(t.FileID, 10))
 		b.WriteString(" ")
 		b.WriteString(makeLenToken(t.FullPath))
+		if t.Offset != 0 {
+			b.WriteString(" offset=")
+			b.WriteString(strconv.FormatInt(t.Offset, 10))
+		}
+		if t.Size > 0 {
+			b.WriteString(" size=")
+			b.WriteString(strconv.FormatInt(t.Size, 10))
+		}
 	}
 	if err := c.sendTCPCommand(conn, state, b.String()); err != nil {
 		conn.Close()
@@ -469,6 +477,10 @@ func (c *Client) fetchFileBatchTCP(
 	trimmed := strings.TrimRight(firstLine, "\r\n")
 	if err := parseErrControlFrame(trimmed); err != nil {
 		conn.Close()
+		var controlErr controlFrameError
+		if errors.As(err, &controlErr) && strings.EqualFold(controlErr.Code, "NOT_FOUND") {
+			return nil, fmt.Errorf("%w: %w", ErrFileMissing, &fileMissingError{Status: 404, Body: strings.TrimSpace(controlErr.Message)})
+		}
 		return nil, err
 	}
 	if _, ok := parseOKStatusLine(trimmed); ok {

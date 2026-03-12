@@ -12,8 +12,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"filippo.io/age"
+	. "github.com/jolynch/pinch/filexfer"
 	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 	"github.com/zeebo/xxh3"
 )
@@ -207,6 +209,75 @@ func TestRunCLITransferAndGet(t *testing.T) {
 	}
 }
 
+func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txresume.fm1")
+	manifestRaw := strings.Join([]string{
+		"FM/1 txresume 7:/remote",
+		"0 10 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := os.WriteFile(manifestPath+".progress", []byte("0 5 0\n"), 0o644); err != nil {
+		t.Fatalf("write progress: %v", err)
+	}
+
+	outRoot := filepath.Join(tmp, "out")
+	if err := os.MkdirAll(outRoot, 0o755); err != nil {
+		t.Fatalf("mkdir out root: %v", err)
+	}
+	destPath := filepath.Join(outRoot, "a.txt")
+	if err := os.WriteFile(destPath, []byte("helloSTALETAIL"), 0o644); err != nil {
+		t.Fatalf("write stale destination: %v", err)
+	}
+	partB := []byte("world")
+
+	var sawSend bool
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			sawSend = true
+			if got := req.Params[1]["offset"]; got != "5" {
+				return fmt.Errorf("expected resume offset 5, got %q", got)
+			}
+			if got := req.Params[1]["size"]; got != "5" {
+				return fmt.Errorf("expected resume size 5, got %q", got)
+			}
+			_, err := io.WriteString(out, buildCLIFrame(0, partB, 5))
+			return err
+		case intftcp.VerbACK:
+			expectedAck := "10@1001@xxh128:" + xxh128HexCLI(partB)
+			if got := req.Params[0]["ack-token"]; got != expectedAck {
+				return fmt.Errorf("expected ack-token=%s, got %q", expectedAck, got)
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "get", "--tid", "txresume", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-A", "1KiB"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("get resume: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !sawSend {
+		t.Fatalf("expected SEND request")
+	}
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("read resumed output: %v", err)
+	}
+	if string(got) != "helloworld" {
+		t.Fatalf("unexpected resumed output: %q", got)
+	}
+}
+
 func TestRunCLITransferWithEncryptAge(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
@@ -365,5 +436,121 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "file-listener address") {
 		t.Fatalf("expected explicit server address error, got: %s", stderr.String())
+	}
+}
+
+func TestVerboseProgressReporterIncludesAckedBytes(t *testing.T) {
+	var stderr bytes.Buffer
+	reporter := newVerboseProgressReporter(&stderr)
+	t0 := time.Unix(0, 0)
+
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      42,
+		CopiedBytes: 20,
+		TargetBytes: 100,
+		UpdateTime:  t0,
+	})
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      42,
+		AckBytes:    10,
+		TargetBytes: 100,
+		UpdateTime:  t0.Add(500 * time.Millisecond),
+	})
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      42,
+		CopiedBytes: 40,
+		TargetBytes: 100,
+		UpdateTime:  t0.Add(1 * time.Second),
+	})
+
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 progress lines, got %d: %q", len(lines), stderr.String())
+	}
+	if got := lines[0]; !strings.Contains(got, "progress: fd=42 20% bytes=20 B/100 B [0 B]") {
+		t.Fatalf("unexpected first progress line: %q", got)
+	}
+	if got := lines[1]; !strings.Contains(got, "progress: fd=42 40% bytes=40 B/100 B [10 B]") {
+		t.Fatalf("unexpected second progress line: %q", got)
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "tid=") {
+			t.Fatalf("progress line should not include tid: %q", line)
+		}
+	}
+}
+
+func TestVerboseProgressReporterTimeCadenceAndCompletion(t *testing.T) {
+	var stderr bytes.Buffer
+	reporter := newVerboseProgressReporter(&stderr)
+	t0 := time.Unix(0, 0)
+
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      7,
+		CopiedBytes: 5,
+		TargetBytes: 100,
+		UpdateTime:  t0,
+	})
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      7,
+		CopiedBytes: 10,
+		TargetBytes: 100,
+		UpdateTime:  t0.Add(2 * time.Second),
+	})
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      7,
+		CopiedBytes: 100,
+		TargetBytes: 100,
+		UpdateTime:  t0.Add(3 * time.Second),
+	})
+
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 progress lines, got %d: %q", len(lines), stderr.String())
+	}
+	if got := lines[0]; !strings.Contains(got, "progress: fd=7 10% ") {
+		t.Fatalf("expected timed 10%% line, got %q", got)
+	}
+	if got := lines[1]; !strings.Contains(got, "progress: fd=7 100% ") {
+		t.Fatalf("expected final 100%% line, got %q", got)
+	}
+}
+
+func TestVerboseProgressReporterConcurrentUse(t *testing.T) {
+	var stderr bytes.Buffer
+	reporter := newVerboseProgressReporter(&stderr)
+	start := time.Unix(0, 0)
+
+	var wg sync.WaitGroup
+	runFile := func(fileID uint64) {
+		defer wg.Done()
+		for pct := int64(20); pct <= 100; pct += 20 {
+			copied := pct
+			reporter.ReportUpdate(DownloadProgressUpdate{
+				FileID:      fileID,
+				CopiedBytes: copied,
+				TargetBytes: 100,
+				UpdateTime:  start.Add(time.Duration(copied) * time.Millisecond),
+			})
+			reporter.ReportUpdate(DownloadProgressUpdate{
+				FileID:      fileID,
+				AckBytes:    copied / 2,
+				TargetBytes: 100,
+				UpdateTime:  start.Add(time.Duration(copied)*time.Millisecond + 500*time.Microsecond),
+			})
+		}
+	}
+
+	wg.Add(2)
+	go runFile(1)
+	go runFile(2)
+	wg.Wait()
+
+	out := stderr.String()
+	if !strings.Contains(out, "progress: fd=1 ") {
+		t.Fatalf("expected fd=1 progress lines, got %q", out)
+	}
+	if !strings.Contains(out, "progress: fd=2 ") {
+		t.Fatalf("expected fd=2 progress lines, got %q", out)
 	}
 }

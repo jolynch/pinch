@@ -292,9 +292,6 @@ func ParseFXTrailer(line string) (FrameTrailer, error) {
 	if ts < 0 {
 		return FrameTrailer{}, errors.New("trailer missing ts")
 	}
-	if !ValidHashToken(hashToken) {
-		return FrameTrailer{}, errors.New("trailer missing or invalid hash token")
-	}
 	if fileHashToken != "" && !ValidHashToken(fileHashToken) {
 		return FrameTrailer{}, errors.New("trailer invalid file hash token")
 	}
@@ -311,7 +308,7 @@ func ParseFXTrailer(line string) (FrameTrailer, error) {
 func splitTrailerPrefixAndHash(line string) (string, string, error) {
 	idx := strings.LastIndex(line, " hash=")
 	if idx <= 0 {
-		return "", "", errors.New("trailer missing hash token")
+		return strings.TrimSpace(line), "", nil
 	}
 	prefix := line[:idx]
 	hashToken := strings.TrimSpace(line[idx+len(" hash="):])

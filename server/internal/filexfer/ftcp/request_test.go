@@ -50,6 +50,33 @@ func TestParseRequestSENDMultipleBlocksWithOptions(t *testing.T) {
 	}
 }
 
+func TestParseRequestSENDCompModes(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "adapt", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=adapt`, want: "adapt"},
+		{name: "lz4", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=lz4`, want: "lz4"},
+		{name: "zstd", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=zstd`, want: "zstd"},
+		{name: "none", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=none`, want: "none"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := ParseRequest([]byte(tc.raw))
+			if err != nil {
+				t.Fatalf("ParseRequest err: %v", err)
+			}
+			if len(req.Params) != 2 {
+				t.Fatalf("params len=%d", len(req.Params))
+			}
+			if got := req.Params[1]["comp"]; got != tc.want {
+				t.Fatalf("expected comp=%q got=%q", tc.want, got)
+			}
+		})
+	}
+}
+
 func TestParseRequestACKMinimal(t *testing.T) {
 	payload := []byte(`ACK tx1 fd=42 "/tmp/file.txt" ack-token=5@1001@xxh128:abc`)
 	req, err := ParseRequest(payload)
