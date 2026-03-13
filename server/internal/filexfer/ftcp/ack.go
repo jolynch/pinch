@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
 )
 
 type ackItem struct {
@@ -154,9 +154,9 @@ func handleACK(_ context.Context, req Request, out io.Writer, deps Deps) error {
 				v.item.RecvMS,
 				v.item.SyncMS,
 				receiverMS,
-				intencoding.HumanRate(receiverBps),
-				intencoding.HumanRate(recvBps),
-				intencoding.HumanRate(syncBps),
+				encoding.HumanRate(receiverBps),
+				encoding.HumanRate(recvBps),
+				encoding.HumanRate(syncBps),
 			)
 		}
 	}
@@ -185,7 +185,7 @@ func parseAckToken(raw string) (ackBytes int64, ackTS int64, ackHashToken string
 	}
 	if len(parts) == 3 {
 		ackHashToken = strings.TrimSpace(parts[2])
-		if !intencoding.ValidHashToken(ackHashToken) {
+		if !encoding.ValidHashToken(ackHashToken) {
 			return 0, 0, "", true, fmt.Errorf("invalid ack hash token")
 		}
 	}

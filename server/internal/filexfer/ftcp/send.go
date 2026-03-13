@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
-	intlimit "github.com/jolynch/pinch/internal/filexfer/limit"
-	intpolicy "github.com/jolynch/pinch/internal/filexfer/policy"
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/internal/filexfer/limit"
+	"github.com/jolynch/pinch/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
 )
@@ -57,7 +57,7 @@ type frameStreamArgs struct {
 	HeaderTS      int64
 	Next          int64
 	IsTerminal    bool
-	TerminalMD    *intencoding.FileFrameMetadata
+	TerminalMD    *encoding.FileFrameMetadata
 	WindowHasher  *xxh3.Hasher128
 	Output        io.Writer
 	PipeSizeBytes int
@@ -109,11 +109,11 @@ func parseSENDRequest(req Request) (sendRequest, error) {
 		if comp == "" {
 			comp = "adapt"
 		}
-		if comp == intencoding.EncodingIdentity {
+		if comp == encoding.EncodingIdentity {
 			comp = "none"
 		}
 		switch comp {
-		case "adapt", "none", intencoding.EncodingLz4, intencoding.EncodingZstd:
+		case "adapt", "none", encoding.EncodingLz4, encoding.EncodingZstd:
 		default:
 			return sendRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: adapt, none, lz4, zstd"}
 		}
@@ -139,7 +139,7 @@ func handleSEND(ctx context.Context, req Request, out io.Writer, deps Deps) erro
 	return handleSENDWithOptions(ctx, req, out, deps, nil)
 }
 
-func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps Deps, limiter *intlimit.Limiter) error {
+func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps Deps, limiter *limit.Limiter) error {
 	parsed, err := parseSENDRequest(req)
 	if err != nil {
 		return err
@@ -206,7 +206,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 
 	adaptive := item.Comp == "adapt"
 	currentMode := initialCompressionMode(item.Comp)
-	compressPolicy := intpolicy.NewCompressionPolicy()
+	compressPolicy := policy.NewCompressionPolicy()
 	windowHasher := xxh3.New128()
 
 	for remaining := windowLen; remaining > 0; {
@@ -222,10 +222,10 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 			maxHint = &maxWSizeHint
 		}
 
-		frameComp := intpolicy.FrameCompTokenForMode(currentMode)
-		var terminalMD *intencoding.FileFrameMetadata
+		frameComp := policy.FrameCompTokenForMode(currentMode)
+		var terminalMD *encoding.FileFrameMetadata
 		if isTerminal {
-			md := intencoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
+			md := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
 			terminalMD = &md
 		}
 
@@ -272,7 +272,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 				windowTS0 = time.Now().UnixMilli()
 				firstFrame = true
 				currentMode = initialCompressionMode(item.Comp)
-				compressPolicy = intpolicy.NewCompressionPolicy()
+				compressPolicy = policy.NewCompressionPolicy()
 				windowHasher = xxh3.New128()
 				continue
 			}
@@ -296,15 +296,15 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 		}
 
 		if adaptive {
-			decision := compressPolicy.Decide(currentMode, intpolicy.CompressionMetrics{
+			decision := compressPolicy.Decide(currentMode, policy.CompressionMetrics{
 				LogicalSize:    stats.LogicalSize,
 				WireSize:       stats.WireSize,
 				PrepareLatency: stats.PrepareLatency,
 				WriteLatency:   stats.WriteLatency,
 			})
 			if decision.Next != currentMode {
-				prevComp := intpolicy.FrameCompTokenForMode(currentMode)
-				nextComp := intpolicy.FrameCompTokenForMode(decision.Next)
+				prevComp := policy.FrameCompTokenForMode(currentMode)
+				nextComp := policy.FrameCompTokenForMode(decision.Next)
 				log.Printf(
 					"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f read_over_write=%.3f",
 					txferID,
@@ -340,8 +340,8 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 		windowTS0,
 		windowTS1,
 		windowMS,
-		intencoding.HumanRate(logicalBps),
-		intencoding.HumanRate(wireBps),
+		encoding.HumanRate(logicalBps),
+		encoding.HumanRate(wireBps),
 	)
 	return nil
 }
@@ -370,14 +370,14 @@ func isDirectIOReadError(err error) bool {
 	return errors.Is(err, syscall.EINVAL) || errors.Is(err, unix.EINVAL)
 }
 
-func initialCompressionMode(comp string) intpolicy.CompressionMode {
+func initialCompressionMode(comp string) policy.CompressionMode {
 	switch comp {
-	case intencoding.EncodingLz4:
-		return intpolicy.CompressionModeLz4
-	case intencoding.EncodingZstd:
-		return intpolicy.CompressionModeZstdLevel1
+	case encoding.EncodingLz4:
+		return policy.CompressionModeLz4
+	case encoding.EncodingZstd:
+		return policy.CompressionModeZstdLevel1
 	default:
-		return intpolicy.CompressionModeNone
+		return policy.CompressionModeNone
 	}
 }
 
@@ -388,8 +388,8 @@ func maxFrameWireHint(comp string, logicalSize int64) (int64, error) {
 	switch comp {
 	case "adapt":
 		maxHint := int64(0)
-		for _, candidate := range []string{"none", intencoding.EncodingLz4, intencoding.EncodingZstd} {
-			hint, err := intencoding.MaxFrameWireSizeHintBytes(candidate, logicalSize)
+		for _, candidate := range []string{"none", encoding.EncodingLz4, encoding.EncodingZstd} {
+			hint, err := encoding.MaxFrameWireSizeHintBytes(candidate, logicalSize)
 			if err != nil {
 				return 0, err
 			}
@@ -399,7 +399,7 @@ func maxFrameWireHint(comp string, logicalSize int64) (int64, error) {
 		}
 		return maxHint, nil
 	default:
-		return intencoding.MaxFrameWireSizeHintBytes(comp, logicalSize)
+		return encoding.MaxFrameWireSizeHintBytes(comp, logicalSize)
 	}
 }
 
@@ -461,7 +461,7 @@ func buildFrameHeaderLine(fileID uint64, offset int64, size int64, wireSize int6
 		" ts=" + strconv.FormatInt(ts, 10) + "\n"
 }
 
-func buildFrameTrailerLine(fileID uint64, ts int64, next int64, windowHashToken string, metadata *intencoding.FileFrameMetadata) string {
+func buildFrameTrailerLine(fileID uint64, ts int64, next int64, windowHashToken string, metadata *encoding.FileFrameMetadata) string {
 	var b strings.Builder
 	b.WriteString("FXT/1 ")
 	b.WriteString(strconv.FormatUint(fileID, 10))
@@ -483,7 +483,7 @@ func buildFrameTrailerLine(fileID uint64, ts int64, next int64, windowHashToken 
 	return b.String()
 }
 
-func metadataTrailerTokens(metadata *intencoding.FileFrameMetadata) []string {
+func metadataTrailerTokens(metadata *encoding.FileFrameMetadata) []string {
 	if metadata == nil {
 		return nil
 	}
@@ -527,7 +527,7 @@ func writeFrameHeader(out io.Writer, args frameStreamArgs, wireSize int64, write
 func writeFrameTrailer(out io.Writer, args frameStreamArgs, writeLatency *time.Duration) (string, error) {
 	windowHashToken := ""
 	if args.IsTerminal {
-		windowHashToken = intencoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
+		windowHashToken = encoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
 	}
 	trailerLine := buildFrameTrailerLine(args.FileID, time.Now().UnixMilli(), args.Next, windowHashToken, args.TerminalMD)
 	writeStart := time.Now()
@@ -635,7 +635,7 @@ func streamBufferedCompressed(fd *os.File, fileOffset *int64, args frameStreamAr
 	frameBuf := acquireCompressedFrameBuffer()
 	defer releaseCompressedFrameBuffer(frameBuf)
 
-	compressedWriter, closeCompressedWriter, selected, err := intencoding.WrapCompressedWriter(frameBuf, args.Comp)
+	compressedWriter, closeCompressedWriter, selected, err := encoding.WrapCompressedWriter(frameBuf, args.Comp)
 	if err != nil {
 		return frameStreamStats{}, err
 	}
@@ -762,7 +762,7 @@ func streamSpliceNone(fd *os.File, fileOffset *int64, args frameStreamArgs) (fra
 
 	windowHashToken := ""
 	if args.IsTerminal {
-		windowHashToken = intencoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
+		windowHashToken = encoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
 	}
 	trailerLine := buildFrameTrailerLine(args.FileID, time.Now().UnixMilli(), args.Next, windowHashToken, args.TerminalMD)
 	writeStart = time.Now()
@@ -801,7 +801,7 @@ func streamSpliceCompressed(fd *os.File, fileOffset *int64, args frameStreamArgs
 
 	frameBuf := acquireCompressedFrameBuffer()
 	defer releaseCompressedFrameBuffer(frameBuf)
-	compressedWriter, closeCompressedWriter, selected, err := intencoding.WrapCompressedWriter(frameBuf, args.Comp)
+	compressedWriter, closeCompressedWriter, selected, err := encoding.WrapCompressedWriter(frameBuf, args.Comp)
 	if err != nil {
 		return frameStreamStats{}, err
 	}
@@ -870,7 +870,7 @@ func streamSpliceCompressed(fd *os.File, fileOffset *int64, args frameStreamArgs
 
 	windowHashToken := ""
 	if args.IsTerminal {
-		windowHashToken = intencoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
+		windowHashToken = encoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
 	}
 	trailerLine := buildFrameTrailerLine(args.FileID, time.Now().UnixMilli(), args.Next, windowHashToken, args.TerminalMD)
 	writeStart = time.Now()

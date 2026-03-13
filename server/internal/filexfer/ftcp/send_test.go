@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 )
 
@@ -113,8 +113,8 @@ func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {
 	}{
 		{name: "none", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=none`, want: "none"},
 		{name: "identity", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=identity`, want: "none"},
-		{name: "lz4", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=lz4`, want: intencoding.EncodingLz4},
-		{name: "zstd", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=zstd`, want: intencoding.EncodingZstd},
+		{name: "lz4", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=lz4`, want: encoding.EncodingLz4},
+		{name: "zstd", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=zstd`, want: encoding.EncodingZstd},
 		{name: "adapt", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=adapt`, want: "adapt"},
 	}
 	for _, tc := range tests {
@@ -185,7 +185,7 @@ func TestParseSENDRequestModeDefaultsAndValidation(t *testing.T) {
 func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 	data := bytes.Repeat([]byte("abcdefghijklmnopqrstuvwxyz012345"), 8192)
 
-	for _, comp := range []string{"none", intencoding.EncodingLz4, intencoding.EncodingZstd} {
+	for _, comp := range []string{"none", encoding.EncodingLz4, encoding.EncodingZstd} {
 		t.Run(comp, func(t *testing.T) {
 			tmp := writeTempSendFile(t, data)
 			deps := &sendTestDeps{filePath: tmp}
@@ -210,7 +210,7 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 				t.Fatalf("decoded logical payload mismatch")
 			}
 
-			expectedHash := intencoding.FormatXXH128HashToken(xxh3.Hash128(data))
+			expectedHash := encoding.FormatXXH128HashToken(xxh3.Hash128(data))
 			if deps.windowHash != expectedHash {
 				t.Fatalf("unexpected stored window hash: got=%q want=%q", deps.windowHash, expectedHash)
 			}
@@ -252,7 +252,7 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 	}
 	sawCompressed := false
 	for _, comp := range comps[1:] {
-		if comp == intencoding.EncodingLz4 || comp == intencoding.EncodingZstd {
+		if comp == encoding.EncodingLz4 || comp == encoding.EncodingZstd {
 			sawCompressed = true
 			break
 		}
@@ -263,9 +263,9 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 }
 
 type decodedFrame struct {
-	Header  intencoding.FileFrameMeta
+	Header  encoding.FileFrameMeta
 	Logical []byte
-	Trailer intencoding.FrameTrailer
+	Trailer encoding.FrameTrailer
 }
 
 func decodeFrameStream(raw []byte) ([]decodedFrame, error) {
@@ -280,7 +280,7 @@ func decodeFrameStream(raw []byte) ([]decodedFrame, error) {
 			return nil, fmt.Errorf("read header: %w", err)
 		}
 		headerTrimmed := strings.TrimRight(headerLine, "\r\n")
-		header, err := intencoding.ParseFXHeader(headerTrimmed)
+		header, err := encoding.ParseFXHeader(headerTrimmed)
 		if err != nil {
 			return nil, fmt.Errorf("parse header: %w", err)
 		}
@@ -291,7 +291,7 @@ func decodeFrameStream(raw []byte) ([]decodedFrame, error) {
 		if _, err := io.ReadFull(br, payload); err != nil {
 			return nil, fmt.Errorf("read payload: %w", err)
 		}
-		decodedReader, err := intencoding.DecodePayloadReaderByComp(bytes.NewReader(payload), header.Comp)
+		decodedReader, err := encoding.DecodePayloadReaderByComp(bytes.NewReader(payload), header.Comp)
 		if err != nil {
 			return nil, fmt.Errorf("decode payload: %w", err)
 		}
@@ -308,7 +308,7 @@ func decodeFrameStream(raw []byte) ([]decodedFrame, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read trailer: %w", err)
 		}
-		trailer, err := intencoding.ParseFXTrailer(strings.TrimRight(trailerLine, "\r\n"))
+		trailer, err := encoding.ParseFXTrailer(strings.TrimRight(trailerLine, "\r\n"))
 		if err != nil {
 			return nil, fmt.Errorf("parse trailer: %w", err)
 		}
@@ -328,7 +328,7 @@ func frameComps(raw []byte) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		header, err := intencoding.ParseFXHeader(strings.TrimRight(headerLine, "\r\n"))
+		header, err := encoding.ParseFXHeader(strings.TrimRight(headerLine, "\r\n"))
 		if err != nil {
 			return nil, err
 		}
