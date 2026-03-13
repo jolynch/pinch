@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -352,25 +353,36 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
 		return 1
 	}
-	manifest.Progress = progressState
+	applyProgressStateToManifest(manifest, progressState)
 	progressUpdates := make(chan DownloadProgressUpdate, 128)
 	var onProgressUpdate func(DownloadProgressUpdate)
 	if verbose {
 		progressReporter := newVerboseProgressReporter(stderr)
 		onProgressUpdate = progressReporter.ReportUpdate
 	}
-	stopProgress, markMetadataDone := startProgressWriter(progressPath, progressState, progressUpdates, onProgressUpdate, stderr)
+	forwardProgress := func(update DownloadProgressUpdate) {
+		applyProgressUpdateToManifest(manifest, update)
+		if onProgressUpdate != nil {
+			onProgressUpdate(update)
+		}
+	}
+	stopProgress, markMetadataDonePersisted := startProgressWriter(progressPath, progressState, progressUpdates, forwardProgress, stderr)
+	markMetadataDone := func(fileID uint64) {
+		markManifestEntryMetadataDone(manifest, fileID)
+		markMetadataDonePersisted(fileID)
+	}
 	defer stopProgress()
 
 	client := NewClient(serverURL, WithLoadStrategy(loadStrategy))
 	start := time.Now()
-	entrySize := manifestEntrySize(manifest, fileID)
-	resumeFrom := int64(0)
-	if st, ok := manifest.Progress[fileID]; ok && st.AckBytes > 0 && st.AckBytes < entrySize && outFile != "-" {
-		resumeFrom = st.AckBytes
+	entry, ok := manifest.EntryByID(fileID)
+	if !ok {
+		fmt.Fprintf(stderr, "get failed: file id %d not in manifest\n", fileID)
+		return 1
 	}
-	if st, ok := manifest.Progress[fileID]; ok && st.AckBytes >= entrySize {
-		if !st.MetadataDone {
+	progress := entry.Progress
+	if progress.AckBytes >= entry.Size {
+		if !progress.MetadataDone {
 			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, fileID, outRoot, outFile, agePublicKey, ageIdentity); err != nil {
 				fmt.Fprintf(stderr, "get metadata refresh failed: %v\n", err)
 				return 1
@@ -379,26 +391,19 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 			fmt.Fprintf(stderr, "get metadata refreshed: fd=%d\n", fileID)
 			return 0
 		}
-		fmt.Fprintf(stderr, "get skipped: already complete fd=%d ack=%d\n", fileID, st.AckBytes)
+		fmt.Fprintf(stderr, "get skipped: already complete fd=%d ack=%d\n", fileID, progress.AckBytes)
 		return 0
 	}
-	if resumeFrom > 0 {
-		if manifest.Progress == nil {
-			manifest.Progress = make(map[uint64]ManifestProgress)
-		}
-		progress := manifest.Progress[fileID]
-		progress.AckBytes = resumeFrom
-		manifest.Progress[fileID] = progress
-	}
+	outputPath := resolveDownloadDestinationPath(entry, outRoot, outFile)
 	downloadBatchResp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
-		Manifest:        manifest,
-		FileIDs:         []uint64{fileID},
-		OutRoot:         outRoot,
-		OutFile:         outFile,
-		Stdout:          stdout,
+		Manifest: manifest,
+		FileIDs:  []uint64{fileID},
+		OutputWriter: func(entry ManifestEntry) (io.WriteCloser, func() error, error) {
+			destPath := resolveDownloadDestinationPath(entry, outRoot, outFile)
+			return openDownloadOutput(entry, destPath, stdout, noSync)
+		},
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
-		NoSync:          noSync,
 		ProgressUpdates: progressUpdates,
 	})
 	elapsed := time.Since(start)
@@ -411,8 +416,12 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		return 1
 	}
 	downloadResp := downloadBatchResp.Files[0]
+	if err := applyDownloadedTrailerMetadata(outputPath, downloadResp.Meta.TrailerMetadata); err != nil {
+		fmt.Fprintf(stderr, "get failed: %v\n", err)
+		return 1
+	}
 	markMetadataDone(fileID)
-	printFileMetrics(stdout, manifest.TransferID, fileID, downloadResp.DestinationPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
+	printFileMetrics(stdout, manifest.TransferID, fileID, outputPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
 	return 0
 }
 
@@ -495,14 +504,24 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
 		return 1
 	}
-	manifest.Progress = progressState
+	applyProgressStateToManifest(manifest, progressState)
 	progressUpdates := make(chan DownloadProgressUpdate, 1024)
 	var onStartProgressUpdate func(DownloadProgressUpdate)
 	if verbose {
 		progressReporter := newVerboseProgressReporter(stderr)
 		onStartProgressUpdate = progressReporter.ReportUpdate
 	}
-	stopProgress, markMetadataDone := startProgressWriter(progressPath, progressState, progressUpdates, onStartProgressUpdate, stderr)
+	forwardProgress := func(update DownloadProgressUpdate) {
+		applyProgressUpdateToManifest(manifest, update)
+		if onStartProgressUpdate != nil {
+			onStartProgressUpdate(update)
+		}
+	}
+	stopProgress, markMetadataDonePersisted := startProgressWriter(progressPath, progressState, progressUpdates, forwardProgress, stderr)
+	markMetadataDone := func(fileID uint64) {
+		markManifestEntryMetadataDone(manifest, fileID)
+		markMetadataDonePersisted(fileID)
+	}
 	defer stopProgress()
 	client := NewClient(serverURL, WithLoadStrategy(loadStrategy))
 	fmt.Fprintf(
@@ -518,6 +537,15 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var completed int64
 	var totalTransferred int64
 	var failures []error
+	var failuresMu sync.Mutex
+	recordFailure := func(err error) {
+		if err == nil {
+			return
+		}
+		failuresMu.Lock()
+		failures = append(failures, err)
+		failuresMu.Unlock()
+	}
 	var stopStatusPolling func()
 	if verbose {
 		stopStatusPolling = startVerboseStatusPolling(txferID, client, stderr)
@@ -525,13 +553,14 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	pendingEntries := make([]ManifestEntry, 0, len(manifest.Entries))
 	for _, entry := range manifest.Entries {
-		if st, ok := manifest.Progress[entry.ID]; ok && st.AckBytes >= entry.Size {
-			if st.MetadataDone {
+		progress := entry.Progress
+		if progress.AckBytes >= entry.Size {
+			if progress.MetadataDone {
 				completed++
 				continue
 			}
 			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, "", agePublicKey, ageIdentity); err != nil {
-				failures = append(failures, fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err))
+				recordFailure(fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err))
 				continue
 			}
 			markMetadataDone(entry.ID)
@@ -541,18 +570,30 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		pendingEntries = append(pendingEntries, entry)
 	}
 	startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
-		Manifest:        manifest,
-		Entries:         pendingEntries,
-		OutRoot:         outRoot,
+		Manifest: manifest,
+		Entries:  pendingEntries,
+		OutputWriter: func(entry ManifestEntry) (io.WriteCloser, func() error, error) {
+			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+			return openDownloadOutput(entry, destPath, nil, noSync)
+		},
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
-		NoSync:          noSync,
 		Concurrency:     effectiveConcurrency,
 		BatchMaxBytes:   ackEvery,
 		ProgressUpdates: progressUpdates,
 		OnFileDone: func(evt StartFileDoneEvent) {
+			entry, ok := manifest.EntryByID(evt.File.Meta.FileID)
+			if !ok {
+				recordFailure(fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID))
+				return
+			}
+			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+			if err := applyDownloadedTrailerMetadata(destPath, evt.File.Meta.TrailerMetadata); err != nil {
+				recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
+				return
+			}
 			markMetadataDone(evt.File.Meta.FileID)
-			printStartFileSummary(stdout, evt.File.Meta.FileID, evt.File.DestinationPath, evt.File.Meta, evt.File.LocalFileHash, evt.Elapsed)
+			printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.Elapsed)
 		},
 	})
 	if err != nil {
@@ -561,8 +602,13 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	completed += int64(startResp.Downloaded)
 	totalTransferred += startResp.TransferredBytes
-	failures = append(failures, startResp.Errors...)
-	for _, err := range failures {
+	for _, startErr := range startResp.Errors {
+		recordFailure(startErr)
+	}
+	failuresMu.Lock()
+	finalFailures := append([]error(nil), failures...)
+	failuresMu.Unlock()
+	for _, err := range finalFailures {
 		fmt.Fprintf(stderr, "start error: %v\n", err)
 	}
 
@@ -577,12 +623,12 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		txferID,
 		len(manifest.Entries),
 		completed,
-		len(failures),
+		len(finalFailures),
 		encoding.HumanBytes(totalTransferred),
 		encoding.HumanRate(overallSpeed),
 		elapsedAll.Round(time.Millisecond),
 	)
-	if len(failures) > 0 {
+	if len(finalFailures) > 0 {
 		return 1
 	}
 	return 0
@@ -651,6 +697,144 @@ func parseFileID(raw string) (uint64, error) {
 	return strconv.ParseUint(raw, 10, 64)
 }
 
+type noOpWriteCloser struct {
+	io.Writer
+}
+
+func (n noOpWriteCloser) Close() error {
+	return nil
+}
+
+func isDiscardDestination(destPath string) bool {
+	if destPath == "-" {
+		return true
+	}
+	return filepath.Clean(destPath) == filepath.Clean(os.DevNull)
+}
+
+func resolveDownloadDestinationPath(entry ManifestEntry, outRoot string, outFile string) string {
+	outFile = strings.TrimSpace(outFile)
+	if outFile != "" {
+		return outFile
+	}
+	if outRoot == "" {
+		outRoot = "."
+	}
+	if filepath.Clean(outRoot) == filepath.Clean(os.DevNull) {
+		return os.DevNull
+	}
+	return filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
+}
+
+func openDownloadOutput(entry ManifestEntry, destPath string, stdout io.Writer, noSync bool) (io.WriteCloser, func() error, error) {
+	if destPath == "-" {
+		if entry.Progress.AckBytes > 0 {
+			return nil, nil, errors.New("cannot resume when output is stdout")
+		}
+		if stdout == nil {
+			stdout = os.Stdout
+		}
+		return noOpWriteCloser{Writer: stdout}, func() error { return nil }, nil
+	}
+	if filepath.Clean(destPath) == filepath.Clean(os.DevNull) {
+		return noOpWriteCloser{Writer: io.Discard}, func() error { return nil }, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return nil, nil, fmt.Errorf("create output parent directory: %w", err)
+	}
+	resumeFrom := entry.Progress.AckBytes
+	var (
+		fd  *os.File
+		err error
+	)
+	if resumeFrom > 0 {
+		fd, err = os.OpenFile(destPath, os.O_RDWR, 0)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, nil, fmt.Errorf("resume requested at offset %d but output file is missing", resumeFrom)
+			}
+			return nil, nil, fmt.Errorf("open output file for resume: %w", err)
+		}
+		stat, statErr := fd.Stat()
+		if statErr != nil {
+			_ = fd.Close()
+			return nil, nil, fmt.Errorf("stat output file for resume: %w", statErr)
+		}
+		if stat.Size() < resumeFrom {
+			_ = fd.Close()
+			return nil, nil, fmt.Errorf("resume requested at offset %d but output file has only %d bytes", resumeFrom, stat.Size())
+		}
+		if err := fd.Truncate(resumeFrom); err != nil {
+			_ = fd.Close()
+			return nil, nil, fmt.Errorf("truncate output file for resume: %w", err)
+		}
+		if _, err := fd.Seek(resumeFrom, io.SeekStart); err != nil {
+			_ = fd.Close()
+			return nil, nil, fmt.Errorf("seek output file for resume: %w", err)
+		}
+	} else {
+		fd, err = os.Create(destPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("create output file: %w", err)
+		}
+	}
+	syncOutput := func() error {
+		if noSync {
+			return nil
+		}
+		return syscall.Fdatasync(int(fd.Fd()))
+	}
+	return fd, syncOutput, nil
+}
+
+func applyDownloadedTrailerMetadata(destPath string, meta *FileTrailerMetadata) error {
+	if meta == nil || isDiscardDestination(destPath) {
+		return nil
+	}
+	if err := applyTrailerMetadataToPath(destPath, meta); err != nil {
+		return fmt.Errorf("apply trailer metadata to %s: %w", destPath, err)
+	}
+	return nil
+}
+
+func applyProgressStateToManifest(manifest *Manifest, state map[uint64]ManifestProgress) {
+	if manifest == nil || len(manifest.Entries) == 0 || len(state) == 0 {
+		return
+	}
+	for i := range manifest.Entries {
+		if progress, ok := state[manifest.Entries[i].ID]; ok {
+			manifest.Entries[i].Progress = progress
+		}
+	}
+}
+
+func applyProgressUpdateToManifest(manifest *Manifest, update DownloadProgressUpdate) {
+	if manifest == nil {
+		return
+	}
+	for i := range manifest.Entries {
+		if manifest.Entries[i].ID != update.FileID {
+			continue
+		}
+		if update.AckBytes > manifest.Entries[i].Progress.AckBytes {
+			manifest.Entries[i].Progress.AckBytes = update.AckBytes
+		}
+		return
+	}
+}
+
+func markManifestEntryMetadataDone(manifest *Manifest, fileID uint64) {
+	if manifest == nil {
+		return
+	}
+	for i := range manifest.Entries {
+		if manifest.Entries[i].ID == fileID {
+			manifest.Entries[i].Progress.MetadataDone = true
+			return
+		}
+	}
+}
+
 func loadManifestForStart(txferID string, manifestPath string) (*Manifest, string, string, error) {
 	return loadManifestWithOptionalTID("start", txferID, manifestPath)
 }
@@ -677,17 +861,6 @@ func loadManifestWithOptionalTID(cmd string, txferID string, manifestPath string
 		return nil, "", "", fmt.Errorf("manifest transfer id mismatch: expected %s got %s", txferID, manifest.TransferID)
 	}
 	return manifest, manifestPath, txferID, nil
-}
-
-func manifestEntrySize(manifest *Manifest, fileID uint64) int64 {
-	if manifest == nil {
-		return 0
-	}
-	entry, ok := manifest.EntryByID(fileID)
-	if !ok {
-		return 0
-	}
-	return entry.Size
 }
 
 func loadProgressState(progressPath string) (map[uint64]ManifestProgress, error) {
@@ -897,6 +1070,9 @@ func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest 
 		destPath = filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
 	}
 	if destPath == "-" {
+		return nil
+	}
+	if isDiscardDestination(destPath) {
 		return nil
 	}
 	serverPath := filepath.Clean(filepath.Join(manifest.Root, filepath.FromSlash(entry.Path)))

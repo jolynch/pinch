@@ -313,6 +313,49 @@ func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
 	}
 }
 
+func TestRunCLIGetOutRootDevNullDiscardsOutput(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txdevnull.fm2")
+	manifestRaw := strings.Join([]string{
+		"FM/2 txdevnull 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	payload := []byte("hello")
+	var sawAck bool
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
+			return err
+		case intftcp.VerbACK:
+			sawAck = true
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "get", "--tid", "txdevnull", "--fd", "0", "--manifest", manifestPath, "--out-root", os.DevNull, "-A", "1KiB"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("get devnull: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !sawAck {
+		t.Fatalf("expected ACK request")
+	}
+	if !strings.Contains(stdout.String(), "  path: "+os.DevNull) {
+		t.Fatalf("expected file metrics path %q, got: %s", os.DevNull, stdout.String())
+	}
+}
+
 func TestRunCLITransferWithEncryptAge(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
@@ -471,6 +514,44 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "start-plan: strategy=fast link=1200Mbps concurrency=5 (manifest=5)") {
 		t.Fatalf("missing default start plan line: %s", stdout.String())
+	}
+}
+
+func TestRunCLIStartOutRootDevNullDiscardsOutput(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txstartdevnull.fm2")
+	manifestRaw := strings.Join([]string{
+		"FM/2 txstartdevnull 7:/remote mode=fast link-mbps=1200 concurrency=2",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	payload := []byte("hello")
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "start", "--tid", "txstartdevnull", "--manifest", manifestPath, "--out-root", os.DevNull, "--ack-every", "1KiB"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start devnull: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "start-file: fd=0 path="+os.DevNull) {
+		t.Fatalf("missing start-file devnull path line: %s", stdout.String())
 	}
 }
 

@@ -185,7 +185,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 		windowLen = item.Size
 	}
 	if item.Mode == loadStrategyFast {
-		maybeFadviseSequential(fd, item.Offset, windowLen)
+		tryReadAheadWindow(fd, item.Offset, windowLen)
 	}
 
 	cursor := item.Offset
@@ -262,7 +262,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 				usedDirectOpen = false
 				useLinuxSplice = runtime.GOOS == "linux" && item.Mode == loadStrategyFast
 				if item.Mode == loadStrategyFast {
-					maybeFadviseSequential(fd, item.Offset, windowLen)
+					tryReadAheadWindow(fd, item.Offset, windowLen)
 				}
 				cursor = item.Offset
 				remaining = windowLen
@@ -950,8 +950,8 @@ func logicalBufferBucketSize(maxChunk int64) int {
 	return 8 * 1024 * 1024
 }
 
-func maybeFadviseSequential(fd *os.File, offset int64, length int64) {
-	if length <= 0 {
+func tryReadAheadWindow(fd *os.File, offset int64, length int64) {
+	if fd == nil || offset < 0 || length <= 0 {
 		return
 	}
 	_ = unix.Fadvise(int(fd.Fd()), offset, length, unix.FADV_SEQUENTIAL)

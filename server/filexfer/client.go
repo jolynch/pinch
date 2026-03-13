@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -142,15 +140,15 @@ type Manifest struct {
 	LinkMbps    int64
 	Concurrency int
 	Entries     []ManifestEntry
-	Progress    map[uint64]ManifestProgress
 }
 
 type ManifestEntry struct {
-	ID    uint64
-	Size  int64
-	Mtime int64
-	Mode  os.FileMode
-	Path  string
+	ID       uint64
+	Size     int64
+	Mtime    int64
+	Mode     os.FileMode
+	Path     string
+	Progress ManifestProgress
 }
 
 type ManifestProgress struct {
@@ -194,22 +192,17 @@ type DownloadProgressUpdate struct {
 }
 
 type DownloadFileResponse struct {
-	DestinationPath string
-	Meta            FileFrameMeta
-	LocalFileHash   string
+	Meta          FileFrameMeta
+	LocalFileHash string
 }
 
 type DownloadBatchRequest struct {
-	Manifest                *Manifest
-	FileIDs                 []uint64
-	OutRoot                 string
-	OutFile                 string
-	Stdout                  io.Writer
-	AgePublicKey            string
-	AgeIdentity             string
-	NoSync                  bool
-	MetadataApplyBestEffort bool
-	ProgressUpdates         chan<- DownloadProgressUpdate
+	Manifest        *Manifest
+	FileIDs         []uint64
+	OutputWriter    func(ManifestEntry) (io.WriteCloser, func() error, error)
+	AgePublicKey    string
+	AgeIdentity     string
+	ProgressUpdates chan<- DownloadProgressUpdate
 }
 
 type DownloadBatchResponse struct {
@@ -219,10 +212,9 @@ type DownloadBatchResponse struct {
 type StartFromManifestRequest struct {
 	Manifest        *Manifest
 	Entries         []ManifestEntry
-	OutRoot         string
+	OutputWriter    func(ManifestEntry) (io.WriteCloser, func() error, error)
 	AgePublicKey    string
 	AgeIdentity     string
-	NoSync          bool
 	Concurrency     int
 	BatchMaxBytes   int64
 	ProgressUpdates chan<- DownloadProgressUpdate
@@ -591,8 +583,6 @@ func (c *Client) GetTransferStatus(ctx context.Context, request GetTransferStatu
 type downloadBatchPlan struct {
 	entry      ManifestEntry
 	serverPath string
-	destPath   string
-	stdout     io.Writer
 	resumeFrom int64
 }
 
@@ -603,14 +593,9 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 	if len(req.FileIDs) == 0 {
 		return DownloadBatchResponse{}, errors.New("empty file batch")
 	}
-	if req.OutRoot == "" {
-		req.OutRoot = "."
+	if req.OutputWriter == nil {
+		return DownloadBatchResponse{}, errors.New("missing output writer callback")
 	}
-	outFileOverride := strings.TrimSpace(req.OutFile)
-	if outFileOverride != "" && len(req.FileIDs) != 1 {
-		return DownloadBatchResponse{}, errors.New("out file override requires exactly one file id")
-	}
-	stdoutOverride := req.Stdout
 
 	plans := make([]downloadBatchPlan, 0, len(req.FileIDs))
 	targets := make([]FetchFileTarget, 0, len(req.FileIDs))
@@ -619,36 +604,16 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 		if err != nil {
 			return DownloadBatchResponse{}, err
 		}
-		resumeFrom := int64(0)
-		if req.Manifest != nil && req.Manifest.Progress != nil {
-			if progress, ok := req.Manifest.Progress[fileID]; ok {
-				resumeFrom = progress.AckBytes
-			}
-		}
+		resumeFrom := entry.Progress.AckBytes
 		if resumeFrom < 0 {
 			return DownloadBatchResponse{}, fmt.Errorf("file %d resume offset must be >= 0", fileID)
 		}
 		if entry.Size >= 0 && resumeFrom > entry.Size {
 			return DownloadBatchResponse{}, fmt.Errorf("file %d resume offset %d exceeds file size %d", fileID, resumeFrom, entry.Size)
 		}
-		destPath := outFileOverride
-		stdoutWriter := stdoutOverride
-		if destPath == "" {
-			destPath = filepath.Clean(filepath.Join(req.OutRoot, filepath.FromSlash(entry.Path)))
-		}
-		if destPath == "-" {
-			if resumeFrom > 0 {
-				return DownloadBatchResponse{}, errors.New("cannot resume when output is stdout")
-			}
-			if stdoutWriter == nil {
-				stdoutWriter = os.Stdout
-			}
-		}
 		plans = append(plans, downloadBatchPlan{
 			entry:      entry,
 			serverPath: serverPath,
-			destPath:   destPath,
-			stdout:     stdoutWriter,
 			resumeFrom: resumeFrom,
 		})
 		target := FetchFileTarget{FileID: fileID, FullPath: serverPath, Offset: resumeFrom}
@@ -661,7 +626,7 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 	stream, err := c.fetchFileBatchTCP(ctx, req.Manifest.TransferID, targets, req.AgePublicKey, req.AgeIdentity)
 	if err != nil {
 		var missingErr *fileMissingError
-		if len(plans) == 1 && errors.Is(err, ErrFileMissing) && errors.As(err, &missingErr) && shouldAcknowledgeMissing404(missingErr.Body) && plans[0].destPath != "-" {
+		if len(plans) == 1 && errors.Is(err, ErrFileMissing) && errors.As(err, &missingErr) && shouldAcknowledgeMissing404(missingErr.Body) {
 			if ackErr := c.acknowledgeMissingFile(ctx, req.Manifest.TransferID, plans[0].entry.ID, plans[0].serverPath); ackErr != nil {
 				return DownloadBatchResponse{}, fmt.Errorf("%w (failed to ack missing: %v)", err, ackErr)
 			}
@@ -703,64 +668,27 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 	}
 
 	for _, plan := range plans {
-		writer := io.Writer(nil)
-		closeWriter := func() error { return nil }
-		fileWriter := (*os.File)(nil)
-		if plan.destPath == "-" {
-			writer = plan.stdout
-		} else {
-			if err := os.MkdirAll(filepath.Dir(plan.destPath), 0o755); err != nil {
-				return DownloadBatchResponse{}, fmt.Errorf("create output parent directory: %w", err)
+		writer, syncOutput, err := req.OutputWriter(plan.entry)
+		if err != nil {
+			return DownloadBatchResponse{}, fmt.Errorf("create output writer for file %d: %w", plan.entry.ID, err)
+		}
+		if writer == nil {
+			return DownloadBatchResponse{}, fmt.Errorf("create output writer for file %d: nil writer", plan.entry.ID)
+		}
+		if syncOutput == nil {
+			syncOutput = func() error { return nil }
+		}
+		writerClosed := false
+		closeWriter := func() error {
+			if writerClosed {
+				return nil
 			}
-			if plan.resumeFrom > 0 {
-				fd, err := os.OpenFile(plan.destPath, os.O_RDWR, 0)
-				if err != nil {
-					if errors.Is(err, os.ErrNotExist) {
-						return DownloadBatchResponse{}, fmt.Errorf("resume requested at offset %d but output file is missing", plan.resumeFrom)
-					}
-					return DownloadBatchResponse{}, fmt.Errorf("open output file for resume: %w", err)
-				}
-				stat, statErr := fd.Stat()
-				if statErr != nil {
-					_ = fd.Close()
-					return DownloadBatchResponse{}, fmt.Errorf("stat output file for resume: %w", statErr)
-				}
-				if stat.Size() < plan.resumeFrom {
-					_ = fd.Close()
-					return DownloadBatchResponse{}, fmt.Errorf("resume requested at offset %d but output file has only %d bytes", plan.resumeFrom, stat.Size())
-				}
-				if err := fd.Truncate(plan.resumeFrom); err != nil {
-					_ = fd.Close()
-					return DownloadBatchResponse{}, fmt.Errorf("truncate output file for resume: %w", err)
-				}
-				if _, err := fd.Seek(plan.resumeFrom, io.SeekStart); err != nil {
-					_ = fd.Close()
-					return DownloadBatchResponse{}, fmt.Errorf("seek output file for resume: %w", err)
-				}
-				writer = fd
-				closeWriter = fd.Close
-				fileWriter = fd
-			} else {
-				fd, err := os.Create(plan.destPath)
-				if err != nil {
-					return DownloadBatchResponse{}, fmt.Errorf("create output file: %w", err)
-				}
-				writer = fd
-				closeWriter = fd.Close
-				fileWriter = fd
-			}
+			writerClosed = true
+			return writer.Close()
 		}
 
 		fileHasher := xxh3.New128()
-		if fileWriter != nil && plan.resumeFrom > 0 {
-			hashBuf, releaseHashBuf := c.acquireFrameReadBuffer(0)
-			prefixReader := io.NewSectionReader(fileWriter, 0, plan.resumeFrom)
-			hashErr := copyStream(io.Discard, prefixReader, hashBuf, fileHasher)
-			releaseHashBuf()
-			if hashErr != nil {
-				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("hash existing output prefix for resume: %w", hashErr)
-			}
+		if plan.resumeFrom > 0 {
 			emitProgressUpdate(DownloadProgressUpdate{
 				TransferID:  req.Manifest.TransferID,
 				FileID:      plan.entry.ID,
@@ -889,54 +817,43 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 			return DownloadBatchResponse{}, fmt.Errorf("window hash mismatch: server=%s client=%s", serverHash, windowHash)
 		}
 
-		if fileWriter != nil {
-			if err := applyVerifiedFileMetadata(fileWriter, lastMetadata, req.MetadataApplyBestEffort); err != nil {
-				_ = closeWriter()
-				return DownloadBatchResponse{}, err
-			}
-		}
 		syncMS := int64(0)
-		if fileWriter != nil && !req.NoSync {
-			syncStart := time.Now()
-			if err := dataSyncFile(fileWriter); err != nil {
-				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("fdatasync output file: %w", err)
-			}
-			syncMS = time.Since(syncStart).Milliseconds()
+		syncStart := time.Now()
+		if err := syncOutput(); err != nil {
+			_ = closeWriter()
+			return DownloadBatchResponse{}, fmt.Errorf("sync output for file %d: %w", plan.entry.ID, err)
 		}
+		syncMS = time.Since(syncStart).Milliseconds()
 		if err := closeWriter(); err != nil {
-			return DownloadBatchResponse{}, fmt.Errorf("close output file: %w", err)
+			return DownloadBatchResponse{}, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
 		}
 
 		localHash := intencoding.FormatXXH128HashToken(fileHasher.Sum128())
 		recvMS := time.Since(fileStart).Milliseconds()
 		deltaBytes := offset - plan.resumeFrom
-		if fileWriter != nil {
-			pendingAcks = append(pendingAcks, AcknowledgeFileProgressRequest{
-				TransferID: req.Manifest.TransferID,
-				FileID:     plan.entry.ID,
-				FullPath:   plan.serverPath,
-				AckBytes:   offset,
-				ServerTS:   lastTrailerTS,
-				HashToken:  windowHash,
-				DeltaBytes: deltaBytes,
-				RecvMS:     recvMS,
-				SyncMS:     syncMS,
-			})
-			ackProgresses = append(ackProgresses, ackProgress{
-				fileID:      plan.entry.ID,
-				ackBytes:    offset,
-				targetBytes: plan.entry.Size,
-			})
-		}
+		pendingAcks = append(pendingAcks, AcknowledgeFileProgressRequest{
+			TransferID: req.Manifest.TransferID,
+			FileID:     plan.entry.ID,
+			FullPath:   plan.serverPath,
+			AckBytes:   offset,
+			ServerTS:   lastTrailerTS,
+			HashToken:  windowHash,
+			DeltaBytes: deltaBytes,
+			RecvMS:     recvMS,
+			SyncMS:     syncMS,
+		})
+		ackProgresses = append(ackProgresses, ackProgress{
+			fileID:      plan.entry.ID,
+			ackBytes:    offset,
+			targetBytes: plan.entry.Size,
+		})
 
 		meta.TrailerTS = lastTrailerTS
 		meta.FileHashToken = windowHash
 		meta.TrailerMetadata = lastMetadata
 		results = append(results, DownloadFileResponse{
-			DestinationPath: plan.destPath,
-			Meta:            meta,
-			LocalFileHash:   localHash,
+			Meta:          meta,
+			LocalFileHash: localHash,
 		})
 	}
 
@@ -995,8 +912,8 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 	if len(entries) == 0 {
 		return resp, nil
 	}
-	if req.OutRoot == "" {
-		req.OutRoot = "."
+	if req.OutputWriter == nil {
+		return StartFromManifestResponse{}, errors.New("missing output writer callback")
 	}
 	if req.Concurrency <= 0 {
 		if req.Manifest.Concurrency > 0 {
@@ -1027,10 +944,9 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 			downloadBatchResp, err := c.DownloadFilesFromManifestBatch(ctx, DownloadBatchRequest{
 				Manifest:        req.Manifest,
 				FileIDs:         fileIDs,
-				OutRoot:         req.OutRoot,
+				OutputWriter:    req.OutputWriter,
 				AgePublicKey:    req.AgePublicKey,
 				AgeIdentity:     req.AgeIdentity,
-				NoSync:          req.NoSync,
 				ProgressUpdates: req.ProgressUpdates,
 			})
 			if err != nil {
@@ -1443,13 +1359,6 @@ func (c *Client) releaseScratchBuffer(buf *bytes.Buffer) {
 	c.scratchBufferPool.Put(buf)
 }
 
-func dataSyncFile(fd *os.File) error {
-	if fd == nil {
-		return nil
-	}
-	return syscall.Fdatasync(int(fd.Fd()))
-}
-
 func parseManifest(raw []byte) (*Manifest, error) {
 	reader := bufio.NewReader(bytes.NewReader(raw))
 	manifest := &Manifest{}
@@ -1649,65 +1558,6 @@ func cloneTrailerMetadata(meta *FileTrailerMetadata) *FileTrailerMetadata {
 	}
 	cloned := *meta
 	return &cloned
-}
-
-func applyVerifiedFileMetadata(fileWriter *os.File, meta *FileTrailerMetadata, bestEffort bool) error {
-	if fileWriter == nil || meta == nil {
-		return nil
-	}
-	if modeRaw := strings.TrimSpace(meta.Mode); modeRaw != "" {
-		mode, err := parseManifestModeToken(modeRaw)
-		if err != nil {
-			if bestEffort {
-				log.Printf("filexfer client: unable to parse trailer mode %q: %v", modeRaw, err)
-			} else {
-				return fmt.Errorf("parse trailer mode %q: %w", modeRaw, err)
-			}
-		} else if err := fileWriter.Chmod(mode); err != nil {
-			if bestEffort {
-				log.Printf("filexfer client: chmod failed mode=%s err=%v", modeRaw, err)
-			} else {
-				return fmt.Errorf("chmod output file to %s: %w", modeRaw, err)
-			}
-		}
-	}
-	uidRaw := strings.TrimSpace(meta.UID)
-	gidRaw := strings.TrimSpace(meta.GID)
-	if uidRaw == "" && gidRaw == "" {
-		return nil
-	}
-	if uidRaw == "" || gidRaw == "" {
-		err := errors.New("trailer uid/gid must both be set")
-		if bestEffort {
-			log.Printf("filexfer client: skipping chown: %v uid=%q gid=%q", err, uidRaw, gidRaw)
-			return nil
-		}
-		return err
-	}
-	uid, err := strconv.Atoi(uidRaw)
-	if err != nil {
-		if bestEffort {
-			log.Printf("filexfer client: invalid trailer uid %q: %v", uidRaw, err)
-			return nil
-		}
-		return fmt.Errorf("invalid trailer uid %q: %w", uidRaw, err)
-	}
-	gid, err := strconv.Atoi(gidRaw)
-	if err != nil {
-		if bestEffort {
-			log.Printf("filexfer client: invalid trailer gid %q: %v", gidRaw, err)
-			return nil
-		}
-		return fmt.Errorf("invalid trailer gid %q: %w", gidRaw, err)
-	}
-	if err := fileWriter.Chown(uid, gid); err != nil {
-		if bestEffort {
-			log.Printf("filexfer client: chown failed uid=%d gid=%d err=%v", uid, gid, err)
-			return nil
-		}
-		return fmt.Errorf("chown output file uid=%d gid=%d: %w", uid, gid, err)
-	}
-	return nil
 }
 
 func parseManifestHeader(line string) (string, string, string, int64, int, error) {

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -316,45 +317,122 @@ func buildFXFrameWithTrailerTokens(t *testing.T, fileID uint64, comp string, off
 	return header + string(payload) + trailer + "\n"
 }
 
+type noOpWriteCloser struct {
+	io.Writer
+}
+
+func (n noOpWriteCloser) Close() error {
+	return nil
+}
+
+type errCloseWriter struct {
+	io.Writer
+	err error
+}
+
+func (w errCloseWriter) Close() error {
+	return w.err
+}
+
 type singleDownloadRequest struct {
-	Manifest                *Manifest
-	FileID                  uint64
-	OutRoot                 string
-	OutFile                 string
-	Stdout                  io.Writer
-	AgePublicKey            string
-	AgeIdentity             string
-	AckEveryBytes           int64
-	ResumeFromBytes         int64
-	NoSync                  bool
-	MetadataApplyBestEffort bool
-	ProgressUpdates         chan<- DownloadProgressUpdate
+	Manifest        *Manifest
+	FileID          uint64
+	OutRoot         string
+	OutFile         string
+	Stdout          io.Writer
+	AgePublicKey    string
+	AgeIdentity     string
+	AckEveryBytes   int64
+	ResumeFromBytes int64
+	NoSync          bool
+	ProgressUpdates chan<- DownloadProgressUpdate
 }
 
 func downloadSingle(ctx context.Context, client *Client, req singleDownloadRequest) (DownloadFileResponse, error) {
 	_ = req.AckEveryBytes
 	if req.Manifest != nil && req.ResumeFromBytes > 0 {
-		if req.Manifest.Progress == nil {
-			req.Manifest.Progress = make(map[uint64]ManifestProgress)
+		for i := range req.Manifest.Entries {
+			if req.Manifest.Entries[i].ID == req.FileID {
+				req.Manifest.Entries[i].Progress.AckBytes = req.ResumeFromBytes
+				break
+			}
 		}
-		progress := req.Manifest.Progress[req.FileID]
-		progress.AckBytes = req.ResumeFromBytes
-		req.Manifest.Progress[req.FileID] = progress
 	}
 	if req.ResumeFromBytes != 0 {
-		// Keep backward-compatible helper signature, but resume is now sourced from manifest progress.
+		// Keep helper signature stable; resume is sourced from entry progress.
 	}
 	resp, err := client.DownloadFilesFromManifestBatch(ctx, DownloadBatchRequest{
-		Manifest:                req.Manifest,
-		FileIDs:                 []uint64{req.FileID},
-		OutRoot:                 req.OutRoot,
-		OutFile:                 req.OutFile,
-		Stdout:                  req.Stdout,
-		AgePublicKey:            req.AgePublicKey,
-		AgeIdentity:             req.AgeIdentity,
-		NoSync:                  req.NoSync,
-		MetadataApplyBestEffort: req.MetadataApplyBestEffort,
-		ProgressUpdates:         req.ProgressUpdates,
+		Manifest: req.Manifest,
+		FileIDs:  []uint64{req.FileID},
+		OutputWriter: func(entry ManifestEntry) (io.WriteCloser, func() error, error) {
+			destPath := strings.TrimSpace(req.OutFile)
+			if destPath == "" {
+				outRoot := req.OutRoot
+				if outRoot == "" {
+					outRoot = "."
+				}
+				destPath = filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
+			}
+			if destPath == "-" {
+				if entry.Progress.AckBytes > 0 {
+					return nil, nil, errors.New("cannot resume when output is stdout")
+				}
+				out := req.Stdout
+				if out == nil {
+					out = os.Stdout
+				}
+				return noOpWriteCloser{Writer: out}, func() error { return nil }, nil
+			}
+			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+				return nil, nil, fmt.Errorf("create output parent directory: %w", err)
+			}
+			resumeFrom := entry.Progress.AckBytes
+			var (
+				fd  *os.File
+				err error
+			)
+			if resumeFrom > 0 {
+				fd, err = os.OpenFile(destPath, os.O_RDWR, 0)
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						return nil, nil, fmt.Errorf("resume requested at offset %d but output file is missing", resumeFrom)
+					}
+					return nil, nil, fmt.Errorf("open output file for resume: %w", err)
+				}
+				info, statErr := fd.Stat()
+				if statErr != nil {
+					_ = fd.Close()
+					return nil, nil, fmt.Errorf("stat output file for resume: %w", statErr)
+				}
+				if info.Size() < resumeFrom {
+					_ = fd.Close()
+					return nil, nil, fmt.Errorf("resume requested at offset %d but output file has only %d bytes", resumeFrom, info.Size())
+				}
+				if err := fd.Truncate(resumeFrom); err != nil {
+					_ = fd.Close()
+					return nil, nil, fmt.Errorf("truncate output file for resume: %w", err)
+				}
+				if _, err := fd.Seek(resumeFrom, io.SeekStart); err != nil {
+					_ = fd.Close()
+					return nil, nil, fmt.Errorf("seek output file for resume: %w", err)
+				}
+			} else {
+				fd, err = os.Create(destPath)
+				if err != nil {
+					return nil, nil, fmt.Errorf("create output file: %w", err)
+				}
+			}
+			syncOutput := func() error {
+				if req.NoSync {
+					return nil
+				}
+				return syscall.Fdatasync(int(fd.Fd()))
+			}
+			return fd, syncOutput, nil
+		},
+		AgePublicKey:    req.AgePublicKey,
+		AgeIdentity:     req.AgeIdentity,
+		ProgressUpdates: req.ProgressUpdates,
 	})
 	if err != nil {
 		return DownloadFileResponse{}, err
@@ -959,7 +1037,7 @@ func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	downloadResp, err := downloadSingle(context.Background(), client, singleDownloadRequest{
+	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest: manifest,
 		FileID:   0,
 		OutRoot:  outRoot,
@@ -967,12 +1045,8 @@ func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
 	}
-	outPath := downloadResp.DestinationPath
 	expected := filepath.Join(outRoot, "dir", "a.txt")
-	if outPath != expected {
-		t.Fatalf("expected output path %q, got %q", expected, outPath)
-	}
-	got, err := os.ReadFile(outPath)
+	got, err := os.ReadFile(expected)
 	if err != nil {
 		t.Fatalf("read output file: %v", err)
 	}
@@ -984,7 +1058,7 @@ func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 	}
 }
 
-func TestDownloadFileFromManifestAppliesModeAfterVerify(t *testing.T) {
+func TestDownloadFileFromManifestReturnsTrailerMetadata(t *testing.T) {
 	outRoot := t.TempDir()
 	manifest := &Manifest{
 		TransferID: "txmode",
@@ -1017,16 +1091,15 @@ func TestDownloadFileFromManifestAppliesModeAfterVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
 	}
-	info, err := os.Stat(resp.DestinationPath)
-	if err != nil {
-		t.Fatalf("stat output file: %v", err)
+	if resp.Meta.TrailerMetadata == nil {
+		t.Fatalf("expected trailer metadata")
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("expected mode 0600, got %04o", info.Mode().Perm())
+	if resp.Meta.TrailerMetadata.Mode != "0600" {
+		t.Fatalf("expected trailer mode 0600, got %q", resp.Meta.TrailerMetadata.Mode)
 	}
 }
 
-func TestDownloadFileFromManifestMetadataStrictFailure(t *testing.T) {
+func TestDownloadFileFromManifestMetadataValidationIsCallerOwned(t *testing.T) {
 	outRoot := t.TempDir()
 	manifest := &Manifest{
 		TransferID: "txstrict",
@@ -1051,13 +1124,16 @@ func TestDownloadFileFromManifestMetadataStrictFailure(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
+	resp, err := downloadSingle(context.Background(), client, singleDownloadRequest{
 		Manifest: manifest,
 		FileID:   0,
 		OutRoot:  outRoot,
 	})
-	if err == nil || !strings.Contains(err.Error(), "invalid trailer uid") {
-		t.Fatalf("expected strict metadata failure, got %v", err)
+	if err != nil {
+		t.Fatalf("expected metadata validation to be caller-owned, got %v", err)
+	}
+	if resp.Meta.TrailerMetadata == nil || resp.Meta.TrailerMetadata.UID != "not-a-number" {
+		t.Fatalf("expected unvalidated trailer metadata in response, got %+v", resp.Meta.TrailerMetadata)
 	}
 }
 
@@ -1087,13 +1163,12 @@ func TestDownloadFileFromManifestMetadataBestEffort(t *testing.T) {
 
 	client := NewClient(srv.URL)
 	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
-		Manifest:                manifest,
-		FileID:                  0,
-		OutRoot:                 outRoot,
-		MetadataApplyBestEffort: true,
+		Manifest: manifest,
+		FileID:   0,
+		OutRoot:  outRoot,
 	})
 	if err != nil {
-		t.Fatalf("expected best-effort metadata apply success, got %v", err)
+		t.Fatalf("expected success with caller-owned metadata apply, got %v", err)
 	}
 }
 
@@ -1310,16 +1385,15 @@ func TestDownloadFileFromManifestResumesFromOffsetAndTruncatesTail(t *testing.T)
 
 	client := NewClient(srv.URL)
 	_, err := downloadSingle(context.Background(), client, singleDownloadRequest{
-		Manifest:                manifest,
-		FileID:                  0,
-		OutRoot:                 outRoot,
-		ResumeFromBytes:         5,
-		AckEveryBytes:           1,
-		NoSync:                  true,
-		ProgressUpdates:         make(chan DownloadProgressUpdate, 1),
-		AgePublicKey:            "",
-		AgeIdentity:             "",
-		MetadataApplyBestEffort: false,
+		Manifest:        manifest,
+		FileID:          0,
+		OutRoot:         outRoot,
+		ResumeFromBytes: 5,
+		AckEveryBytes:   1,
+		NoSync:          true,
+		ProgressUpdates: make(chan DownloadProgressUpdate, 1),
+		AgePublicKey:    "",
+		AgeIdentity:     "",
 	})
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
@@ -1398,10 +1472,19 @@ func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
 
 	client := NewClient(srv.URL)
 	resp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
-		Manifest:        manifest,
-		FileIDs:         []uint64{0, 1},
-		OutRoot:         outRoot,
-		NoSync:          true,
+		Manifest: manifest,
+		FileIDs:  []uint64{0, 1},
+		OutputWriter: func(entry ManifestEntry) (io.WriteCloser, func() error, error) {
+			destPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
+			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+				return nil, nil, err
+			}
+			fd, err := os.Create(destPath)
+			if err != nil {
+				return nil, nil, err
+			}
+			return fd, func() error { return nil }, nil
+		},
 		ProgressUpdates: progressUpdates,
 	})
 	if err != nil {
@@ -1479,7 +1562,6 @@ doneBatchProgress:
 }
 
 func TestStartFromManifestNoLongerProbes(t *testing.T) {
-	outRoot := t.TempDir()
 	manifest := &Manifest{
 		TransferID:  "txstartprobe",
 		Root:        "/remote",
@@ -1514,9 +1596,10 @@ func TestStartFromManifestNoLongerProbes(t *testing.T) {
 
 	client := NewClient(srv.URL, WithLoadStrategy(LoadStrategyGentle))
 	resp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
-		Manifest:      manifest,
-		OutRoot:       outRoot,
-		NoSync:        true,
+		Manifest: manifest,
+		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+			return noOpWriteCloser{Writer: io.Discard}, func() error { return nil }, nil
+		},
 		BatchMaxBytes: 1024,
 	})
 	if err != nil {
@@ -1528,7 +1611,6 @@ func TestStartFromManifestNoLongerProbes(t *testing.T) {
 }
 
 func TestStartFromManifestRespectsExplicitConcurrency(t *testing.T) {
-	outRoot := t.TempDir()
 	manifest := &Manifest{
 		TransferID:  "txstartoverride",
 		Root:        "/remote",
@@ -1560,9 +1642,10 @@ func TestStartFromManifestRespectsExplicitConcurrency(t *testing.T) {
 
 	client := NewClient(srv.URL)
 	resp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
-		Manifest:      manifest,
-		OutRoot:       outRoot,
-		NoSync:        true,
+		Manifest: manifest,
+		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+			return noOpWriteCloser{Writer: io.Discard}, func() error { return nil }, nil
+		},
 		BatchMaxBytes: 1024,
 		Concurrency:   99,
 	})
@@ -1703,15 +1786,146 @@ func TestDownloadFileFromManifestWritesToStdout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
 	}
-	outPath := downloadResp.DestinationPath
-	if outPath != "-" {
-		t.Fatalf("expected outPath '-', got %q", outPath)
+	if downloadResp.Meta.FileID != 0 {
+		t.Fatalf("expected file id 0, got %d", downloadResp.Meta.FileID)
 	}
 	if out.String() != "hello" {
 		t.Fatalf("unexpected stdout output: %q", out.String())
 	}
+	if !acked {
+		t.Fatalf("expected ack request for stdout destination")
+	}
+}
+
+func TestDownloadFilesFromManifestBatchRequiresOutputWriter(t *testing.T) {
+	manifest := &Manifest{
+		TransferID: "txmissingwriter",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	client := NewClient("127.0.0.1:1")
+	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+		Manifest: manifest,
+		FileIDs:  []uint64{0},
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing output writer callback") {
+		t.Fatalf("expected missing output writer error, got %v", err)
+	}
+}
+
+func TestDownloadFilesFromManifestBatchRejectsNilWriterFromCallback(t *testing.T) {
+	manifest := &Manifest{
+		TransferID: "txnilwriter",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, []byte("hello"), nil))
+			return err
+		case intftcp.VerbACK:
+			return fmt.Errorf("unexpected ACK for nil writer callback test")
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+		Manifest: manifest,
+		FileIDs:  []uint64{0},
+		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+			return nil, nil, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "nil writer") {
+		t.Fatalf("expected nil writer error, got %v", err)
+	}
+}
+
+func TestDownloadFilesFromManifestBatchPropagatesSyncError(t *testing.T) {
+	manifest := &Manifest{
+		TransferID: "txsyncerr",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	acked := false
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, []byte("hello"), nil))
+			return err
+		case intftcp.VerbACK:
+			acked = true
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+		Manifest: manifest,
+		FileIDs:  []uint64{0},
+		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+			return noOpWriteCloser{Writer: io.Discard}, func() error { return errors.New("sync blew up") }, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "sync output for file 0") {
+		t.Fatalf("expected sync output error, got %v", err)
+	}
 	if acked {
-		t.Fatalf("did not expect ack-only request for stdout destination")
+		t.Fatalf("did not expect ACK when sync fails")
+	}
+}
+
+func TestDownloadFilesFromManifestBatchPropagatesCloseError(t *testing.T) {
+	manifest := &Manifest{
+		TransferID: "txcloseerr",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	acked := false
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, []byte("hello"), nil))
+			return err
+		case intftcp.VerbACK:
+			acked = true
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+		Manifest: manifest,
+		FileIDs:  []uint64{0},
+		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+			return errCloseWriter{Writer: io.Discard, err: errors.New("close failed")}, func() error { return nil }, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "close output for file 0") {
+		t.Fatalf("expected close output error, got %v", err)
+	}
+	if acked {
+		t.Fatalf("did not expect ACK when close fails")
 	}
 }
 
