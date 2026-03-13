@@ -13,6 +13,7 @@ func TestParseVerb(t *testing.T) {
 		{token: "ACK", want: VerbACK},
 		{token: "CXSUM", want: VerbCXSUM},
 		{token: "STATUS", want: VerbSTATUS},
+		{token: "PROBE", want: VerbPROBE},
 		{token: "status", want: VerbSTATUS},
 	}
 	for _, tc := range cases {
@@ -37,7 +38,7 @@ func TestParseVerbUnknown(t *testing.T) {
 }
 
 func TestDispatchMapContainsVerbs(t *testing.T) {
-	verbs := []Verb{VerbAUTH, VerbTXFER, VerbSEND, VerbACK, VerbCXSUM, VerbSTATUS}
+	verbs := []Verb{VerbAUTH, VerbTXFER, VerbSEND, VerbACK, VerbCXSUM, VerbSTATUS, VerbPROBE}
 	for _, v := range verbs {
 		if _, ok := handlers[v]; !ok {
 			t.Fatalf("handlers missing verb %v", v)

@@ -42,6 +42,8 @@ func (d *sendTestDeps) ClipTransfer(string) bool { return false }
 
 func (d *sendTestDeps) GetTransfer(string) (Transfer, bool) { return Transfer{}, false }
 
+func (d *sendTestDeps) SetTransferHints(string, string, int64, int) bool { return true }
+
 func (d *sendTestDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
 	fd, err := os.Open(d.filePath)
 	if err != nil {
@@ -142,6 +144,41 @@ func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {
 	var pe protocolErr
 	if !errors.As(err, &pe) || pe.code != "UNSUPPORTED_COMP" {
 		t.Fatalf("expected UNSUPPORTED_COMP, got %v", err)
+	}
+}
+
+func TestParseSENDRequestModeDefaultsAndValidation(t *testing.T) {
+	req, err := ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt"`))
+	if err != nil {
+		t.Fatalf("ParseRequest failed: %v", err)
+	}
+	parsed, err := parseSENDRequest(req)
+	if err != nil {
+		t.Fatalf("parseSENDRequest failed: %v", err)
+	}
+	if got := parsed.Items[0].Mode; got != loadStrategyFast {
+		t.Fatalf("expected default mode %q, got %q", loadStrategyFast, got)
+	}
+
+	req, err = ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt" mode=gentle`))
+	if err != nil {
+		t.Fatalf("ParseRequest failed: %v", err)
+	}
+	parsed, err = parseSENDRequest(req)
+	if err != nil {
+		t.Fatalf("parseSENDRequest failed: %v", err)
+	}
+	if got := parsed.Items[0].Mode; got != loadStrategyGentle {
+		t.Fatalf("expected mode %q, got %q", loadStrategyGentle, got)
+	}
+
+	req, err = ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt" mode=slow`))
+	if err != nil {
+		t.Fatalf("ParseRequest failed: %v", err)
+	}
+	_, err = parseSENDRequest(req)
+	if err == nil {
+		t.Fatalf("expected mode validation error")
 	}
 }
 

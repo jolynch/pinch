@@ -99,7 +99,7 @@ func ParseRequest(payload []byte) (Request, error) {
 					return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND item option"}
 				}
 				switch key {
-				case "offset", "size", "comp":
+				case "offset", "size", "comp", "mode":
 					item[key] = val
 				default:
 					// Unknown keys are ignored for forward compatibility.
@@ -194,6 +194,29 @@ func ParseRequest(payload []byte) (Request, error) {
 			return Request{}, protocolErr{code: "BAD_REQUEST", message: "unexpected STATUS arguments"}
 		}
 		req.Params = append(req.Params, map[string]string{"txferid": txferID})
+		return req, nil
+	case VerbPROBE:
+		param := map[string]string{}
+		for !c.eof() {
+			tok, tokErr := c.readToken()
+			if tokErr != nil {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid PROBE arguments"}
+			}
+			key, val, ok := strings.Cut(tok, "=")
+			if !ok {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid PROBE arguments"}
+			}
+			switch key {
+			case "cpu", "probe-bytes", "cts0", "sts0", "sts1":
+				param[key] = val
+			default:
+				// Unknown keys are ignored for forward compatibility.
+			}
+		}
+		if strings.TrimSpace(param["cpu"]) == "" || strings.TrimSpace(param["probe-bytes"]) == "" || strings.TrimSpace(param["cts0"]) == "" {
+			return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid PROBE arguments"}
+		}
+		req.Params = append(req.Params, param)
 		return req, nil
 	default:
 		return Request{Verb: VerbUnknown}, protocolErr{code: "BAD_COMMAND", message: "unknown command"}

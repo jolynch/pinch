@@ -11,9 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	intlimit "github.com/jolynch/pinch/internal/filexfer/limit"
 	intpolicy "github.com/jolynch/pinch/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
@@ -24,6 +26,8 @@ const defaultMaxLinuxPipeSizeBytes int64 = 1 * 1024 * 1024
 const defaultCompressedFrameBufferBytes = 8 * 1024 * 1024
 const maxCompressedFrameBufferPoolBytes = 32 * 1024 * 1024
 const placeholderHeaderHashToken = "xxh128:00000000000000000000000000000000"
+const loadStrategyFast = "fast"
+const loadStrategyGentle = "gentle"
 
 var logicalBufferPools sync.Map
 var compressedFrameBufferPool sync.Pool
@@ -36,6 +40,7 @@ type sendItem struct {
 	Size   int64
 	Comp   string
 	Path   string
+	Mode   string
 }
 
 type sendRequest struct {
@@ -116,18 +121,35 @@ func parseSENDRequest(req Request) (sendRequest, error) {
 		if path == "" {
 			return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND path"}
 		}
-		items = append(items, sendItem{FileID: fid, Offset: offset, Size: size, Comp: comp, Path: path})
+		mode := strings.ToLower(strings.TrimSpace(p["mode"]))
+		if mode == "" {
+			mode = loadStrategyFast
+		}
+		switch mode {
+		case loadStrategyFast, loadStrategyGentle:
+		default:
+			return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "unsupported SEND mode"}
+		}
+		items = append(items, sendItem{FileID: fid, Offset: offset, Size: size, Comp: comp, Path: path, Mode: mode})
 	}
 	return sendRequest{TransferID: txferID, Items: items}, nil
 }
 
-func handleSEND(_ context.Context, req Request, out io.Writer, deps Deps) error {
+func handleSEND(ctx context.Context, req Request, out io.Writer, deps Deps) error {
+	return handleSENDWithOptions(ctx, req, out, deps, nil)
+}
+
+func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps Deps, limiter *intlimit.Limiter) error {
 	parsed, err := parseSENDRequest(req)
 	if err != nil {
 		return err
 	}
 	for _, item := range parsed.Items {
-		if err := streamSendItem(out, deps, parsed.TransferID, item); err != nil {
+		itemOut := out
+		if limiter != nil && item.Mode == loadStrategyGentle {
+			itemOut = limiter.WrapRateLimitedWriter(out, ctx)
+		}
+		if err := streamSendItem(itemOut, deps, parsed.TransferID, item); err != nil {
 			return err
 		}
 	}
@@ -135,11 +157,15 @@ func handleSEND(_ context.Context, req Request, out io.Writer, deps Deps) error 
 }
 
 func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) error {
-	fd, fileRef, err := deps.GetFile(txferID, item.FileID, item.Path)
+	fd, fileRef, usedDirectOpen, err := openSendFile(deps, txferID, item)
 	if err != nil {
 		return mapLookupError(err)
 	}
-	defer fd.Close()
+	defer func() {
+		if fd != nil {
+			_ = fd.Close()
+		}
+	}()
 
 	_ = deps.SetTransferFileState(txferID, item.FileID, TransferStateRunning)
 
@@ -158,7 +184,9 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 	if item.Size > 0 && item.Size < windowLen {
 		windowLen = item.Size
 	}
-	maybeFadviseSequential(fd, item.Offset, windowLen)
+	if item.Mode == loadStrategyFast {
+		maybeFadviseSequential(fd, item.Offset, windowLen)
+	}
 
 	cursor := item.Offset
 	windowStart := item.Offset
@@ -173,7 +201,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 		return protocolErr{code: "INTERNAL", message: "failed to compute max frame size hint"}
 	}
 	pipeSizeBytes := desiredPipeSizeBytes(windowLen, defaultFileFrameLogicalSize)
-	useLinuxSplice := runtime.GOOS == "linux"
+	useLinuxSplice := runtime.GOOS == "linux" && item.Mode == loadStrategyFast
 	firstFrame := true
 
 	adaptive := item.Comp == "adapt"
@@ -224,6 +252,30 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 			stats, err = streamFramePayloadBuffered(fd, &frameOffset, frameArgs)
 		}
 		if err != nil {
+			if usedDirectOpen && isDirectIOReadError(err) {
+				_ = fd.Close()
+				fd = nil
+				fd, fileRef, err = deps.GetFile(txferID, item.FileID, item.Path)
+				if err != nil {
+					return mapLookupError(err)
+				}
+				usedDirectOpen = false
+				useLinuxSplice = runtime.GOOS == "linux" && item.Mode == loadStrategyFast
+				if item.Mode == loadStrategyFast {
+					maybeFadviseSequential(fd, item.Offset, windowLen)
+				}
+				cursor = item.Offset
+				remaining = windowLen
+				windowWireTotal = 0
+				windowLogicalTotal = 0
+				windowFrames = 0
+				windowTS0 = time.Now().UnixMilli()
+				firstFrame = true
+				currentMode = initialCompressionMode(item.Comp)
+				compressPolicy = intpolicy.NewCompressionPolicy()
+				windowHasher = xxh3.New128()
+				continue
+			}
 			return err
 		}
 
@@ -292,6 +344,30 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 		intencoding.HumanRate(wireBps),
 	)
 	return nil
+}
+
+func openSendFile(deps Deps, txferID string, item sendItem) (*os.File, FileRef, bool, error) {
+	if item.Mode != loadStrategyGentle {
+		fd, fileRef, err := deps.GetFile(txferID, item.FileID, item.Path)
+		return fd, fileRef, false, err
+	}
+	fileRef, err := deps.GetFileRef(txferID, item.FileID, item.Path)
+	if err != nil {
+		return nil, FileRef{}, false, err
+	}
+	fd, err := os.OpenFile(fileRef.Path, os.O_RDONLY|unix.O_DIRECT, 0)
+	if err != nil {
+		fd, fileRef, err = deps.GetFile(txferID, item.FileID, item.Path)
+		return fd, fileRef, false, err
+	}
+	return fd, fileRef, true, nil
+}
+
+func isDirectIOReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.EINVAL) || errors.Is(err, unix.EINVAL)
 }
 
 func initialCompressionMode(comp string) intpolicy.CompressionMode {

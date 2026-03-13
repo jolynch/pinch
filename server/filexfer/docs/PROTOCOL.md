@@ -20,8 +20,9 @@ All commands are single lines terminated by `\r\n`.
   - `ERR <code> <message>\r\n`
 
 For `TXFER`, `SEND`, and `CXSUM`, the payload interval is a streaming body
-(`FM/1` for `TXFER`, `FX/1` for `SEND`/`CXSUM`) between the request line and
-the terminal response status line.
+(`FM/2` for `TXFER`, `FX/1` for `SEND`/`CXSUM`) between the request line and
+the terminal response status line. `PROBE` also has a request payload and
+response payload body.
 
 Maximum command line size is 4 MiB.
 
@@ -29,7 +30,7 @@ Maximum command line size is 4 MiB.
 
 1. Client connects.
 2. Client sends either:
-   - command line (`TXFER|SEND|ACK|CXSUM|STATUS`), or
+   - command line (`TXFER|SEND|ACK|CXSUM|STATUS|PROBE`), or
    - `AUTH` first, then exactly one command line.
 3. Server writes response.
 4. Server closes connection.
@@ -80,14 +81,17 @@ Creates a transfer and streams a manifest.
 
 ### Request
 
-`TXFER <path> [verbose=<0|1|true|false>] [max-manifest-chunk-size=<n>]`
+`TXFER <path> mode=<fast|gentle> link-mbps=<int> concurrency=<int> [verbose=<0|1|true|false>] [max-manifest-chunk-size=<n>]`
 
 - `<path>` must be quoted or length-prefixed.
 - directory must be absolute, existing, and readable.
+- `mode`, `link-mbps`, and `concurrency` are required.
+- `link-mbps` must be `>= 0`.
+- `concurrency` must be `> 0`.
 
 ### Response
 
-- Stream bytes in `FM/1` format (see [MANIFEST.md](./MANIFEST.md)).
+- Stream bytes in `FM/2` format (see [MANIFEST.md](./MANIFEST.md)).
 - Terminal status line after manifest stream: `OK` or `ERR ...`.
 
 ## SEND
@@ -96,14 +100,16 @@ Streams one or more file windows as `FX/1` frames.
 
 ### Request
 
-`SEND <txferid> fd=<fid> <path> [offset=<n>] [size=<n>] [comp=<name>] [<unknown key=value>...] [fd=<fid> <path> ...]`
+`SEND <txferid> fd=<fid> <path> [offset=<n>] [size=<n>] [comp=<name>] [mode=<fast|gentle>] [<unknown key=value>...] [fd=<fid> <path> ...]`
 
 - each `fd=` starts a new file block.
 - required per block: `fd`, `path`.
 - `offset` defaults to `0`.
 - `size` defaults to `0` (means "from offset to EOF").
 - `comp` defaults to `adapt`.
+- `mode` defaults to `fast`.
 - accepted compression values: `adapt`, `none`, `identity`, `lz4`, `zstd`.
+- accepted load strategy values: `fast`, `gentle`.
 - `identity` is normalized to `none`.
 - in `adapt`, server may emit different per-frame `comp` values as it adjusts compression.
 - unknown compression values are rejected with `ERR UNSUPPORTED_COMP ...`.
@@ -191,3 +197,23 @@ JSON schema:
   }
 }
 ```
+
+## PROBE
+
+Latency/throughput probe used before `TXFER` so the client can send transfer hints.
+
+### Request
+
+`PROBE cpu=<client-cpu> probe-bytes=<n> cts0=<unix-ms>`
+
+- request line is followed by exactly `probe-bytes` raw bytes.
+- `probe-bytes` must be `<= 32 MiB`.
+
+### Response
+
+- first line:
+  - `PROBE cpu=<server-cpu> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n>`
+- then exactly `probe-bytes` raw bytes.
+- terminal status line: `OK` or `ERR ...`.
+
+Clients typically run 3 probes, compute a rounded link estimate, choose mode/concurrency, then issue `TXFER` with those required hints.

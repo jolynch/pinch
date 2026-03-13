@@ -3,17 +3,20 @@ package filexfer
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"filippo.io/age"
+	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 )
 
 const maxTCPLineBytes = 4 * 1024 * 1024
@@ -23,6 +26,15 @@ type tcpAuthState struct {
 	identity        string
 	hasAuth         bool
 	encryptCommands bool
+}
+
+type probeResponse struct {
+	ServerCPU  int
+	CTS0       int64
+	CTS1       int64
+	STS0       int64
+	STS1       int64
+	ProbeBytes int64
 }
 
 func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
@@ -287,6 +299,9 @@ func (c *Client) fetchManifestTCP(ctx context.Context, request FetchManifestRequ
 	if request.MaxChunkSize > 0 {
 		cmd += " max-manifest-chunk-size=" + strconv.Itoa(request.MaxChunkSize)
 	}
+	cmd += " mode=" + request.Mode
+	cmd += " link-mbps=" + strconv.FormatInt(request.LinkMbps, 10)
+	cmd += " concurrency=" + strconv.Itoa(request.Concurrency)
 	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
 		return FetchManifestResponse{}, fmt.Errorf("send TXFER: %w", err)
 	}
@@ -353,6 +368,7 @@ func (c *Client) fetchFileWindowTCP(
 	if effectiveSize < 0 {
 		effectiveSize = 0
 	}
+	loadStrategy := normalizeLoadStrategy(c.LoadStrategy)
 	var cmd strings.Builder
 	cmd.WriteString("SEND ")
 	cmd.WriteString(txferID)
@@ -360,6 +376,8 @@ func (c *Client) fetchFileWindowTCP(
 	cmd.WriteString(strconv.FormatUint(fileID, 10))
 	cmd.WriteString(" ")
 	cmd.WriteString(makeLenToken(fullPath))
+	cmd.WriteString(" mode=")
+	cmd.WriteString(loadStrategy)
 	if offset != 0 {
 		cmd.WriteString(" offset=")
 		cmd.WriteString(strconv.FormatInt(offset, 10))
@@ -438,6 +456,7 @@ func (c *Client) fetchFileBatchTCP(
 	}
 
 	var b strings.Builder
+	loadStrategy := normalizeLoadStrategy(c.LoadStrategy)
 	b.WriteString("SEND ")
 	b.WriteString(txferID)
 	for _, t := range targets {
@@ -449,6 +468,8 @@ func (c *Client) fetchFileBatchTCP(
 		b.WriteString(strconv.FormatUint(t.FileID, 10))
 		b.WriteString(" ")
 		b.WriteString(makeLenToken(t.FullPath))
+		b.WriteString(" mode=")
+		b.WriteString(loadStrategy)
 		if t.Offset != 0 {
 			b.WriteString(" offset=")
 			b.WriteString(strconv.FormatInt(t.Offset, 10))
@@ -503,6 +524,148 @@ func readTCPStatus(br *bufio.Reader) (string, error) {
 		return "", fmt.Errorf("unexpected response: %s", strings.TrimSpace(line))
 	}
 	return message, nil
+}
+
+func (c *Client) probeTCP(ctx context.Context, probeBytes int64, agePublicKey string, ageIdentity string) (probeResponse, error) {
+	if probeBytes <= 0 {
+		return probeResponse{}, errors.New("probe bytes must be > 0")
+	}
+	state, err := c.resolveTCPAuthState(agePublicKey, ageIdentity)
+	if err != nil {
+		return probeResponse{}, err
+	}
+	conn, err := c.dialTCP(ctx)
+	if err != nil {
+		return probeResponse{}, fmt.Errorf("dial file listener: %w", err)
+	}
+	defer conn.Close()
+	if err := c.sendTCPAuth(conn, state); err != nil {
+		return probeResponse{}, fmt.Errorf("send AUTH: %w", err)
+	}
+
+	cts0 := time.Now().UnixMilli()
+	localCPU := runtime.NumCPU()
+	cmd := fmt.Sprintf("PROBE cpu=%d probe-bytes=%d cts0=%d", localCPU, probeBytes, cts0)
+	if err := c.sendTCPProbe(conn, state, cmd, probeBytes); err != nil {
+		return probeResponse{}, fmt.Errorf("send PROBE: %w", err)
+	}
+
+	responseReader, err := c.responseReaderForTCP(conn, state)
+	if err != nil {
+		return probeResponse{}, fmt.Errorf("initialize PROBE response stream: %w", err)
+	}
+	capture := &firstReadTimestampReader{reader: responseReader}
+	br := bufio.NewReader(capture)
+	line, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return probeResponse{}, fmt.Errorf("read PROBE response line: %w", err)
+	}
+	if err := parseErrControlFrame(line); err != nil {
+		return probeResponse{}, err
+	}
+	probeResp, err := parseProbeResponseLine(line)
+	if err != nil {
+		return probeResponse{}, err
+	}
+	if probeResp.ProbeBytes != probeBytes {
+		return probeResponse{}, fmt.Errorf("probe byte mismatch: sent=%d got=%d", probeBytes, probeResp.ProbeBytes)
+	}
+	if _, err := io.CopyN(io.Discard, br, probeResp.ProbeBytes); err != nil {
+		return probeResponse{}, fmt.Errorf("read PROBE payload: %w", err)
+	}
+	if _, err := readTCPStatus(br); err != nil {
+		return probeResponse{}, fmt.Errorf("read PROBE status: %w", err)
+	}
+	probeResp.CTS1 = capture.FirstTS()
+	if probeResp.CTS1 == 0 {
+		probeResp.CTS1 = time.Now().UnixMilli()
+	}
+	return probeResp, nil
+}
+
+func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, probeBytes int64) error {
+	if !state.encryptCommands {
+		if err := writeTCPLine(conn, cmd); err != nil {
+			return err
+		}
+		_, err := io.CopyN(conn, rand.Reader, probeBytes)
+		return err
+	}
+	recipient, err := age.ParseX25519Recipient(strings.TrimSpace(c.ServerAgePublicKey))
+	if err != nil {
+		return err
+	}
+	ew, err := age.Encrypt(conn, recipient)
+	if err != nil {
+		return err
+	}
+	if err := writeTCPLine(ew, cmd); err != nil {
+		_ = ew.Close()
+		return err
+	}
+	if _, err := io.CopyN(ew, rand.Reader, probeBytes); err != nil {
+		_ = ew.Close()
+		return err
+	}
+	return ew.Close()
+}
+
+type firstReadTimestampReader struct {
+	reader io.Reader
+	first  int64
+}
+
+func (r *firstReadTimestampReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && r.first == 0 {
+		r.first = time.Now().UnixMilli()
+	}
+	return n, err
+}
+
+func (r *firstReadTimestampReader) FirstTS() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.first
+}
+
+func parseProbeResponseLine(line string) (probeResponse, error) {
+	req, err := intftcp.ParseRequest([]byte(strings.TrimSpace(line)))
+	if err != nil {
+		return probeResponse{}, fmt.Errorf("parse PROBE response: %w", err)
+	}
+	if req.Verb != intftcp.VerbPROBE || len(req.Params) != 1 {
+		return probeResponse{}, errors.New("invalid PROBE response")
+	}
+	p := req.Params[0]
+	serverCPU, err := strconv.Atoi(strings.TrimSpace(p["cpu"]))
+	if err != nil || serverCPU <= 0 {
+		return probeResponse{}, errors.New("invalid PROBE response cpu")
+	}
+	cts0, err := strconv.ParseInt(strings.TrimSpace(p["cts0"]), 10, 64)
+	if err != nil || cts0 < 0 {
+		return probeResponse{}, errors.New("invalid PROBE response cts0")
+	}
+	sts0, err := strconv.ParseInt(strings.TrimSpace(p["sts0"]), 10, 64)
+	if err != nil || sts0 < 0 {
+		return probeResponse{}, errors.New("invalid PROBE response sts0")
+	}
+	sts1, err := strconv.ParseInt(strings.TrimSpace(p["sts1"]), 10, 64)
+	if err != nil || sts1 < 0 {
+		return probeResponse{}, errors.New("invalid PROBE response sts1")
+	}
+	probeBytes, err := strconv.ParseInt(strings.TrimSpace(p["probe-bytes"]), 10, 64)
+	if err != nil || probeBytes < 0 {
+		return probeResponse{}, errors.New("invalid PROBE response probe-bytes")
+	}
+	return probeResponse{
+		ServerCPU:  serverCPU,
+		CTS0:       cts0,
+		STS0:       sts0,
+		STS1:       sts1,
+		ProbeBytes: probeBytes,
+	}, nil
 }
 
 func (c *Client) acknowledgeFileProgressTCP(ctx context.Context, request AcknowledgeFileProgressRequest, ackToken string) (AcknowledgeFileProgressResponse, error) {

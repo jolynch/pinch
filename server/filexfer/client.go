@@ -32,6 +32,11 @@ const (
 	EncodingLz4      = "lz4"
 )
 
+const (
+	LoadStrategyFast   = "fast"
+	LoadStrategyGentle = "gentle"
+)
+
 type DownloadStatus struct {
 	Started int `json:"started"`
 	Running int `json:"running"`
@@ -103,6 +108,12 @@ func WithSocketReadBufferBytes(bufferBytes int) ClientOption {
 	})
 }
 
+func WithLoadStrategy(strategy string) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.LoadStrategy = normalizeLoadStrategy(strategy)
+	})
+}
+
 type Client struct {
 	FileAddr                string
 	ServerAgePublicKey      string
@@ -111,6 +122,7 @@ type Client struct {
 	MaxFrameReadBufferBytes int
 	AckRequestTimeout       time.Duration
 	SocketReadBufferBytes   int
+	LoadStrategy            string
 
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
@@ -124,10 +136,13 @@ type Client struct {
 }
 
 type Manifest struct {
-	TransferID string
-	Root       string
-	Entries    []ManifestEntry
-	Progress   map[uint64]ManifestProgress
+	TransferID  string
+	Root        string
+	Mode        string
+	LinkMbps    int64
+	Concurrency int
+	Entries     []ManifestEntry
+	Progress    map[uint64]ManifestProgress
 }
 
 type ManifestEntry struct {
@@ -231,8 +246,26 @@ type FetchManifestRequest struct {
 	Directory    string
 	Verbose      bool
 	MaxChunkSize int
+	Mode         string
+	LinkMbps     int64
+	Concurrency  int
 	AgePublicKey string
 	AgeIdentity  string
+}
+
+type ProbeRequest struct {
+	Samples      int
+	ProbeBytes   int64
+	LoadStrategy string
+	AgePublicKey string
+	AgeIdentity  string
+}
+
+type ProbeResponse struct {
+	ServerCPU            int
+	AvgLatencyMS         int64
+	LinkMbps             int64
+	SuggestedConcurrency int
 }
 
 type FetchManifestResponse struct {
@@ -314,6 +347,11 @@ const (
 	defaultClientScratchBufferBytes      int   = 64 * 1024
 	maxClientScratchBufferPoolBytes      int   = 16 * 1024 * 1024
 	defaultClientAckRequestTimeout             = 15 * time.Second
+	defaultClientLoadStrategy                  = LoadStrategyFast
+	defaultClientProbeBytes              int64 = 1 * 1024 * 1024
+	defaultClientProbeSamples                  = 3
+	minAutoStartConcurrency                    = 2
+	maxAutoStartConcurrency                    = 256
 )
 
 func NewClient(fileAddr string, opts ...ClientOption) *Client {
@@ -326,6 +364,7 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 		MaxFrameReadBufferBytes: defaultClientMaxFrameReadBufferBytes,
 		AckRequestTimeout:       defaultClientAckRequestTimeout,
 		SocketReadBufferBytes:   utils.MaxSocketReadBufferBytes(),
+		LoadStrategy:            defaultClientLoadStrategy,
 	}
 	for _, opt := range opts {
 		if opt == nil {
@@ -349,6 +388,16 @@ func (c *Client) FetchManifest(ctx context.Context, request FetchManifestRequest
 	if request.Directory == "" {
 		return FetchManifestResponse{}, errors.New("missing directory")
 	}
+	request.Mode = strings.ToLower(strings.TrimSpace(request.Mode))
+	if request.Mode != LoadStrategyFast && request.Mode != LoadStrategyGentle {
+		return FetchManifestResponse{}, errors.New("invalid mode")
+	}
+	if request.LinkMbps < 0 {
+		return FetchManifestResponse{}, errors.New("link mbps must be >= 0")
+	}
+	if request.Concurrency <= 0 {
+		return FetchManifestResponse{}, errors.New("concurrency must be > 0")
+	}
 	return c.fetchManifestTCP(ctx, request)
 }
 
@@ -358,6 +407,15 @@ func DefaultClientConcurrency() int {
 		return 1
 	}
 	return n
+}
+
+func normalizeLoadStrategy(strategy string) string {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case LoadStrategyGentle:
+		return LoadStrategyGentle
+	default:
+		return LoadStrategyFast
+	}
 }
 
 func SaveManifest(path string, manifest *Manifest) error {
@@ -941,8 +999,13 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 		req.OutRoot = "."
 	}
 	if req.Concurrency <= 0 {
-		req.Concurrency = DefaultClientConcurrency()
+		if req.Manifest.Concurrency > 0 {
+			req.Concurrency = req.Manifest.Concurrency
+		} else {
+			req.Concurrency = DefaultClientConcurrency()
+		}
 	}
+	req.Concurrency = clampConcurrency(req.Concurrency)
 	batches := buildManifestBatchesByBytes(entries, req.BatchMaxBytes)
 	workCh := make(chan []ManifestEntry)
 	errCh := make(chan error, len(entries))
@@ -1016,6 +1079,89 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 	resp.TransferredBytes = transferred.Load()
 	resp.Failed = len(resp.Errors)
 	return resp, nil
+}
+
+func suggestedConcurrencyFromProbe(serverCPU int, strategy string) int {
+	if serverCPU <= 0 {
+		serverCPU = runtime.NumCPU()
+	}
+	strategy = normalizeLoadStrategy(strategy)
+	if strategy == LoadStrategyGentle {
+		value := serverCPU / 4
+		if serverCPU%4 != 0 {
+			value++
+		}
+		return value
+	}
+	return serverCPU * 2
+}
+
+func clampConcurrency(v int) int {
+	if v < minAutoStartConcurrency {
+		return minAutoStartConcurrency
+	}
+	if v > maxAutoStartConcurrency {
+		return maxAutoStartConcurrency
+	}
+	return v
+}
+
+func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse, error) {
+	if c == nil {
+		return ProbeResponse{}, errors.New("nil client")
+	}
+	samples := req.Samples
+	if samples <= 0 {
+		samples = defaultClientProbeSamples
+	}
+	probeBytes := req.ProbeBytes
+	if probeBytes <= 0 {
+		probeBytes = defaultClientProbeBytes
+	}
+	loadStrategy := req.LoadStrategy
+	if strings.TrimSpace(loadStrategy) == "" {
+		loadStrategy = c.LoadStrategy
+	}
+	loadStrategy = normalizeLoadStrategy(loadStrategy)
+
+	probeResults := make([]probeResponse, 0, samples)
+	for i := 0; i < samples; i++ {
+		result, err := c.probeTCP(ctx, probeBytes, req.AgePublicKey, req.AgeIdentity)
+		if err != nil {
+			return ProbeResponse{}, fmt.Errorf("probe %d failed: %w", i+1, err)
+		}
+		probeResults = append(probeResults, result)
+	}
+	response := summarizeProbeSamples(probeResults, probeBytes)
+	response.SuggestedConcurrency = clampConcurrency(suggestedConcurrencyFromProbe(response.ServerCPU, loadStrategy))
+	return response, nil
+}
+
+func summarizeProbeSamples(results []probeResponse, probeBytes int64) ProbeResponse {
+	if len(results) == 0 {
+		return ProbeResponse{}
+	}
+	totalIntervalMS := int64(0)
+	serverCPU := 0
+	for _, result := range results {
+		serverCPU = result.ServerCPU
+		intervalMS := (result.CTS1 - result.CTS0) - (result.STS1 - result.STS0)
+		if intervalMS < 1 {
+			intervalMS = 1
+		}
+		totalIntervalMS += intervalMS
+	}
+	avgMS := totalIntervalMS / int64(len(results))
+	if avgMS <= 0 {
+		avgMS = 1
+	}
+	mbps := ((probeBytes * 8 * 1000) / avgMS) / 1_000_000
+	roundedMbps := ((mbps + 50) / 100) * 100
+	return ProbeResponse{
+		ServerCPU:    serverCPU,
+		AvgLatencyMS: avgMS,
+		LinkMbps:     roundedMbps,
+	}
 }
 
 func buildManifestBatchesByBytes(entries []ManifestEntry, maxBytes int64) [][]ManifestEntry {
@@ -1322,16 +1468,19 @@ func parseManifest(raw []byte) (*Manifest, error) {
 		line = strings.TrimRight(line, "\r\n")
 		trimmed := strings.TrimSpace(line)
 		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-			if strings.HasPrefix(trimmed, "FM/1 ") {
-				txferID, root, parseErr := parseManifestHeader(trimmed)
+			if strings.HasPrefix(trimmed, "FM/2 ") {
+				txferID, root, mode, linkMbps, concurrency, parseErr := parseManifestHeader(trimmed)
 				if parseErr != nil {
 					return nil, parseErr
 				}
 				if !seenHeader {
 					manifest.TransferID = txferID
 					manifest.Root = root
+					manifest.Mode = mode
+					manifest.LinkMbps = linkMbps
+					manifest.Concurrency = concurrency
 					seenHeader = true
-				} else if manifest.TransferID != txferID || manifest.Root != root {
+				} else if manifest.TransferID != txferID || manifest.Root != root || manifest.Mode != mode || manifest.LinkMbps != linkMbps || manifest.Concurrency != concurrency {
 					return nil, errors.New("manifest chunk header mismatch")
 				}
 				prevPath = ""
@@ -1384,7 +1533,26 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 	entries := append([]ManifestEntry(nil), manifest.Entries...)
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
 	var b strings.Builder
-	fmt.Fprintf(&b, "FM/1 %s %d:%s\n", manifest.TransferID, len(manifest.Root), manifest.Root)
+	mode := strings.ToLower(strings.TrimSpace(manifest.Mode))
+	if mode != LoadStrategyFast && mode != LoadStrategyGentle {
+		return nil, errors.New("manifest mode must be fast or gentle")
+	}
+	if manifest.LinkMbps < 0 {
+		return nil, errors.New("manifest link mbps must be >= 0")
+	}
+	if manifest.Concurrency <= 0 {
+		return nil, errors.New("manifest concurrency must be > 0")
+	}
+	fmt.Fprintf(
+		&b,
+		"FM/2 %s %d:%s mode=%s link-mbps=%d concurrency=%d\n",
+		manifest.TransferID,
+		len(manifest.Root),
+		manifest.Root,
+		mode,
+		manifest.LinkMbps,
+		manifest.Concurrency,
+	)
 	prevPath := ""
 	prevMtime := ""
 	seenIDs := make(map[uint64]struct{}, len(entries))
@@ -1542,19 +1710,64 @@ func applyVerifiedFileMetadata(fileWriter *os.File, meta *FileTrailerMetadata, b
 	return nil
 }
 
-func parseManifestHeader(line string) (string, string, error) {
-	rest := strings.TrimPrefix(line, "FM/1 ")
+func parseManifestHeader(line string) (string, string, string, int64, int, error) {
+	rest := strings.TrimPrefix(line, "FM/2 ")
 	sep := strings.IndexByte(rest, ' ')
 	if sep <= 0 || sep == len(rest)-1 {
-		return "", "", errors.New("invalid manifest header")
+		return "", "", "", 0, 0, errors.New("invalid manifest header")
 	}
 	txferID := rest[:sep]
-	rootToken := rest[sep+1:]
-	root, err := parseLenPrefixed(rootToken)
+	rootRaw := rest[sep+1:]
+	root, consumed, err := parseLenPrefixedPrefix(rootRaw)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid manifest root token: %w", err)
+		return "", "", "", 0, 0, fmt.Errorf("invalid manifest root token: %w", err)
 	}
-	return txferID, root, nil
+	optionsRaw := strings.TrimSpace(rootRaw[consumed:])
+	if optionsRaw == "" {
+		return "", "", "", 0, 0, errors.New("manifest header missing metadata options")
+	}
+	options := strings.Fields(optionsRaw)
+	var (
+		mode        string
+		linkMbps    int64
+		concurrency int
+		seenMode    bool
+		seenLink    bool
+		seenConc    bool
+	)
+	for _, option := range options {
+		key, value, ok := strings.Cut(option, "=")
+		if !ok {
+			return "", "", "", 0, 0, errors.New("invalid manifest header option")
+		}
+		switch key {
+		case "mode":
+			value = strings.ToLower(strings.TrimSpace(value))
+			if value != LoadStrategyFast && value != LoadStrategyGentle {
+				return "", "", "", 0, 0, errors.New("invalid manifest mode")
+			}
+			mode = value
+			seenMode = true
+		case "link-mbps":
+			linkMbps, err = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if err != nil || linkMbps < 0 {
+				return "", "", "", 0, 0, errors.New("invalid manifest link-mbps")
+			}
+			seenLink = true
+		case "concurrency":
+			concurrency, err = strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || concurrency <= 0 {
+				return "", "", "", 0, 0, errors.New("invalid manifest concurrency")
+			}
+			seenConc = true
+		default:
+			return "", "", "", 0, 0, errors.New("unknown manifest header option")
+		}
+	}
+	if !seenMode || !seenLink || !seenConc {
+		return "", "", "", 0, 0, errors.New("manifest header missing required metadata")
+	}
+	return txferID, root, mode, linkMbps, concurrency, nil
 }
 
 func parseManifestEntry(line string, prevPath string, prevMtime string) (ManifestEntry, string, string, error) {
@@ -1670,6 +1883,23 @@ func parseLenPrefixed(token string) (string, error) {
 		return "", errors.New("len prefix mismatch")
 	}
 	return data, nil
+}
+
+func parseLenPrefixedPrefix(raw string) (string, int, error) {
+	sep := strings.IndexByte(raw, ':')
+	if sep <= 0 {
+		return "", 0, errors.New("invalid len-prefixed token")
+	}
+	n, err := strconv.Atoi(raw[:sep])
+	if err != nil || n < 0 {
+		return "", 0, errors.New("invalid len prefix")
+	}
+	start := sep + 1
+	end := start + n
+	if end > len(raw) {
+		return "", 0, errors.New("len prefix mismatch")
+	}
+	return raw[start:end], end, nil
 }
 
 func decodeMtimeToken(prev string, token string) (string, error) {

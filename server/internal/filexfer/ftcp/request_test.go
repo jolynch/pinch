@@ -77,6 +77,19 @@ func TestParseRequestSENDCompModes(t *testing.T) {
 	}
 }
 
+func TestParseRequestSENDMode(t *testing.T) {
+	req, err := ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt" mode=gentle`))
+	if err != nil {
+		t.Fatalf("ParseRequest err: %v", err)
+	}
+	if len(req.Params) != 2 {
+		t.Fatalf("params len=%d", len(req.Params))
+	}
+	if got := req.Params[1]["mode"]; got != "gentle" {
+		t.Fatalf("expected mode=gentle got=%q", got)
+	}
+}
+
 func TestParseRequestACKMinimal(t *testing.T) {
 	payload := []byte(`ACK tx1 fd=42 "/tmp/file.txt" ack-token=5@1001@xxh128:abc`)
 	req, err := ParseRequest(payload)
@@ -172,9 +185,32 @@ func TestParseRequestUnknownVerb(t *testing.T) {
 	}
 }
 
+func TestParseRequestPROBE(t *testing.T) {
+	req, err := ParseRequest([]byte(`PROBE cpu=8 probe-bytes=1048576 cts0=100`))
+	if err != nil {
+		t.Fatalf("ParseRequest err: %v", err)
+	}
+	if req.Verb != VerbPROBE {
+		t.Fatalf("verb=%v", req.Verb)
+	}
+	if len(req.Params) != 1 {
+		t.Fatalf("params len=%d", len(req.Params))
+	}
+	if req.Params[0]["cpu"] != "8" || req.Params[0]["probe-bytes"] != "1048576" || req.Params[0]["cts0"] != "100" {
+		t.Fatalf("unexpected PROBE params: %#v", req.Params[0])
+	}
+}
+
+func TestParseRequestPROBEMissingRequired(t *testing.T) {
+	_, err := ParseRequest([]byte(`PROBE cpu=8 cts0=100`))
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
 func TestHandleCommandBadVerb(t *testing.T) {
 	s := &connSession{}
-	err := s.handleCommand(context.Background(), Request{Verb: VerbUnknown}, nil)
+	err := s.handleCommand(context.Background(), Request{Verb: VerbUnknown}, nil, nil)
 	if err == nil {
 		t.Fatalf("expected error")
 	}

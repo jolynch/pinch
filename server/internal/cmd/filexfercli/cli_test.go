@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -104,6 +105,21 @@ func serveFTCPConn(conn net.Conn, handler func(intftcp.Request, io.Writer) error
 			return
 		}
 	}
+	if cmdReq.Verb == intftcp.VerbPROBE && len(cmdReq.Params) > 0 {
+		n, convErr := strconv.ParseInt(strings.TrimSpace(cmdReq.Params[0]["probe-bytes"]), 10, 64)
+		if convErr != nil || n < 0 {
+			_, _ = io.WriteString(out, "ERR BAD_REQUEST invalid probe-bytes\r\n")
+			_ = closeOut()
+			return
+		}
+		if n > 0 {
+			if _, drainErr := io.CopyN(io.Discard, br, n); drainErr != nil {
+				_, _ = io.WriteString(out, "ERR BAD_REQUEST invalid probe payload\r\n")
+				_ = closeOut()
+				return
+			}
+		}
+	}
 
 	if err := handler(cmdReq, out); err != nil {
 		_, _ = io.WriteString(out, "ERR INTERNAL "+err.Error()+"\r\n")
@@ -145,7 +161,7 @@ func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 func TestRunCLITransferAndGet(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txcli 7:/remote",
+		"FM/2 txcli 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -153,9 +169,28 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
+		case intftcp.VerbPROBE:
+			cts0 := req.Params[0]["cts0"]
+			n, err := strconv.Atoi(req.Params[0]["probe-bytes"])
+			if err != nil || n < 0 {
+				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
+			}
+			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+				return err
+			}
+			if n > 0 {
+				if _, err := out.Write(make([]byte, n)); err != nil {
+					return err
+				}
+			}
+			_, err = io.WriteString(out, "OK\r\n")
+			return err
 		case intftcp.VerbTXFER:
 			if got := req.Params[0]["directory"]; got != "/remote" {
 				return fmt.Errorf("unexpected directory: %q", got)
+			}
+			if got := req.Params[0]["mode"]; got != LoadStrategyFast {
+				return fmt.Errorf("unexpected mode: %q", got)
 			}
 			if _, err := io.WriteString(out, manifestRaw); err != nil {
 				return err
@@ -184,7 +219,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	manifestPath := filepath.Join(tmp, "txcli.fm1")
+	manifestPath := filepath.Join(tmp, "txcli.fm2")
 	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", "-o", manifestPath}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
@@ -211,9 +246,9 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
 	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txresume.fm1")
+	manifestPath := filepath.Join(tmp, "txresume.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/1 txresume 7:/remote",
+		"FM/2 txresume 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -281,26 +316,44 @@ func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
 func TestRunCLITransferWithEncryptAge(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txenccli 7:/remote",
+		"FM/2 txenccli 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		if req.Verb != intftcp.VerbTXFER {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			cts0 := req.Params[0]["cts0"]
+			n, err := strconv.Atoi(req.Params[0]["probe-bytes"])
+			if err != nil || n < 0 {
+				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
+			}
+			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+				return err
+			}
+			if n > 0 {
+				if _, err := out.Write(make([]byte, n)); err != nil {
+					return err
+				}
+			}
+			_, err = io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
 			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
-		if _, err := io.WriteString(out, manifestRaw); err != nil {
-			return err
-		}
-		_, err := io.WriteString(out, "OK\r\n")
-		return err
 	})
 	defer srv.Close()
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	manifestPath := filepath.Join(tmp, "txenccli.fm1")
+	manifestPath := filepath.Join(tmp, "txenccli.fm2")
 	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", "--encrypt", "age", "-o", manifestPath}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
@@ -316,9 +369,9 @@ func TestRunCLITransferWithEncryptAge(t *testing.T) {
 
 func TestRunCLIStartDownloadsAll(t *testing.T) {
 	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txstart.fm1")
+	manifestPath := filepath.Join(tmp, "txstart.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstart 7:/remote",
+		"FM/2 txstart 7:/remote mode=gentle link-mbps=700 concurrency=3",
 		"0 5 0:100 0644 0:5:a.txt",
 		"1 4 0:101 0644 0:5:b.txt",
 		"",
@@ -330,6 +383,11 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbSEND:
+			for _, p := range req.Params[1:] {
+				if got := p["mode"]; got != LoadStrategyGentle {
+					return fmt.Errorf("expected SEND mode=%s, got %q", LoadStrategyGentle, got)
+				}
+			}
 			for _, p := range req.Params[1:] {
 				switch p["fid"] {
 				case "0":
@@ -362,10 +420,57 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
+	if !strings.Contains(stdout.String(), "start-plan: strategy=gentle link=700Mbps concurrency=2 (manifest=3)") {
+		t.Fatalf("missing start plan line: %s", stdout.String())
+	}
 	for _, p := range []string{"a.txt", "b.txt"} {
 		if _, err := os.Stat(filepath.Join(outRoot, p)); err != nil {
 			t.Fatalf("missing output %s: %v", p, err)
 		}
+	}
+}
+
+func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txstartdefault.fm2")
+	manifestRaw := strings.Join([]string{
+		"FM/2 txstartdefault 7:/remote mode=fast link-mbps=1200 concurrency=5",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			if got := req.Params[1]["mode"]; got != LoadStrategyFast {
+				return fmt.Errorf("expected SEND mode=%s, got %q", LoadStrategyFast, got)
+			}
+			if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	outRoot := filepath.Join(tmp, "out")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "start", "--tid", "txstartdefault", "--manifest", manifestPath, "--out-root", outRoot, "--ack-every", "1KiB"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "start-plan: strategy=fast link=1200Mbps concurrency=5 (manifest=5)") {
+		t.Fatalf("missing default start plan line: %s", stdout.String())
 	}
 }
 
@@ -413,6 +518,13 @@ func TestRunCLIUsageErrors(t *testing.T) {
 		t.Fatalf("expected usage exit 2 for invalid --ack-every, got %d", code)
 	}
 	stderr.Reset()
+	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t", "--fd", "0", "--load-strategy", "slow"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --load-strategy on get, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --load-strategy") {
+		t.Fatalf("expected invalid --load-strategy message, got: %s", stderr.String())
+	}
+	stderr.Reset()
 	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t", "--fd", "0", "--ack-every", "bad"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --ack-every size, got %d", code)
 	}
@@ -422,6 +534,20 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	stderr.Reset()
 	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for legacy --directory flag, got %d", code)
+	}
+	stderr.Reset()
+	if code := RunCLI([]string{"127.0.0.1:1", "start", "--tid", "t", "--probe-bytes", "bad"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for unknown --probe-bytes, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("expected unknown flag message, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := RunCLI([]string{"127.0.0.1:1", "start", "--tid", "t", "--load-strategy", "slow"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for unknown --load-strategy on start, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("expected unknown flag message, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "-s", "/tmp", "--encrypt", "aes"}, &stdout, &stderr); code != 2 {

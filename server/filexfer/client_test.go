@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -114,6 +115,21 @@ func serveFTCPTestConn(conn net.Conn, handler func(intftcp.Request, io.Writer) e
 			return
 		}
 	}
+	if cmdReq.Verb == intftcp.VerbPROBE && len(cmdReq.Params) > 0 {
+		n, convErr := strconv.ParseInt(strings.TrimSpace(cmdReq.Params[0]["probe-bytes"]), 10, 64)
+		if convErr != nil || n < 0 {
+			_, _ = io.WriteString(responseOut, "ERR BAD_REQUEST invalid probe-bytes\r\n")
+			_ = closeResponse()
+			return
+		}
+		if n > 0 {
+			if _, drainErr := io.CopyN(io.Discard, br, n); drainErr != nil {
+				_, _ = io.WriteString(responseOut, "ERR BAD_REQUEST invalid probe payload\r\n")
+				_ = closeResponse()
+				return
+			}
+		}
+	}
 	if err := handler(cmdReq, responseOut); err != nil {
 		_, _ = io.WriteString(responseOut, "ERR INTERNAL "+err.Error()+"\r\n")
 	}
@@ -166,6 +182,45 @@ func TestNewClientOptions(t *testing.T) {
 	}
 	if client.contextDialer == nil {
 		t.Fatalf("expected context dialer to be configured")
+	}
+}
+
+func TestNewClientLoadStrategyOption(t *testing.T) {
+	client := NewClient("127.0.0.1:3453")
+	if client.LoadStrategy != LoadStrategyFast {
+		t.Fatalf("expected default load strategy %q, got %q", LoadStrategyFast, client.LoadStrategy)
+	}
+	client = NewClient("127.0.0.1:3453", WithLoadStrategy("gentle"))
+	if client.LoadStrategy != LoadStrategyGentle {
+		t.Fatalf("expected load strategy %q, got %q", LoadStrategyGentle, client.LoadStrategy)
+	}
+	client = NewClient("127.0.0.1:3453", WithLoadStrategy("unknown"))
+	if client.LoadStrategy != LoadStrategyFast {
+		t.Fatalf("expected fallback load strategy %q, got %q", LoadStrategyFast, client.LoadStrategy)
+	}
+}
+
+func TestSummarizeProbeResultsAndConcurrency(t *testing.T) {
+	results := []probeResponse{
+		{ServerCPU: 24, CTS0: 1000, CTS1: 1040, STS0: 1005, STS1: 1010},
+		{ServerCPU: 24, CTS0: 2000, CTS1: 2045, STS0: 2005, STS1: 2010},
+		{ServerCPU: 24, CTS0: 3000, CTS1: 3030, STS0: 3005, STS1: 3010},
+	}
+	summary := summarizeProbeSamples(results, 1*1024*1024)
+	if summary.ServerCPU != 24 {
+		t.Fatalf("expected server cpu 24, got %d", summary.ServerCPU)
+	}
+	if summary.AvgLatencyMS <= 0 {
+		t.Fatalf("expected avg ms > 0, got %d", summary.AvgLatencyMS)
+	}
+	if summary.LinkMbps <= 0 {
+		t.Fatalf("expected rounded mbps > 0, got %d", summary.LinkMbps)
+	}
+	if got := suggestedConcurrencyFromProbe(24, LoadStrategyGentle); got != 6 {
+		t.Fatalf("expected gentle concurrency 6, got %d", got)
+	}
+	if got := suggestedConcurrencyFromProbe(24, LoadStrategyFast); got != 48 {
+		t.Fatalf("expected fast concurrency 48, got %d", got)
 	}
 }
 
@@ -401,7 +456,7 @@ func TestEffectiveFrameReadBufferSize(t *testing.T) {
 
 func TestParseManifestSingleChunk(t *testing.T) {
 	raw := strings.Join([]string{
-		"FM/1 tx123 5:/root",
+		"FM/2 tx123 5:/root mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"1 7 2:1 0600 0:9:dir/b.txt",
 		"",
@@ -430,10 +485,10 @@ func TestParseManifestSingleChunk(t *testing.T) {
 
 func TestParseManifestMultiChunk(t *testing.T) {
 	raw := strings.Join([]string{
-		"FM/1 tx456 6:/root2",
+		"FM/2 tx456 6:/root2 mode=gentle link-mbps=500 concurrency=4",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
-		"FM/1 tx456 6:/root2",
+		"FM/2 tx456 6:/root2 mode=gentle link-mbps=500 concurrency=4",
 		"1 3 0:200 0600 0:5:b.txt",
 		"",
 	}, "\n")
@@ -449,8 +504,11 @@ func TestParseManifestMultiChunk(t *testing.T) {
 
 func TestMarshalManifestRoundTrip(t *testing.T) {
 	manifest := &Manifest{
-		TransferID: "txrt",
-		Root:       "/root",
+		TransferID:  "txrt",
+		Root:        "/root",
+		Mode:        LoadStrategyFast,
+		LinkMbps:    900,
+		Concurrency: 12,
 		Entries: []ManifestEntry{
 			{ID: 1, Size: 5, Mtime: 100, Mode: 0o644, Path: "a.txt"},
 			{ID: 2, Size: 9, Mtime: 100, Mode: 0o600, Path: "dir/b.txt"},
@@ -470,6 +528,15 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 	if parsed.Root != manifest.Root {
 		t.Fatalf("root mismatch: got=%q want=%q", parsed.Root, manifest.Root)
 	}
+	if parsed.Mode != manifest.Mode {
+		t.Fatalf("mode mismatch: got=%q want=%q", parsed.Mode, manifest.Mode)
+	}
+	if parsed.LinkMbps != manifest.LinkMbps {
+		t.Fatalf("link mismatch: got=%d want=%d", parsed.LinkMbps, manifest.LinkMbps)
+	}
+	if parsed.Concurrency != manifest.Concurrency {
+		t.Fatalf("concurrency mismatch: got=%d want=%d", parsed.Concurrency, manifest.Concurrency)
+	}
 	if len(parsed.Entries) != len(manifest.Entries) {
 		t.Fatalf("entry count mismatch: got=%d want=%d", len(parsed.Entries), len(manifest.Entries))
 	}
@@ -482,7 +549,7 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 
 func TestParseManifestMalformed(t *testing.T) {
 	raw := strings.Join([]string{
-		"FM/1 tx789 5:/root",
+		"FM/2 tx789 5:/root mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:abc 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -493,7 +560,7 @@ func TestParseManifestMalformed(t *testing.T) {
 
 func TestParseManifestLegacyEntryRejected(t *testing.T) {
 	raw := strings.Join([]string{
-		"FM/1 tx789 5:/root",
+		"FM/2 tx789 5:/root mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0:5:a.txt",
 		"",
 	}, "\n")
@@ -509,7 +576,7 @@ func TestFetchManifestEncryptedWithAge(t *testing.T) {
 	}
 	recipient := identity.Recipient().String()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txenc 5:/root",
+		"FM/2 txenc 5:/root mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -531,6 +598,9 @@ func TestFetchManifestEncryptedWithAge(t *testing.T) {
 	client := NewClient(srv.URL)
 	resp, err := client.FetchManifest(context.Background(), FetchManifestRequest{
 		Directory:    "/root",
+		Mode:         LoadStrategyFast,
+		LinkMbps:     1000,
+		Concurrency:  8,
 		AgePublicKey: recipient,
 		AgeIdentity:  identity.String(),
 	})
@@ -583,6 +653,43 @@ func TestFetchFileDecodesByHeaderComp(t *testing.T) {
 				t.Fatalf("expected comp %q, got %q", comp, resp.Meta.Comp)
 			}
 		})
+	}
+}
+
+func TestFetchFileIncludesSendMode(t *testing.T) {
+	logical := []byte("hello")
+	frame := buildFXFrame(t, 7, "none", 0, logical, nil)
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbSEND {
+			return fmt.Errorf("expected SEND, got %v", req.Verb)
+		}
+		if got := req.Params[1]["mode"]; got != LoadStrategyGentle {
+			return fmt.Errorf("expected mode=%s, got %q", LoadStrategyGentle, got)
+		}
+		_, err := io.WriteString(out, frame)
+		return err
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL, WithLoadStrategy(LoadStrategyGentle))
+	resp, err := client.FetchFile(context.Background(), FetchFileRequest{
+		TransferID: "tx",
+		Files: []FetchFileTarget{{
+			FileID:   7,
+			FullPath: "/root/a.txt",
+		}},
+		AckBytes: -1,
+	})
+	if err != nil {
+		t.Fatalf("FetchFile failed: %v", err)
+	}
+	got, err := readAndClose(t, resp.Reader)
+	if err != nil {
+		t.Fatalf("FetchFile read failed: %v", err)
+	}
+	if !bytes.Equal(got, logical) {
+		t.Fatalf("unexpected logical bytes: %q", got)
 	}
 }
 
@@ -1368,6 +1475,102 @@ doneBatchProgress:
 	}
 	if got := finalProgress[1]; got != int64(len(dataB)) {
 		t.Fatalf("unexpected final progress for fid=1: %d", got)
+	}
+}
+
+func TestStartFromManifestNoLongerProbes(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID:  "txstartprobe",
+		Root:        "/remote",
+		Mode:        LoadStrategyGentle,
+		LinkMbps:    1000,
+		Concurrency: 6,
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	payload := []byte("hello")
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			if got := req.Params[1]["mode"]; got != LoadStrategyGentle {
+				return fmt.Errorf("expected SEND mode gentle, got %q", got)
+			}
+			if _, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, payload, nil)); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL, WithLoadStrategy(LoadStrategyGentle))
+	resp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
+		Manifest:      manifest,
+		OutRoot:       outRoot,
+		NoSync:        true,
+		BatchMaxBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("StartFromManifest failed: %v", err)
+	}
+	if resp.Downloaded != 1 {
+		t.Fatalf("expected one downloaded file, got %d", resp.Downloaded)
+	}
+}
+
+func TestStartFromManifestRespectsExplicitConcurrency(t *testing.T) {
+	outRoot := t.TempDir()
+	manifest := &Manifest{
+		TransferID:  "txstartoverride",
+		Root:        "/remote",
+		Mode:        LoadStrategyFast,
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 5, Path: "a.txt"},
+		},
+	}
+	payload := []byte("hello")
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			if _, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, payload, nil)); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	resp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
+		Manifest:      manifest,
+		OutRoot:       outRoot,
+		NoSync:        true,
+		BatchMaxBytes: 1024,
+		Concurrency:   99,
+	})
+	if err != nil {
+		t.Fatalf("StartFromManifest failed: %v", err)
+	}
+	if resp.Downloaded != 1 {
+		t.Fatalf("expected one downloaded file, got %d", resp.Downloaded)
 	}
 }
 

@@ -33,6 +33,7 @@ var handlers = map[Verb]HandlerFunc{
 	VerbACK:    handleACK,
 	VerbCXSUM:  handleCXSUM,
 	VerbSTATUS: handleSTATUS,
+	VerbPROBE:  handlePROBECommand,
 }
 
 func Serve(listener net.Listener, opts ServerOptions) error {
@@ -104,7 +105,7 @@ func (s *connSession) run() error {
 	}
 
 	cmdReq := firstReq
-	requestReader := io.Reader(br)
+	cmdReader := br
 	if firstReq.Verb == VerbAUTH {
 		authRes, authErr := processAUTHRequest(firstReq, s.requireAuth, s.serverID)
 		if authErr != nil {
@@ -129,10 +130,10 @@ func (s *connSession) run() error {
 			if decErr != nil {
 				return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed"}
 			}
-			requestReader = decIn
+			cmdReader = bufio.NewReader(decIn)
 		}
 
-		cmdPayload, cmdErr := readCommandLine(bufio.NewReader(requestReader), maxCommandLineBytes)
+		cmdPayload, cmdErr := readCommandLine(cmdReader, maxCommandLineBytes)
 		if cmdErr != nil {
 			return cmdErr
 		}
@@ -145,16 +146,12 @@ func (s *connSession) run() error {
 	}
 
 	cmdCtx := context.Background()
-	cmdOut := s.respOut
-	if s.limiter != nil {
-		cmdOut = s.limiter.WrapRateLimitedWriter(cmdOut, cmdCtx)
-	}
-	countingOut := &countingWriter{w: cmdOut}
-	if err := s.handleCommand(cmdCtx, cmdReq, countingOut); err != nil {
+	countingOut := &countingWriter{w: s.respOut}
+	if err := s.handleCommand(cmdCtx, cmdReq, cmdReader, countingOut); err != nil {
 		s.wroteBytes = countingOut.n > 0
 		return err
 	}
-	if cmdReq.Verb == VerbTXFER || cmdReq.Verb == VerbSEND || cmdReq.Verb == VerbCXSUM {
+	if cmdReq.Verb == VerbTXFER || cmdReq.Verb == VerbSEND || cmdReq.Verb == VerbCXSUM || cmdReq.Verb == VerbPROBE {
 		if err := writeOKLine(countingOut, ""); err != nil {
 			s.wroteBytes = countingOut.n > 0
 			return err
@@ -164,7 +161,13 @@ func (s *connSession) run() error {
 	return s.closeResp()
 }
 
-func (s *connSession) handleCommand(ctx context.Context, req Request, out io.Writer) error {
+func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Reader, out io.Writer) error {
+	if req.Verb == VerbSEND {
+		return handleSENDWithOptions(ctx, req, out, s.deps, s.limiter)
+	}
+	if req.Verb == VerbPROBE {
+		return handlePROBEWithInput(ctx, req, in, out, s.deps)
+	}
 	handler, ok := handlers[req.Verb]
 	if !ok || req.Verb == VerbUnknown {
 		return protocolErr{code: "BAD_COMMAND", message: "unknown command"}

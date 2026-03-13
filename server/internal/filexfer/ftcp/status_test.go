@@ -20,7 +20,8 @@ func (f fakeDeps) RegisterTransferFileState(string, <-chan TransferFileStateUpda
 	close(done)
 	return done
 }
-func (f fakeDeps) ClipTransfer(string) bool { return true }
+func (f fakeDeps) ClipTransfer(string) bool                         { return true }
+func (f fakeDeps) SetTransferHints(string, string, int64, int) bool { return true }
 func (f fakeDeps) GetTransfer(string) (Transfer, bool) {
 	return f.transfer, f.transferOK
 }

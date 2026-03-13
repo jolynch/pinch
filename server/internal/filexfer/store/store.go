@@ -38,6 +38,9 @@ const (
 type Transfer struct {
 	ID        string
 	Directory string
+	Mode      string
+	LinkMbps  int64
+	Concurrency int
 	NumFiles  int
 	TotalSize int64
 	Done      uint64
@@ -158,6 +161,21 @@ func (s *transferStore) setState(txferID string, state uint8) bool {
 			transfer.State[i] = state
 		}
 	}
+	s.transfers[txferID] = transfer
+	return true
+}
+
+func (s *transferStore) setTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	transfer, ok := s.transfers[txferID]
+	if !ok {
+		return false
+	}
+	transfer.Mode = strings.ToLower(strings.TrimSpace(mode))
+	transfer.LinkMbps = linkMbps
+	transfer.Concurrency = concurrency
 	s.transfers[txferID] = transfer
 	return true
 }
@@ -654,6 +672,9 @@ func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, err
 		transfer := Transfer{
 			ID:        txferID,
 			Directory: directory,
+			Mode:      "",
+			LinkMbps:  0,
+			Concurrency: 0,
 			NumFiles:  numFiles,
 			TotalSize: totalSize,
 			Done:      0,
@@ -719,6 +740,10 @@ func DeleteTransfer(txferID string) bool {
 
 func GetTransfer(txferID string) (Transfer, bool) {
 	return manager.get(txferID)
+}
+
+func SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
+	return manager.setTransferHints(txferID, mode, linkMbps, concurrency)
 }
 
 func GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
