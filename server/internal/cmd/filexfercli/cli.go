@@ -18,10 +18,32 @@ import (
 	"syscall"
 	"time"
 
+	"runtime/trace"
+
 	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
 	"github.com/jolynch/pinch/internal/filexfer/encoding"
 )
+
+func startTracing(path string, stderr io.Writer) (stop func()) {
+	if path == "" {
+		return func() {}
+	}
+	tf, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "trace: failed to create file %s: %v\n", path, err)
+		return func() {}
+	}
+	if err := trace.Start(tf); err != nil {
+		fmt.Fprintf(stderr, "trace: failed to start: %v\n", err)
+		_ = tf.Close()
+		return func() {}
+	}
+	return func() {
+		trace.Stop()
+		_ = tf.Close()
+	}
+}
 
 const defaultVerboseStatusInterval = 10 * time.Second
 const defaultCLIAckEveryBytes int64 = 256 * 1024 * 1024
@@ -300,6 +322,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var batchSizeRaw string
 	var noSync bool
 	var verbose bool
+	var traceFile string
 	fs.StringVar(&txferID, "tid", "", "transfer id")
 	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm2)")
 	fs.StringVar(&fileIDRaw, "fd", "", "file id to download")
@@ -315,9 +338,12 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	fs.StringVar(&batchSizeRaw, "b", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	fs.StringVar(&batchSizeRaw, "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	fs.BoolVar(&noSync, "no-sync", false, "ack without disk sync")
+	fs.StringVar(&traceFile, "trace", "", "write runtime/trace output to this file")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	stopTracing := startTracing(traceFile, stderr)
+	defer stopTracing()
 	if fileIDRaw == "" {
 		fmt.Fprintln(stderr, "get requires --fd")
 		return 2
@@ -469,9 +495,13 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	fs.StringVar(&batchSizeRaw, "b", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	fs.StringVar(&batchSizeRaw, "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")
+	var traceFile string
+	fs.StringVar(&traceFile, "trace", "", "write runtime/trace output to this file")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	stopTracing := startTracing(traceFile, stderr)
+	defer stopTracing()
 	concurrencyExplicit := false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "concurrency" {

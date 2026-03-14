@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"runtime/trace"
 	"strconv"
 	"strings"
 	"time"
@@ -75,7 +76,7 @@ func parseACKRequest(req Request) (ackRequest, error) {
 	return ackRequest{Items: items}, nil
 }
 
-func handleACK(_ context.Context, req Request, out io.Writer, deps Deps) error {
+func handleACK(ctx context.Context, req Request, out io.Writer, deps Deps) error {
 	parsed, err := parseACKRequest(req)
 	if err != nil {
 		return err
@@ -120,7 +121,9 @@ func handleACK(_ context.Context, req Request, out io.Writer, deps Deps) error {
 	}
 
 	for _, v := range validated {
+		_, ackTask := trace.NewTask(ctx, "ack")
 		if ok := deps.AcknowledgeTransferFile(v.item.TransferID, v.item.FileID, v.ackBytes); !ok {
+			ackTask.End()
 			return protocolErr{code: "INTERNAL", message: "failed to acknowledge file progress"}
 		}
 		if v.ackBytes >= 0 {
@@ -159,6 +162,7 @@ func handleACK(_ context.Context, req Request, out io.Writer, deps Deps) error {
 				encoding.HumanRate(syncBps),
 			)
 		}
+		ackTask.End()
 	}
 	return writeOKLine(out, "")
 }

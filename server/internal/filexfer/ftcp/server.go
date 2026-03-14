@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime/trace"
 	"time"
 
 	"filippo.io/age"
@@ -145,7 +146,8 @@ func (s *connSession) run() error {
 		return protocolErr{code: "NOT_AUTHORIZED", message: "missing AUTH"}
 	}
 
-	cmdCtx := context.Background()
+	cmdCtx, connTask := trace.NewTask(context.Background(), "tcp-connection")
+	defer connTask.End()
 	countingOut := &countingWriter{w: s.respOut}
 	if err := s.handleCommand(cmdCtx, cmdReq, cmdReader, countingOut); err != nil {
 		s.wroteBytes = countingOut.n > 0

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/trace"
 	"sort"
 	"strconv"
 	"strings"
@@ -403,6 +404,8 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 }
 
 func (c *Client) FetchManifest(ctx context.Context, request FetchManifestRequest) (FetchManifestResponse, error) {
+	ctx, task := trace.NewTask(ctx, "fetch-manifest")
+	defer task.End()
 	if c == nil {
 		return FetchManifestResponse{}, errors.New("nil client")
 	}
@@ -628,6 +631,8 @@ type splitWindowResult struct {
 }
 
 func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req DownloadBatchRequest) (DownloadBatchResponse, error) {
+	ctx, task := trace.NewTask(ctx, "download-batch")
+	defer task.End()
 	if req.Manifest == nil {
 		return DownloadBatchResponse{}, errors.New("nil manifest")
 	}
@@ -744,6 +749,7 @@ func (c *Client) downloadManifestBatchSequential(
 	}
 
 	for _, plan := range plans {
+		fileCtx, fileTask := trace.NewTask(ctx, "download-file")
 		writer, syncOutput, err := req.OutputWriter(plan.entry, plan.resumeFrom)
 		if err != nil {
 			return DownloadBatchResponse{}, fmt.Errorf("create output writer for file %d: %w", plan.entry.ID, err)
@@ -895,10 +901,13 @@ func (c *Client) downloadManifestBatchSequential(
 
 		syncMS := int64(0)
 		syncStart := time.Now()
+		_, syncTask := trace.NewTask(fileCtx, "sync")
 		if err := syncOutput(); err != nil {
+			syncTask.End()
 			_ = closeWriter()
 			return DownloadBatchResponse{}, fmt.Errorf("sync output for file %d: %w", plan.entry.ID, err)
 		}
+		syncTask.End()
 		syncMS = time.Since(syncStart).Milliseconds()
 		if err := closeWriter(); err != nil {
 			return DownloadBatchResponse{}, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
@@ -931,6 +940,7 @@ func (c *Client) downloadManifestBatchSequential(
 			Meta:          meta,
 			LocalFileHash: localHash,
 		})
+		fileTask.End()
 	}
 
 	statusLine, err := readTCPLine(br, maxTCPLineBytes)
@@ -948,12 +958,14 @@ func (c *Client) downloadManifestBatchSequential(
 	}
 
 	if len(pendingAcks) > 0 {
+		_, ackTask := trace.NewTask(ctx, "ack")
 		ackErr := retryAck(ctx, func(callCtx context.Context) error {
 			ackCtx, cancel := context.WithTimeout(callCtx, ackTimeout)
 			defer cancel()
 			_, err := c.acknowledgeFileProgressBatch(ackCtx, pendingAcks)
 			return err
 		})
+		ackTask.End()
 		if ackErr != nil {
 			return DownloadBatchResponse{}, fmt.Errorf("acknowledge download failed: %w", ackErr)
 		}
@@ -1095,12 +1107,14 @@ func (c *Client) downloadManifestBatchWindows(
 		if len(ackBatch) == 0 {
 			continue
 		}
+		_, ackTask := trace.NewTask(requestCtx, "ack")
 		ackErr := retryAck(requestCtx, func(callCtx context.Context) error {
 			ackCtx, cancelAck := context.WithTimeout(callCtx, ackTimeout)
 			defer cancelAck()
 			_, err := c.acknowledgeFileProgressBatch(ackCtx, ackBatch)
 			return err
 		})
+		ackTask.End()
 		if ackErr != nil {
 			setErr(fmt.Errorf("acknowledge download failed: %w", ackErr))
 			break
@@ -1182,6 +1196,8 @@ func (c *Client) downloadSplitWindow(
 	syncOutput func() error,
 	emitProgressUpdate func(DownloadProgressUpdate),
 ) (splitWindowResult, error) {
+	ctx, windowTask := trace.NewTask(ctx, "download-window")
+	defer windowTask.End()
 	start := time.Now()
 	reader, meta, err := c.fetchFileWindow(
 		ctx,
@@ -1257,10 +1273,13 @@ func (c *Client) downloadSplitWindow(
 	}
 
 	syncStart := time.Now()
+	_, syncTask := trace.NewTask(ctx, "sync")
 	if err := syncOutput(); err != nil {
+		syncTask.End()
 		_ = closeWriter()
 		return splitWindowResult{}, fmt.Errorf("sync output for file %d: %w", plan.entry.ID, err)
 	}
+	syncTask.End()
 	syncMS := time.Since(syncStart).Milliseconds()
 	if err := closeWriter(); err != nil {
 		return splitWindowResult{}, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
@@ -1497,6 +1516,8 @@ func clampConcurrency(v int) int {
 }
 
 func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse, error) {
+	ctx, task := trace.NewTask(ctx, "probe-link")
+	defer task.End()
 	if c == nil {
 		return ProbeResponse{}, errors.New("nil client")
 	}

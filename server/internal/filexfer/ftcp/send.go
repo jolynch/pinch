@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"runtime/trace"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +50,7 @@ type sendRequest struct {
 }
 
 type frameStreamArgs struct {
+	Ctx           context.Context
 	FileID        uint64
 	Offset        int64
 	FrameSize     int64
@@ -151,14 +153,16 @@ func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps
 		if limiter != nil && item.Mode == loadStrategyGentle {
 			itemOut = limiter.WrapRateLimitedWriter(out, ctx)
 		}
-		if err := streamSendItem(itemOut, deps, parsed.TransferID, item); err != nil {
+		if err := streamSendItem(ctx, itemOut, deps, parsed.TransferID, item); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) error {
+func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID string, item sendItem) error {
+	ctx, windowTask := trace.NewTask(ctx, "send-window")
+	defer windowTask.End()
 	fd, fileRef, usedDirectOpen, err := openSendFile(deps, txferID, item)
 	if err != nil {
 		return mapLookupError(err)
@@ -232,6 +236,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 		}
 
 		frameArgs := frameStreamArgs{
+			Ctx:           ctx,
 			FileID:        item.FileID,
 			Offset:        cursor,
 			FrameSize:     frameSize,
@@ -551,6 +556,7 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 		}
 	}
 
+	readRegion := trace.StartRegion(args.Ctx, "frame-read")
 	prepareLatency, err := streamBufferedRead(fd, fileOffset, args.FrameSize, readBuf, isCompressed, func(chunk []byte) error {
 		_, _ = args.WindowHasher.Write(chunk)
 		writeStart := time.Now()
@@ -566,24 +572,30 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 		}
 		return nil
 	})
+	readRegion.End()
 	if err != nil {
 		return frameStreamStats{}, err
 	}
 
 	wireSize := args.FrameSize
 	if isCompressed {
+		compRegion := trace.StartRegion(args.Ctx, "frame-compress")
 		if err := closeCompWriter(); err != nil {
+			compRegion.End()
 			return frameStreamStats{}, err
 		}
 		wireSize = int64(frameBuf.Len())
 		if err := writeFrameHeader(args.Output, args, wireSize, &writeLatency); err != nil {
+			compRegion.End()
 			return frameStreamStats{}, err
 		}
 		writeStart := time.Now()
 		if _, err := args.Output.Write(frameBuf.Bytes()); err != nil {
+			compRegion.End()
 			return frameStreamStats{}, err
 		}
 		writeLatency += time.Since(writeStart)
+		compRegion.End()
 	} else if stagedDirectWrite {
 		if err := writeFrameHeader(args.Output, args, wireSize, &writeLatency); err != nil {
 			return frameStreamStats{}, err
@@ -662,6 +674,7 @@ func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, args frameStr
 
 	prepareLatency := time.Duration(0)
 	remaining := args.FrameSize
+	readRegion := trace.StartRegion(args.Ctx, "frame-read")
 	for remaining > 0 {
 		step := remaining
 		if step > int64(args.PipeSizeBytes) {
@@ -671,9 +684,11 @@ func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, args frameStr
 		splicedIn, spliceErr := unix.Splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), unix.SPLICE_F_MOVE)
 		prepareLatency += time.Since(spliceStart)
 		if spliceErr != nil {
+			readRegion.End()
 			return frameStreamStats{}, spliceErr
 		}
 		if splicedIn <= 0 {
+			readRegion.End()
 			return frameStreamStats{}, io.ErrUnexpectedEOF
 		}
 
@@ -696,34 +711,43 @@ func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, args frameStr
 					prepareLatency += time.Since(writeStart)
 				}
 				if writeErr != nil {
+					readRegion.End()
 					return frameStreamStats{}, writeErr
 				}
 				if written != n {
+					readRegion.End()
 					return frameStreamStats{}, io.ErrShortWrite
 				}
 				sourceRemaining -= int64(n)
 			}
 			if readErr != nil {
+				readRegion.End()
 				return frameStreamStats{}, readErr
 			}
 		}
 		remaining -= int64(splicedIn)
 	}
+	readRegion.End()
 
 	wireSize := args.FrameSize
 	if isCompressed {
+		compRegion := trace.StartRegion(args.Ctx, "frame-compress")
 		if err := closeCompWriter(); err != nil {
+			compRegion.End()
 			return frameStreamStats{}, err
 		}
 		wireSize = int64(frameBuf.Len())
 		if err := writeFrameHeader(args.Output, args, wireSize, &writeLatency); err != nil {
+			compRegion.End()
 			return frameStreamStats{}, err
 		}
 		writeStart := time.Now()
 		if _, err := args.Output.Write(frameBuf.Bytes()); err != nil {
+			compRegion.End()
 			return frameStreamStats{}, err
 		}
 		writeLatency += time.Since(writeStart)
+		compRegion.End()
 	}
 
 	windowHashToken, err := writeFrameTrailer(args.Output, args, &writeLatency)

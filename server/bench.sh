@@ -7,6 +7,7 @@ Usage: ./bench.sh [options]
 
 Options:
   --flamegraph               Run start benchmark under perf and emit flamegraph SVG.
+  --trace                    Capture runtime/trace for client and server (view with go tool trace).
   --build                    Build ./pinch before benchmarking (default: true).
   --no-build                 Skip build step.
   --server-url ADDR          File listener address for CLI (default: 127.0.0.1:3453).
@@ -25,6 +26,8 @@ Options:
   --server-flamegraph-svg PATH
                              Server flamegraph SVG output path (default: /tmp/pinch-server.svg).
   --flamegraph-dir PATH      Path to FlameGraph repo (optional if scripts on PATH).
+  --client-trace PATH        Client trace output path (default: /tmp/pinch-start.trace).
+  --server-trace PATH        Server trace output path (default: /tmp/pinch-server.trace).
   -h, --help                 Show help.
 EOF
 }
@@ -47,6 +50,7 @@ require_value() {
 
 BUILD=true
 FLAMEGRAPH=false
+TRACE=false
 SERVER_URL="127.0.0.1:3453"
 SERVER_STARTUP_TIMEOUT_SEC=30
 SOURCE_DIRECTORY="/home/jolynch/Hacking/test-data"
@@ -61,12 +65,28 @@ FLAMEGRAPH_SVG="/tmp/pinch-start.svg"
 SERVER_PERF_DATA="/tmp/pinch-server.perf.data"
 SERVER_FLAMEGRAPH_SVG="/tmp/pinch-server.svg"
 FLAMEGRAPH_DIR=""
+CLIENT_TRACE="/tmp/pinch-start.trace"
+SERVER_TRACE="/tmp/pinch-server.trace"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --flamegraph)
       FLAMEGRAPH=true
       shift
+      ;;
+    --trace)
+      TRACE=true
+      shift
+      ;;
+    --client-trace)
+      require_value "$1" "${2:-}"
+      CLIENT_TRACE="$2"
+      shift 2
+      ;;
+    --server-trace)
+      require_value "$1" "${2:-}"
+      SERVER_TRACE="$2"
+      shift 2
       ;;
     --build)
       BUILD=true
@@ -241,7 +261,11 @@ start_server() {
   read -r host port < <(split_host_port "${SERVER_URL}")
   mkdir -p "${SERVER_IN}" "${SERVER_OUT}" "${SERVER_KEYS}"
   echo "Starting server in background..."
-  ./pinch -in "${SERVER_IN}" -out "${SERVER_OUT}" -keys "${SERVER_KEYS}" >"${SERVER_LOG}" 2>&1 &
+  local server_args=(-in "${SERVER_IN}" -out "${SERVER_OUT}" -keys "${SERVER_KEYS}")
+  if [[ "${TRACE}" == "true" ]]; then
+    server_args+=(-fs-trace "${SERVER_TRACE}")
+  fi
+  ./pinch "${server_args[@]}" >"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
   SERVER_APP_PID="${SERVER_PID}"
 
@@ -287,11 +311,19 @@ fi
 if [[ -n "${ENCRYPT_MODE}" ]]; then
   START_CMD+=(--encrypt "${ENCRYPT_MODE}")
 fi
+if [[ "${TRACE}" == "true" ]]; then
+  START_CMD+=(--trace "${CLIENT_TRACE}")
+fi
 
 if [[ "$FLAMEGRAPH" != "true" ]]; then
   echo "Running timed start benchmark..."
   { time "${START_CMD[@]}" 2>/dev/null | awk '!/^start-file: /'; } 2>&1
-  echo "Flamegraph disabled. Re-run with --flamegraph to generate ${FLAMEGRAPH_SVG} and ${SERVER_FLAMEGRAPH_SVG}."
+  if [[ "${TRACE}" == "true" ]]; then
+    echo "Client trace written to: ${CLIENT_TRACE}  (view with: go tool trace ${CLIENT_TRACE})"
+    echo "Server trace written to: ${SERVER_TRACE}  (view with: go tool trace ${SERVER_TRACE})"
+  else
+    echo "Flamegraph disabled. Re-run with --flamegraph to generate ${FLAMEGRAPH_SVG} and ${SERVER_FLAMEGRAPH_SVG}."
+  fi
   exit 0
 fi
 

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"runtime/trace"
 	"strconv"
 	"strings"
 	"syscall"
@@ -703,9 +704,22 @@ func main() {
 	flag.StringVar(&fsFileBurst, "fs-file-rate-burst", fsFileBurst, "Token-bucket burst for file-listener response rate limit (examples: 1MiB, 4MB)")
 	fsFileTimeLimit := flag.Duration("fs-file-time-limit", 0, "Per-request wall-clock limit for file-listener responses (0 disables)")
 	fsRequireAuth := flag.Bool("fs-require-auth", false, "Require AUTH before using file-listen commands")
+	fsTraceFile := flag.String("fs-trace", "", "Write runtime/trace output to this file")
 	dieAfter := flag.Duration("die-after", 0, "Die after this duration. Zero seconds indicates live forever")
 
 	flag.Parse()
+
+	if *fsTraceFile != "" {
+		tf, err := os.Create(*fsTraceFile)
+		if err != nil {
+			log.Fatalf("Failed to create trace file %s: %v", *fsTraceFile, err)
+		}
+		defer tf.Close()
+		if err := trace.Start(tf); err != nil {
+			log.Fatalf("Failed to start trace: %v", err)
+		}
+		defer trace.Stop()
+	}
 
 	fileStreamLimiter, limiterErr := limit.NewLimiter(limit.Config{
 		Rate:      fsFileRate,

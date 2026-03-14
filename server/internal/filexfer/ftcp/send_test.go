@@ -191,7 +191,7 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 			deps := &sendTestDeps{filePath: tmp}
 			var out bytes.Buffer
 
-			err := streamSendItem(&out, deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp})
+			err := streamSendItem(context.Background(), &out, deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp})
 			if err != nil {
 				t.Fatalf("streamSendItem failed: %v", err)
 			}
@@ -235,7 +235,7 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 
 	var rawOut bytes.Buffer
 	slowOut := delayedWriter{w: &rawOut, delay: 10 * time.Millisecond}
-	err := streamSendItem(&slowOut, deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp})
+	err := streamSendItem(context.Background(), &slowOut, deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp})
 	if err != nil {
 		t.Fatalf("streamSendItem failed: %v", err)
 	}
