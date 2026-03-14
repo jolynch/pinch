@@ -620,7 +620,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 				return
 			}
 			markMetadataDone(evt.File.Meta.FileID)
-			printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.Elapsed)
+			printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
 		},
 	})
 	if err != nil {
@@ -661,20 +661,27 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	return 0
 }
 
-func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta FileFrameMeta, localFileHash string, elapsed time.Duration) {
+func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta FileFrameMeta, localFileHash string, windowChecksumPassed, windowChecksumTotal int, elapsed time.Duration) {
 	seconds := elapsed.Seconds()
 	if seconds <= 0 {
 		seconds = 0.000001
 	}
 	speed := float64(meta.Size) / seconds
 	compSummary := formatCompSummary(meta)
-	checksum := "[x]"
-	if meta.FileHashToken != "" && localFileHash != "" && strings.EqualFold(meta.FileHashToken, localFileHash) {
-		checksum = "[ok]"
+	var checksum string
+	switch {
+	case windowChecksumTotal > 0:
+		checksum = fmt.Sprintf("wxsum=[%d/%d]", windowChecksumPassed, windowChecksumTotal)
+	case meta.FileHashToken != "" && localFileHash != "" && strings.EqualFold(meta.FileHashToken, localFileHash):
+		checksum = "checksum=[ok]"
+	case meta.FileHashToken != "" && localFileHash != "":
+		checksum = "checksum=[x]"
+	default:
+		checksum = "checksum=[-]"
 	}
 	fmt.Fprintf(
 		stdout,
-		"start-file: fd=%d path=%s checksum=%s comp=%s rate=%s\n",
+		"start-file: fd=%d path=%s %s comp=%s rate=%s\n",
 		fileID,
 		path,
 		checksum,

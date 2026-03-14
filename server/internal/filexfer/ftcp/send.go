@@ -53,6 +53,7 @@ type frameStreamArgs struct {
 	Offset        int64
 	FrameSize     int64
 	Comp          string
+	Mode          string
 	MaxWSizeHint  *int64
 	HeaderTS      int64
 	Next          int64
@@ -235,6 +236,7 @@ func streamSendItem(out io.Writer, deps Deps, txferID string, item sendItem) err
 			Offset:        cursor,
 			FrameSize:     frameSize,
 			Comp:          frameComp,
+			Mode:          item.Mode,
 			MaxWSizeHint:  maxHint,
 			HeaderTS:      time.Now().UnixMilli(),
 			Next:          nextValue,
@@ -530,7 +532,7 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 		defer releaseCompressedFrameBuffer(frameBuf)
 		var compWriter io.Writer
 		var selected string
-		compWriter, closeCompWriter, selected, err = encoding.WrapCompressedWriter(frameBuf, args.Comp)
+		compWriter, closeCompWriter, selected, err = encoding.WrapCompressedWriter(frameBuf, args.Comp, args.Mode)
 		if err != nil {
 			return frameStreamStats{}, err
 		}
@@ -644,7 +646,7 @@ func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, args frameStr
 		defer releaseCompressedFrameBuffer(frameBuf)
 		var compWriter io.Writer
 		var selected string
-		compWriter, closeCompWriter, selected, err = encoding.WrapCompressedWriter(frameBuf, args.Comp)
+		compWriter, closeCompWriter, selected, err = encoding.WrapCompressedWriter(frameBuf, args.Comp, args.Mode)
 		if err != nil {
 			return frameStreamStats{}, err
 		}

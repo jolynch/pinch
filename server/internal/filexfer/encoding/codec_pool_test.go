@@ -78,7 +78,7 @@ func BenchmarkWrapDecompressedReader(b *testing.B) {
 func encodeForCodecPoolTest(t *testing.T, comp string, payload []byte) []byte {
 	t.Helper()
 	var out bytes.Buffer
-	writer, closeFn, selected, err := WrapCompressedWriter(&out, comp)
+	writer, closeFn, selected, err := WrapCompressedWriter(&out, comp, "")
 	if err != nil {
 		t.Fatalf("compress setup (%s): %v", comp, err)
 	}
@@ -97,7 +97,7 @@ func encodeForCodecPoolTest(t *testing.T, comp string, payload []byte) []byte {
 func encodeForCodecPoolBench(b *testing.B, comp string, payload []byte) []byte {
 	b.Helper()
 	var out bytes.Buffer
-	writer, closeFn, selected, err := WrapCompressedWriter(&out, comp)
+	writer, closeFn, selected, err := WrapCompressedWriter(&out, comp, "")
 	if err != nil {
 		b.Fatalf("compress setup (%s): %v", comp, err)
 	}

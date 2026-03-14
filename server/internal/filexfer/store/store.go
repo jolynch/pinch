@@ -560,9 +560,7 @@ func (s *transferStore) acknowledgeFileLocked(txferID string, fileID uint64, ack
 	s.transfers[txferID] = transfer
 
 	wKey := windowHashKey{txferID: txferID, fileID: fileID, endBytes: target}
-	if _, exists := s.windowHashes[wKey]; exists {
-		delete(s.windowHashes, wKey)
-	}
+	delete(s.windowHashes, wKey)
 	return true
 }
 

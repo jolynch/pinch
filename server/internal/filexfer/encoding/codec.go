@@ -109,20 +109,32 @@ func SelectEncoding(acceptEncoding string) string {
 	return best
 }
 
-func WrapCompressedWriter(dst io.Writer, acceptEncoding string) (io.Writer, func() error, string, error) {
+func WrapCompressedWriter(dst io.Writer, acceptEncoding string, strategy string) (io.Writer, func() error, string, error) {
 	if dst == nil {
 		return nil, nil, "", errors.New("nil destination writer")
 	}
 
+	concurrency := 0 // fast: all cores (both lz4 and zstd treat 0 as GOMAXPROCS)
+	if strategy == "gentle" {
+		concurrency = 1
+	}
+
 	switch SelectEncoding(acceptEncoding) {
 	case EncodingZstd:
-		zw, err := zstd.NewWriter(dst, zstd.WithEncoderLevel(1))
+		zw, err := zstd.NewWriter(dst, zstd.WithEncoderLevel(1), zstd.WithEncoderConcurrency(concurrency))
 		if err != nil {
 			return nil, nil, "", err
 		}
 		return zw, zw.Close, EncodingZstd, nil
 	case EncodingLz4:
 		lw := lz4.NewWriter(dst)
+		lw.Apply(
+			lz4.BlockSizeOption(lz4.Block1Mb),
+			lz4.CompressionLevelOption(lz4.Fast),
+			lz4.ConcurrencyOption(concurrency),
+			lz4.ChecksumOption(false),
+			lz4.BlockChecksumOption(false),
+		)
 		return lw, lw.Close, EncodingLz4, nil
 	default:
 		return dst, func() error { return nil }, "", nil

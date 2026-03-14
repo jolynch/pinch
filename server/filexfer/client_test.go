@@ -232,7 +232,7 @@ func encodeSingleFramePayload(data []byte, comp string) ([]byte, error) {
 		return data, nil
 	case EncodingZstd, EncodingLz4:
 		var buf bytes.Buffer
-		out, closeEncoded, _, err := intencoding.WrapCompressedWriter(&buf, comp)
+		out, closeEncoded, _, err := intencoding.WrapCompressedWriter(&buf, comp, "")
 		if err != nil {
 			return nil, err
 		}

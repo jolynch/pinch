@@ -200,8 +200,10 @@ type DownloadProgressUpdate struct {
 }
 
 type DownloadFileResponse struct {
-	Meta          FileFrameMeta
-	LocalFileHash string
+	Meta                 FileFrameMeta
+	LocalFileHash        string
+	WindowChecksumPassed int
+	WindowChecksumTotal  int
 }
 
 type DownloadBatchRequest struct {
@@ -1350,6 +1352,8 @@ func aggregateSplitWindowResults(
 	}
 	aggregate.Meta.FileHashToken = ""
 	aggregate.LocalFileHash = ""
+	aggregate.WindowChecksumPassed = len(windows)
+	aggregate.WindowChecksumTotal = len(windows)
 	return aggregate, nil
 }
 
