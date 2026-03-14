@@ -120,6 +120,27 @@ func WithLoadStrategy(strategy string) ClientOption {
 	})
 }
 
+func WithComp(comp string) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.Comp = normalizeComp(comp)
+	})
+}
+
+func normalizeComp(comp string) string {
+	switch strings.ToLower(strings.TrimSpace(comp)) {
+	case EncodingLz4:
+		return EncodingLz4
+	case EncodingZstd:
+		return EncodingZstd
+	case "none", EncodingIdentity:
+		return "none"
+	case "adapt":
+		return "adapt"
+	default:
+		return ""
+	}
+}
+
 type Client struct {
 	FileAddr                string
 	ServerAgePublicKey      string
@@ -130,6 +151,7 @@ type Client struct {
 	AckRequestTimeout       time.Duration
 	SocketReadBufferBytes   int
 	LoadStrategy            string
+	Comp                    string // adapt|none|lz4|zstd; empty means server default (adapt)
 
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
@@ -277,6 +299,7 @@ type ProbeResponse struct {
 	AvgLatencyMS         int64
 	LinkMbps             int64
 	SuggestedConcurrency int
+	ServerSendBufBytes   int64
 }
 
 type FetchManifestResponse struct {
@@ -296,6 +319,7 @@ type FetchFileTarget struct {
 	FullPath string
 	Offset   int64
 	Size     int64
+	Comp     string // adapt|none|lz4|zstd; empty means server default (adapt)
 }
 
 type FetchFileResponse struct {
@@ -354,7 +378,8 @@ const (
 	// Window and batch sizes. The window is max in-flight bytes per file; the batch is
 	// the unit of parallel work. parallelism = window / batch.
 	defaultClientRequestWindowBytes      int64 = 1024 * 1024 * 1024
-	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024 // also the fallback BatchMaxBytes
+	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024
+	defaultClientBatchMaxBytes           int64 = 128 * 1024 * 1024
 
 	// Frame read-buffer bounds, scaled per stream based on file/frame size.
 	defaultClientFrameBufferBytes int = 8 * 1024 * 1024
@@ -540,6 +565,7 @@ func (c *Client) fetchFileWindow(
 		FileID:   fileID,
 		FullPath: fullPath,
 		Offset:   offset,
+		Comp:     c.Comp,
 	}
 	if size > 0 {
 		target.Size = size
@@ -674,7 +700,7 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 			serverPath: serverPath,
 			resumeFrom: resumeFrom,
 		})
-		target := FetchFileTarget{FileID: fileID, FullPath: serverPath, Offset: resumeFrom}
+		target := FetchFileTarget{FileID: fileID, FullPath: serverPath, Offset: resumeFrom, Comp: c.Comp}
 		if entry.Size > resumeFrom {
 			target.Size = entry.Size - resumeFrom
 		}
@@ -698,33 +724,39 @@ func shouldSplitSingleFileBatch(req DownloadBatchRequest, plans []downloadBatchP
 	return entry.Size-plans[0].resumeFrom > req.BatchMaxBytes
 }
 
-func (c *Client) downloadManifestBatchSequential(
+type seqAckProgress struct {
+	fileID      uint64
+	ackBytes    int64
+	targetBytes int64
+}
+
+// downloadManifestGroupSequential downloads a contiguous group of files sequentially
+// over a single TCP stream. It returns the file results and pending acks but does NOT
+// send the ACK itself — that is the caller's responsibility so acks can be batched
+// across parallel groups.
+func (c *Client) downloadManifestGroupSequential(
 	ctx context.Context,
 	req DownloadBatchRequest,
 	plans []downloadBatchPlan,
 	targets []FetchFileTarget,
-) (DownloadBatchResponse, error) {
+	emitProgressUpdate func(DownloadProgressUpdate),
+) ([]DownloadFileResponse, []AcknowledgeFileProgressRequest, []seqAckProgress, error) {
 	stream, err := c.fetchFileBatchTCP(ctx, req.Manifest.TransferID, targets, req.AgePublicKey, req.AgeIdentity)
 	if err != nil {
 		var missingErr *fileMissingError
 		if len(plans) == 1 && errors.Is(err, ErrFileMissing) && errors.As(err, &missingErr) && shouldAcknowledgeMissing404(missingErr.Body) {
 			if ackErr := c.acknowledgeMissingFile(ctx, req.Manifest.TransferID, plans[0].entry.ID, plans[0].serverPath); ackErr != nil {
-				return DownloadBatchResponse{}, fmt.Errorf("%w (failed to ack missing: %v)", err, ackErr)
+				return nil, nil, nil, fmt.Errorf("%w (failed to ack missing: %v)", err, ackErr)
 			}
 		}
-		return DownloadBatchResponse{}, err
+		return nil, nil, nil, err
 	}
 	defer stream.Close()
 	br := bufio.NewReader(stream)
 
 	results := make([]DownloadFileResponse, 0, len(plans))
-	type ackProgress struct {
-		fileID      uint64
-		ackBytes    int64
-		targetBytes int64
-	}
 	pendingAcks := make([]AcknowledgeFileProgressRequest, 0, len(plans))
-	ackProgresses := make([]ackProgress, 0, len(plans))
+	ackProgresses := make([]seqAckProgress, 0, len(plans))
 	var (
 		frameBuf        []byte
 		releaseFrameBuf func()
@@ -734,28 +766,15 @@ func (c *Client) downloadManifestBatchSequential(
 			releaseFrameBuf()
 		}
 	}()
-	ackTimeout := c.AckRequestTimeout
-	if ackTimeout <= 0 {
-		ackTimeout = defaultClientAckRequestTimeout
-	}
-	emitProgressUpdate := func(update DownloadProgressUpdate) {
-		if req.ProgressUpdates == nil {
-			return
-		}
-		select {
-		case req.ProgressUpdates <- update:
-		default:
-		}
-	}
 
 	for _, plan := range plans {
 		fileCtx, fileTask := trace.NewTask(ctx, "download-file")
 		writer, syncOutput, err := req.OutputWriter(plan.entry, plan.resumeFrom)
 		if err != nil {
-			return DownloadBatchResponse{}, fmt.Errorf("create output writer for file %d: %w", plan.entry.ID, err)
+			return nil, nil, nil, fmt.Errorf("create output writer for file %d: %w", plan.entry.ID, err)
 		}
 		if writer == nil {
-			return DownloadBatchResponse{}, fmt.Errorf("create output writer for file %d: nil writer", plan.entry.ID)
+			return nil, nil, nil, fmt.Errorf("create output writer for file %d: nil writer", plan.entry.ID)
 		}
 		if syncOutput == nil {
 			syncOutput = func() error { return nil }
@@ -797,25 +816,25 @@ func (c *Client) downloadManifestBatchSequential(
 			headerLine, readErr := br.ReadString('\n')
 			if readErr != nil {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("read frame header: %w", readErr)
+				return nil, nil, nil, fmt.Errorf("read frame header: %w", readErr)
 			}
 			headerTrimmed := strings.TrimRight(headerLine, "\r\n")
 			if isStatusLine(headerTrimmed) {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("unexpected status line before file complete: %s", headerTrimmed)
+				return nil, nil, nil, fmt.Errorf("unexpected status line before file complete: %s", headerTrimmed)
 			}
 			frameMeta, parseErr := parseFXHeader(headerTrimmed)
 			if parseErr != nil {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, parseErr
+				return nil, nil, nil, parseErr
 			}
 			if frameMeta.FileID != plan.entry.ID {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("batched file id mismatch: expected=%d got=%d", plan.entry.ID, frameMeta.FileID)
+				return nil, nil, nil, fmt.Errorf("batched file id mismatch: expected=%d got=%d", plan.entry.ID, frameMeta.FileID)
 			}
 			if frameMeta.Offset != offset {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("batched offset mismatch: expected=%d got=%d", offset, frameMeta.Offset)
+				return nil, nil, nil, fmt.Errorf("batched offset mismatch: expected=%d got=%d", offset, frameMeta.Offset)
 			}
 			if frameBuf == nil {
 				frameBuf, releaseFrameBuf = c.acquireFrameReadBuffer(frameMeta.MaxWireSizeHint)
@@ -825,7 +844,7 @@ func (c *Client) downloadManifestBatchSequential(
 			logicalReader, decodeErr := decodePayloadReader(payloadReader, frameMeta.Comp, frameMeta.Enc, nil)
 			if decodeErr != nil {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("decode payload reader: %w", decodeErr)
+				return nil, nil, nil, fmt.Errorf("decode payload reader: %w", decodeErr)
 			}
 			frameStartOffset := offset
 			copyErr := copyStreamWithProgress(io.MultiWriter(writer, fileHasher, windowHasher), logicalReader, frameBuf, nil, func(written int64) error {
@@ -841,11 +860,11 @@ func (c *Client) downloadManifestBatchSequential(
 			closeLogicalErr := logicalReader.Close()
 			if copyErr != nil {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("stream output file: %w", copyErr)
+				return nil, nil, nil, fmt.Errorf("stream output file: %w", copyErr)
 			}
 			if closeLogicalErr != nil {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, closeLogicalErr
+				return nil, nil, nil, closeLogicalErr
 			}
 			meta.Size += frameMeta.Size
 			meta.WireSize += frameMeta.WireSize
@@ -856,16 +875,16 @@ func (c *Client) downloadManifestBatchSequential(
 			trailerLine, trailerReadErr := br.ReadString('\n')
 			if trailerReadErr != nil {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("read frame trailer: %w", trailerReadErr)
+				return nil, nil, nil, fmt.Errorf("read frame trailer: %w", trailerReadErr)
 			}
 			trailer, trailerErr := parseFXTrailer(strings.TrimRight(trailerLine, "\r\n"))
 			if trailerErr != nil {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, trailerErr
+				return nil, nil, nil, trailerErr
 			}
 			if trailer.FileID != plan.entry.ID {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("trailer file id mismatch: expected=%d got=%d", plan.entry.ID, trailer.FileID)
+				return nil, nil, nil, fmt.Errorf("trailer file id mismatch: expected=%d got=%d", plan.entry.ID, trailer.FileID)
 			}
 			lastTrailerTS = trailer.TS
 			if trailer.Metadata != nil {
@@ -881,22 +900,22 @@ func (c *Client) downloadManifestBatchSequential(
 			}
 			if *trailer.Next != offset {
 				_ = closeWriter()
-				return DownloadBatchResponse{}, fmt.Errorf("invalid trailer next offset: expected=%d got=%d", offset, *trailer.Next)
+				return nil, nil, nil, fmt.Errorf("invalid trailer next offset: expected=%d got=%d", offset, *trailer.Next)
 			}
 		}
 		if offset != plan.entry.Size {
 			_ = closeWriter()
-			return DownloadBatchResponse{}, fmt.Errorf("batched file size mismatch: expected=%d got=%d", plan.entry.Size, offset)
+			return nil, nil, nil, fmt.Errorf("batched file size mismatch: expected=%d got=%d", plan.entry.Size, offset)
 		}
 
 		windowHash := intencoding.FormatXXH128HashToken(windowHasher.Sum128())
 		if serverHash == "" {
 			_ = closeWriter()
-			return DownloadBatchResponse{}, errors.New("window hash missing from trailer")
+			return nil, nil, nil, errors.New("window hash missing from trailer")
 		}
 		if !strings.EqualFold(serverHash, windowHash) {
 			_ = closeWriter()
-			return DownloadBatchResponse{}, fmt.Errorf("window hash mismatch: server=%s client=%s", serverHash, windowHash)
+			return nil, nil, nil, fmt.Errorf("window hash mismatch: server=%s client=%s", serverHash, windowHash)
 		}
 
 		syncMS := int64(0)
@@ -905,12 +924,12 @@ func (c *Client) downloadManifestBatchSequential(
 		if err := syncOutput(); err != nil {
 			syncTask.End()
 			_ = closeWriter()
-			return DownloadBatchResponse{}, fmt.Errorf("sync output for file %d: %w", plan.entry.ID, err)
+			return nil, nil, nil, fmt.Errorf("sync output for file %d: %w", plan.entry.ID, err)
 		}
 		syncTask.End()
 		syncMS = time.Since(syncStart).Milliseconds()
 		if err := closeWriter(); err != nil {
-			return DownloadBatchResponse{}, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
+			return nil, nil, nil, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
 		}
 
 		localHash := intencoding.FormatXXH128HashToken(fileHasher.Sum128())
@@ -927,7 +946,7 @@ func (c *Client) downloadManifestBatchSequential(
 			RecvMS:     recvMS,
 			SyncMS:     syncMS,
 		})
-		ackProgresses = append(ackProgresses, ackProgress{
+		ackProgresses = append(ackProgresses, seqAckProgress{
 			fileID:      plan.entry.ID,
 			ackBytes:    offset,
 			targetBytes: plan.entry.Size,
@@ -946,23 +965,120 @@ func (c *Client) downloadManifestBatchSequential(
 	statusLine, err := readTCPLine(br, maxTCPLineBytes)
 	if err != nil {
 		if !errors.Is(err, io.EOF) {
-			return DownloadBatchResponse{}, fmt.Errorf("read batch terminal status: %w", err)
+			return nil, nil, nil, fmt.Errorf("read batch terminal status: %w", err)
 		}
 	} else {
 		if err := parseErrControlFrame(statusLine); err != nil {
-			return DownloadBatchResponse{}, err
+			return nil, nil, nil, err
 		}
 		if _, ok := parseOKStatusLine(statusLine); !ok {
-			return DownloadBatchResponse{}, fmt.Errorf("unexpected batch terminal response: %s", statusLine)
+			return nil, nil, nil, fmt.Errorf("unexpected batch terminal response: %s", statusLine)
 		}
 	}
 
-	if len(pendingAcks) > 0 {
+	return results, pendingAcks, ackProgresses, nil
+}
+
+// splitSequentialGroups splits parallel slices of plans and targets into k contiguous groups.
+func splitSequentialGroups(plans []downloadBatchPlan, targets []FetchFileTarget, k int) ([][]downloadBatchPlan, [][]FetchFileTarget) {
+	n := len(plans)
+	if k > n {
+		k = n
+	}
+	size := (n + k - 1) / k
+	planGroups := make([][]downloadBatchPlan, 0, k)
+	targetGroups := make([][]FetchFileTarget, 0, k)
+	for i := 0; i < n; i += size {
+		end := min(i+size, n)
+		planGroups = append(planGroups, plans[i:end])
+		targetGroups = append(targetGroups, targets[i:end])
+	}
+	return planGroups, targetGroups
+}
+
+func (c *Client) downloadManifestBatchSequential(
+	ctx context.Context,
+	req DownloadBatchRequest,
+	plans []downloadBatchPlan,
+	targets []FetchFileTarget,
+) (DownloadBatchResponse, error) {
+	ackTimeout := c.AckRequestTimeout
+	if ackTimeout <= 0 {
+		ackTimeout = defaultClientAckRequestTimeout
+	}
+	emitProgressUpdate := func(update DownloadProgressUpdate) {
+		if req.ProgressUpdates == nil {
+			return
+		}
+		select {
+		case req.ProgressUpdates <- update:
+		default:
+		}
+	}
+
+	windowBytes := c.FileRequestWindowBytes
+	if windowBytes <= 0 {
+		windowBytes = defaultClientRequestWindowBytes
+	}
+	k := maxSplitWindowWorkers(windowBytes, req.BatchMaxBytes, len(plans))
+
+	var (
+		allFiles    []DownloadFileResponse
+		allAcks     []AcknowledgeFileProgressRequest
+		allProgress []seqAckProgress
+	)
+
+	if k <= 1 {
+		files, acks, progresses, err := c.downloadManifestGroupSequential(ctx, req, plans, targets, emitProgressUpdate)
+		if err != nil {
+			return DownloadBatchResponse{}, err
+		}
+		allFiles = files
+		allAcks = acks
+		allProgress = progresses
+	} else {
+		planGroups, targetGroups := splitSequentialGroups(plans, targets, k)
+		type groupResult struct {
+			files     []DownloadFileResponse
+			acks      []AcknowledgeFileProgressRequest
+			progresses []seqAckProgress
+		}
+		results := make([]groupResult, len(planGroups))
+		errs := make([]error, len(planGroups))
+		groupCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var wg sync.WaitGroup
+		for i, pg := range planGroups {
+			wg.Add(1)
+			go func(i int, pg []downloadBatchPlan, tg []FetchFileTarget) {
+				defer wg.Done()
+				files, acks, progresses, err := c.downloadManifestGroupSequential(groupCtx, req, pg, tg, emitProgressUpdate)
+				results[i] = groupResult{files, acks, progresses}
+				errs[i] = err
+				if err != nil {
+					cancel()
+				}
+			}(i, pg, targetGroups[i])
+		}
+		wg.Wait()
+		for _, err := range errs {
+			if err != nil {
+				return DownloadBatchResponse{}, err
+			}
+		}
+		for _, r := range results {
+			allFiles = append(allFiles, r.files...)
+			allAcks = append(allAcks, r.acks...)
+			allProgress = append(allProgress, r.progresses...)
+		}
+	}
+
+	if len(allAcks) > 0 {
 		_, ackTask := trace.NewTask(ctx, "ack")
 		ackErr := retryAck(ctx, func(callCtx context.Context) error {
 			ackCtx, cancel := context.WithTimeout(callCtx, ackTimeout)
 			defer cancel()
-			_, err := c.acknowledgeFileProgressBatch(ackCtx, pendingAcks)
+			_, err := c.acknowledgeFileProgressBatch(ackCtx, allAcks)
 			return err
 		})
 		ackTask.End()
@@ -971,7 +1087,7 @@ func (c *Client) downloadManifestBatchSequential(
 		}
 	}
 
-	for _, progress := range ackProgresses {
+	for _, progress := range allProgress {
 		emitProgressUpdate(DownloadProgressUpdate{
 			TransferID:  req.Manifest.TransferID,
 			FileID:      progress.fileID,
@@ -980,7 +1096,7 @@ func (c *Client) downloadManifestBatchSequential(
 			UpdateTime:  time.Now(),
 		})
 	}
-	return DownloadBatchResponse{Files: results}, nil
+	return DownloadBatchResponse{Files: allFiles}, nil
 }
 
 func (c *Client) downloadManifestBatchWindows(
@@ -1487,7 +1603,7 @@ func (c *Client) effectiveBatchMaxBytes(reqBatchMaxBytes int64) int64 {
 	if c != nil && c.BatchMaxBytes > 0 {
 		return c.BatchMaxBytes
 	}
-	return int64(defaultClientMaxFrameReadBufferBytes)
+	return defaultClientBatchMaxBytes
 }
 
 func suggestedConcurrencyFromProbe(serverCPU int, strategy string) int {
@@ -1554,8 +1670,10 @@ func summarizeProbeSamples(results []probeResponse, probeBytes int64) ProbeRespo
 	}
 	totalIntervalMS := int64(0)
 	serverCPU := 0
+	serverSendBufBytes := int64(0)
 	for _, result := range results {
 		serverCPU = result.ServerCPU
+		serverSendBufBytes = result.ServerWmemBytes
 		intervalMS := max(int64(1), (result.CTS1-result.CTS0)-(result.STS1-result.STS0))
 		totalIntervalMS += intervalMS
 	}
@@ -1563,9 +1681,10 @@ func summarizeProbeSamples(results []probeResponse, probeBytes int64) ProbeRespo
 	mbps := ((probeBytes * 8 * 1000) / avgMS) / 1_000_000
 	roundedMbps := ((mbps + 50) / 100) * 100
 	return ProbeResponse{
-		ServerCPU:    serverCPU,
-		AvgLatencyMS: avgMS,
-		LinkMbps:     roundedMbps,
+		ServerCPU:          serverCPU,
+		AvgLatencyMS:       avgMS,
+		LinkMbps:           roundedMbps,
+		ServerSendBufBytes: serverSendBufBytes,
 	}
 }
 
@@ -1574,7 +1693,7 @@ func buildManifestBatchesByBytes(entries []ManifestEntry, maxBytes int64) [][]Ma
 		return nil
 	}
 	if maxBytes <= 0 {
-		maxBytes = int64(defaultClientMaxFrameReadBufferBytes)
+		maxBytes = defaultClientBatchMaxBytes
 	}
 	batches := make([][]ManifestEntry, 0, len(entries))
 	current := make([]ManifestEntry, 0, 8)

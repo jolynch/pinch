@@ -1676,23 +1676,25 @@ func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbSEND:
-			if len(req.Params) != 3 {
-				return fmt.Errorf("expected txfer header + 2 SEND items, got %d params", len(req.Params))
+			if len(req.Params) < 2 {
+				return fmt.Errorf("expected txfer header + at least 1 SEND item, got %d params", len(req.Params))
 			}
 			if got := req.Params[0]["txferid"]; got != manifest.TransferID {
 				return fmt.Errorf("unexpected transfer id: %q", got)
 			}
-			if got := req.Params[1]["path"]; got != "/remote/a.txt" {
-				return fmt.Errorf("unexpected first path: %q", got)
-			}
-			if got := req.Params[2]["path"]; got != "/remote/b.txt" {
-				return fmt.Errorf("unexpected second path: %q", got)
-			}
-			if _, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, dataA, nil)); err != nil {
-				return err
-			}
-			if _, err := io.WriteString(out, buildFXFrame(t, 1, "none", 0, dataB, nil)); err != nil {
-				return err
+			for _, item := range req.Params[1:] {
+				switch item["path"] {
+				case "/remote/a.txt":
+					if _, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, dataA, nil)); err != nil {
+						return err
+					}
+				case "/remote/b.txt":
+					if _, err := io.WriteString(out, buildFXFrame(t, 1, "none", 0, dataB, nil)); err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf("unexpected path in SEND: %q", item["path"])
+				}
 			}
 			_, err := io.WriteString(out, "OK\r\n")
 			return err

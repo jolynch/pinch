@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jolynch/pinch/utils"
 )
 
 const maxProbeBytes int64 = 32 * 1024 * 1024
@@ -66,12 +68,13 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 	}
 	sts1 := time.Now().UnixMilli()
 	respLine := fmt.Sprintf(
-		"PROBE cpu=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d\n",
+		"PROBE cpu=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d wmem=%d\n",
 		runtime.NumCPU(),
 		parsed.ClientTS0,
 		sts0,
 		sts1,
 		parsed.ProbeBytes,
+		utils.MaxSocketWriteBufferBytes(),
 	)
 	if _, err := io.WriteString(out, respLine); err != nil {
 		return err

@@ -3,7 +3,10 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./bench.sh [options]
+Usage: ./bench.sh SOURCE_DIRECTORY [options]
+
+Arguments:
+  SOURCE_DIRECTORY           Source directory for transfer (required).
 
 Options:
   --flamegraph               Run start benchmark under perf and emit flamegraph SVG.
@@ -12,13 +15,12 @@ Options:
   --no-build                 Skip build step.
   --server-url ADDR          File listener address for CLI (default: 127.0.0.1:3453).
   --server-startup-timeout S Seconds to wait for file listener readiness (default: 30).
-  --source-directory PATH    Source directory for transfer (default: /home/jolynch/Hacking/test-data).
   --manifest PATH            Manifest output path (default: /tmp/pinch/manifest).
   --out-root PATH            Download output root (default: /var/lib/pinch/data).
   --discard                  Shortcut for --out-root /dev/null.
+  --no-sync                  Skip fdatasync after each file (passed to start command).
   --concurrency N            Start command concurrency (default: 128).
-  --zerocopy                 Deprecated (ignored by TCP-only client).
-  --encrypt MODE            Encryption mode passed to CLI (supported: age).
+  --encrypt MODE             Encryption mode passed to CLI (supported: age).
   --freq HZ                  perf sample frequency (default: 199).
   --perf-data PATH           perf.data output path (default: /tmp/pinch-start.perf.data).
   --flamegraph-svg PATH      Flamegraph SVG output path (default: /tmp/pinch-start.svg).
@@ -53,12 +55,12 @@ FLAMEGRAPH=false
 TRACE=false
 SERVER_URL="127.0.0.1:3453"
 SERVER_STARTUP_TIMEOUT_SEC=30
-SOURCE_DIRECTORY="/home/jolynch/Hacking/test-data"
+SOURCE_DIRECTORY=""
 MANIFEST_PATH="/tmp/pinch/manifest"
 OUT_ROOT="/var/lib/pinch/data"
 CONCURRENCY="48"
-USE_ZEROCOPY=false
 ENCRYPT_MODE=""
+NO_SYNC=false
 PERF_FREQ="199"
 PERF_DATA="/tmp/pinch-start.perf.data"
 FLAMEGRAPH_SVG="/tmp/pinch-start.svg"
@@ -67,6 +69,18 @@ SERVER_FLAMEGRAPH_SVG="/tmp/pinch-server.svg"
 FLAMEGRAPH_DIR=""
 CLIENT_TRACE="/tmp/pinch-start.trace"
 SERVER_TRACE="/tmp/pinch-server.trace"
+
+if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
+  usage
+  exit 0
+fi
+if [[ $# -lt 1 || "${1:-}" == --* ]]; then
+  echo "missing required argument: SOURCE_DIRECTORY" >&2
+  usage >&2
+  exit 2
+fi
+SOURCE_DIRECTORY="$1"
+shift
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -101,11 +115,6 @@ while [[ $# -gt 0 ]]; do
       SERVER_URL="$2"
       shift 2
       ;;
-    --source-directory)
-      require_value "$1" "${2:-}"
-      SOURCE_DIRECTORY="$2"
-      shift 2
-      ;;
     --server-startup-timeout)
       require_value "$1" "${2:-}"
       SERVER_STARTUP_TIMEOUT_SEC="$2"
@@ -125,14 +134,14 @@ while [[ $# -gt 0 ]]; do
       OUT_ROOT="/dev/null"
       shift
       ;;
+    --no-sync)
+      NO_SYNC=true
+      shift
+      ;;
     --concurrency)
       require_value "$1" "${2:-}"
       CONCURRENCY="$2"
       shift 2
-      ;;
-    --zerocopy)
-      USE_ZEROCOPY=true
-      shift
       ;;
     --encrypt)
       require_value "$1" "${2:-}"
@@ -189,11 +198,6 @@ if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "age" ]]; then
   echo "unsupported --encrypt value: ${ENCRYPT_MODE} (only 'age' is supported)" >&2
   exit 2
 fi
-if [[ "${USE_ZEROCOPY}" == "true" && -n "${ENCRYPT_MODE}" ]]; then
-  echo "--zerocopy cannot be combined with --encrypt" >&2
-  exit 2
-fi
-
 if [[ "$BUILD" == "true" ]]; then
   echo "Building pinch..."
   go build -o pinch
@@ -291,6 +295,7 @@ start_server_perf() {
 trap cleanup_server EXIT INT TERM
 start_server
 
+echo "bench: source=${SOURCE_DIRECTORY} target=${OUT_ROOT}"
 echo "Cleaning prior benchmark output..."
 if [[ "${OUT_ROOT%/}" != "/dev/null" ]]; then
   rm -rf "${OUT_ROOT}/"
@@ -305,11 +310,11 @@ fi
 "${TRANSFER_CMD[@]}"
 
 START_CMD=(./pinch cli "${SERVER_URL}" start --manifest "${MANIFEST_PATH}" --out-root "${OUT_ROOT}" --concurrency "${CONCURRENCY}")
-if [[ "${USE_ZEROCOPY}" == "true" ]]; then
-  START_CMD+=(--zerocopy)
-fi
 if [[ -n "${ENCRYPT_MODE}" ]]; then
   START_CMD+=(--encrypt "${ENCRYPT_MODE}")
+fi
+if [[ "${NO_SYNC}" == "true" ]]; then
+  START_CMD+=(--no-sync)
 fi
 if [[ "${TRACE}" == "true" ]]; then
   START_CMD+=(--trace "${CLIENT_TRACE}")

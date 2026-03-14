@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"filippo.io/age"
-	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
+	ftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 )
 
 const maxTCPLineBytes = 4 * 1024 * 1024
@@ -29,12 +29,13 @@ type tcpAuthState struct {
 }
 
 type probeResponse struct {
-	ServerCPU  int
-	CTS0       int64
-	CTS1       int64
-	STS0       int64
-	STS1       int64
-	ProbeBytes int64
+	ServerCPU      int
+	CTS0           int64
+	CTS1           int64
+	STS0           int64
+	STS1           int64
+	ProbeBytes     int64
+	ServerWmemBytes int64
 }
 
 func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
@@ -470,6 +471,10 @@ func (c *Client) fetchFileBatchTCP(
 		b.WriteString(makeLenToken(t.FullPath))
 		b.WriteString(" mode=")
 		b.WriteString(loadStrategy)
+		if t.Comp != "" {
+			b.WriteString(" comp=")
+			b.WriteString(t.Comp)
+		}
 		if t.Offset != 0 {
 			b.WriteString(" offset=")
 			b.WriteString(strconv.FormatInt(t.Offset, 10))
@@ -631,11 +636,11 @@ func (r *firstReadTimestampReader) FirstTS() int64 {
 }
 
 func parseProbeResponseLine(line string) (probeResponse, error) {
-	req, err := intftcp.ParseRequest([]byte(strings.TrimSpace(line)))
+	req, err := ftcp.ParseRequest([]byte(strings.TrimSpace(line)))
 	if err != nil {
 		return probeResponse{}, fmt.Errorf("parse PROBE response: %w", err)
 	}
-	if req.Verb != intftcp.VerbPROBE || len(req.Params) != 1 {
+	if req.Verb != ftcp.VerbPROBE || len(req.Params) != 1 {
 		return probeResponse{}, errors.New("invalid PROBE response")
 	}
 	p := req.Params[0]
@@ -659,12 +664,17 @@ func parseProbeResponseLine(line string) (probeResponse, error) {
 	if err != nil || probeBytes < 0 {
 		return probeResponse{}, errors.New("invalid PROBE response probe-bytes")
 	}
+	wmemBytes, _ := strconv.ParseInt(strings.TrimSpace(p["wmem"]), 10, 64)
+	if wmemBytes < 0 {
+		wmemBytes = 0
+	}
 	return probeResponse{
-		ServerCPU:  serverCPU,
-		CTS0:       cts0,
-		STS0:       sts0,
-		STS1:       sts1,
-		ProbeBytes: probeBytes,
+		ServerCPU:       serverCPU,
+		CTS0:            cts0,
+		STS0:            sts0,
+		STS1:            sts1,
+		ProbeBytes:      probeBytes,
+		ServerWmemBytes: wmemBytes,
 	}, nil
 }
 

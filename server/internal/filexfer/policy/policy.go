@@ -20,7 +20,7 @@ const (
 	hystStreak           = 2
 	downRatioCut         = 0.90
 	downReadOverWriteCut = 1.10
-	upReadOverWriteCut   = 0.20
+	upReadOverWriteCut   = 0.10
 )
 
 type CompressionMetrics struct {

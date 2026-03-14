@@ -23,6 +23,7 @@ import (
 	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
 	"github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/utils"
 )
 
 func startTracing(path string, stderr io.Writer) (stop func()) {
@@ -46,7 +47,7 @@ func startTracing(path string, stderr io.Writer) (stop func()) {
 }
 
 const defaultVerboseStatusInterval = 10 * time.Second
-const defaultCLIAckEveryBytes int64 = 256 * 1024 * 1024
+const defaultCLIAckEveryBytes int64 = 128 * 1024 * 1024
 const defaultVerboseProgressInterval = 2 * time.Second
 const defaultCLIProbeBytes int64 = 1 * 1024 * 1024
 
@@ -138,6 +139,17 @@ func resolveLoadStrategy(raw string) (string, error) {
 		return LoadStrategyGentle, nil
 	default:
 		return "", fmt.Errorf("unsupported --load-strategy value %q (supported: fast, gentle)", raw)
+	}
+}
+
+func resolveComp(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "", nil
+	case "adapt", "none", "lz4", "zstd":
+		return strings.ToLower(strings.TrimSpace(raw)), nil
+	default:
+		return "", fmt.Errorf("unsupported --comp value %q (supported: adapt, none, lz4, zstd)", raw)
 	}
 }
 
@@ -318,6 +330,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var outFile string
 	var encryptMode string
 	var loadStrategyRaw string
+	var compRaw string
 	var ackEveryRaw string
 	var batchSizeRaw string
 	var noSync bool
@@ -330,6 +343,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	fs.StringVar(&outFile, "o", "", "output file path, or '-' for stdout")
 	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
 	fs.StringVar(&loadStrategyRaw, "load-strategy", LoadStrategyFast, "server load strategy (fast|gentle)")
+	fs.StringVar(&compRaw, "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
@@ -376,6 +390,11 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "invalid --load-strategy: %v\n", err)
 		return 2
 	}
+	comp, err := resolveComp(compRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --comp: %v\n", err)
+		return 2
+	}
 	fileID, err := parseFileID(fileIDRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --fd: %v\n", err)
@@ -413,7 +432,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	}
 	defer stopProgress()
 
-	client := NewClient(serverURL, WithLoadStrategy(loadStrategy))
+	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(comp))
 	start := time.Now()
 	entry, ok := manifest.EntryByID(fileID)
 	if !ok {
@@ -480,6 +499,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var concurrency int
 	var ackEveryRaw string
 	var batchSizeRaw string
+	var compRaw string
 	var noSync bool
 	var verbose bool
 	fs.StringVar(&txferID, "tid", "", "transfer id")
@@ -494,6 +514,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
 	fs.StringVar(&batchSizeRaw, "b", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	fs.StringVar(&batchSizeRaw, "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
+	fs.StringVar(&compRaw, "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")
 	var traceFile string
 	fs.StringVar(&traceFile, "trace", "", "write runtime/trace output to this file")
@@ -545,6 +566,11 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "load manifest failed: invalid manifest mode %q\n", manifest.Mode)
 		return 1
 	}
+	comp, err := resolveComp(compRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --comp: %v\n", err)
+		return 2
+	}
 	manifestConcurrency := manifest.Concurrency
 	if manifestConcurrency <= 0 {
 		fmt.Fprintf(stderr, "load manifest failed: invalid manifest concurrency %d\n", manifestConcurrency)
@@ -580,14 +606,20 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		markMetadataDonePersisted(fileID)
 	}
 	defer stopProgress()
-	client := NewClient(serverURL, WithLoadStrategy(loadStrategy))
+	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(comp))
+	serverSendBufBytes := int64(utils.MaxSocketWriteBufferBytes())
+	if miniProbe, err := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); err == nil && miniProbe.ServerSendBufBytes > 0 {
+		serverSendBufBytes = miniProbe.ServerSendBufBytes
+	}
 	fmt.Fprintf(
 		stdout,
-		"start-plan: strategy=%s link=%dMbps concurrency=%d (manifest=%d)\n",
+		"start-plan: strategy=%s link=%dMbps concurrency=%d (manifest=%d) cli-sendbuf=%s srv-recvbuf=%s\n",
 		loadStrategy,
 		manifest.LinkMbps,
 		effectiveConcurrency,
 		manifestConcurrency,
+		encoding.HumanBytes(serverSendBufBytes),
+		encoding.HumanBytes(int64(utils.MaxSocketReadBufferBytes())),
 	)
 
 	startAll := time.Now()
