@@ -14,6 +14,7 @@ Options:
   --source-directory PATH    Source directory for transfer (default: /home/jolynch/Hacking/test-data).
   --manifest PATH            Manifest output path (default: /tmp/pinch/manifest).
   --out-root PATH            Download output root (default: /var/lib/pinch/data).
+  --discard                  Shortcut for --out-root /dev/null.
   --concurrency N            Start command concurrency (default: 128).
   --zerocopy                 Deprecated (ignored by TCP-only client).
   --encrypt MODE            Encryption mode passed to CLI (supported: age).
@@ -99,6 +100,10 @@ while [[ $# -gt 0 ]]; do
       require_value "$1" "${2:-}"
       OUT_ROOT="$2"
       shift 2
+      ;;
+    --discard)
+      OUT_ROOT="/dev/null"
+      shift
       ;;
     --concurrency)
       require_value "$1" "${2:-}"
@@ -263,7 +268,10 @@ trap cleanup_server EXIT INT TERM
 start_server
 
 echo "Cleaning prior benchmark output..."
-rm -rf "${OUT_ROOT}/" "${MANIFEST_PATH}"*
+if [[ "${OUT_ROOT%/}" != "/dev/null" ]]; then
+  rm -rf "${OUT_ROOT}/"
+fi
+rm -rf "${MANIFEST_PATH}"*
 
 echo "Preparing manifest..."
 TRANSFER_CMD=(./pinch cli "${SERVER_URL}" transfer -o "${MANIFEST_PATH}" -s "${SOURCE_DIRECTORY}")

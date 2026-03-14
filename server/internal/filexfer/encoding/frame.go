@@ -8,11 +8,39 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/zeebo/xxh3"
 )
+
+var userNameCache sync.Map  // map[string]string  uid  → username
+var groupNameCache sync.Map // map[string]string  gid  → group name
+
+func lookupUserName(uid string) string {
+	if v, ok := userNameCache.Load(uid); ok {
+		return v.(string)
+	}
+	name := "unknown"
+	if u, err := user.LookupId(uid); err == nil {
+		name = u.Username
+	}
+	userNameCache.Store(uid, name)
+	return name
+}
+
+func lookupGroupName(gid string) string {
+	if v, ok := groupNameCache.Load(gid); ok {
+		return v.(string)
+	}
+	name := "unknown"
+	if g, err := user.LookupGroupId(gid); err == nil {
+		name = g.Name
+	}
+	groupNameCache.Store(gid, name)
+	return name
+}
 
 type FileFrameMetadata struct {
 	Size    int64
@@ -37,12 +65,8 @@ func CollectFileFrameMetadata(path string, info os.FileInfo) FileFrameMetadata {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		meta.UID = strconv.FormatUint(uint64(st.Uid), 10)
 		meta.GID = strconv.FormatUint(uint64(st.Gid), 10)
-		if u, err := user.LookupId(meta.UID); err == nil {
-			meta.User = u.Username
-		}
-		if g, err := user.LookupGroupId(meta.GID); err == nil {
-			meta.Group = g.Name
-		}
+		meta.User = lookupUserName(meta.UID)
+		meta.Group = lookupGroupName(meta.GID)
 	}
 	_ = path
 	return meta
@@ -324,6 +348,18 @@ func ValidHashToken(raw string) bool {
 	}
 	parts := strings.SplitN(raw, ":", 2)
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+}
+
+func AbbrevHashToken(raw string) string {
+	raw = strings.TrimSpace(raw)
+	parts := strings.SplitN(raw, ":", 2)
+	if len(parts) != 2 {
+		return raw
+	}
+	if len(parts[1]) <= 8 {
+		return raw
+	}
+	return parts[0] + ":" + parts[1][:8] + "..."
 }
 
 func DecodePayloadReaderByComp(payload io.Reader, comp string) (io.ReadCloser, error) {

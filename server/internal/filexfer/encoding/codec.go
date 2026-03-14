@@ -116,7 +116,7 @@ func WrapCompressedWriter(dst io.Writer, acceptEncoding string) (io.Writer, func
 
 	switch SelectEncoding(acceptEncoding) {
 	case EncodingZstd:
-		zw, err := zstd.NewWriter(dst)
+		zw, err := zstd.NewWriter(dst, zstd.WithEncoderLevel(1))
 		if err != nil {
 			return nil, nil, "", err
 		}

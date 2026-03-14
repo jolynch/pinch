@@ -1434,6 +1434,8 @@ func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path stri
 	if localFileHash == "" {
 		localFileHash = "n/a"
 	}
+	serverFileHashDisplay := encoding.AbbrevHashToken(serverFileHash)
+	localFileHashDisplay := encoding.AbbrevHashToken(localFileHash)
 	compSummary := formatCompSummary(meta)
 	fmt.Fprintf(
 		stdout,
@@ -1446,8 +1448,8 @@ func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path stri
 		meta.WireSize,
 		encoding.HumanRate(speed),
 		ratio,
-		serverFileHash,
-		localFileHash,
+		serverFileHashDisplay,
+		localFileHashDisplay,
 		elapsed.Round(time.Millisecond),
 		meta.HeaderTS,
 		meta.TrailerTS,

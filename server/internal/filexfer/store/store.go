@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
@@ -88,7 +89,7 @@ type transferStore struct {
 	mu           sync.RWMutex
 	transfers    map[string]Transfer
 	fileHashes   map[fileHashKey]fileHashState
-	windowHashes map[windowHashKey]windowHashState
+	windowHashes map[windowHashKey]*windowHashState
 }
 
 type fileHashKey struct {
@@ -108,14 +109,22 @@ type fileHashState struct {
 }
 
 type windowHashKey struct {
-	txferID  string
-	fileID   uint64
-	endBytes int64
+	txferID string
+	fileID  uint64
 }
 
 type windowHashState struct {
 	hashToken string
+	endBytes  int64
+	ackedUpTo atomic.Int64 // CAS-advanced; entry deleted when ackedUpTo >= endBytes
 	expiresAt time.Time
+}
+
+// AckEntry is a single (transfer, file, ackBytes) tuple for batch acknowledgement.
+type AckEntry struct {
+	TxferID  string
+	FileID   uint64
+	AckBytes int64
 }
 
 var (
@@ -131,7 +140,7 @@ func newTransferStore() *transferStore {
 	return &transferStore{
 		transfers:    make(map[string]Transfer),
 		fileHashes:   make(map[fileHashKey]fileHashState),
-		windowHashes: make(map[windowHashKey]windowHashState),
+		windowHashes: make(map[windowHashKey]*windowHashState),
 	}
 }
 
@@ -437,7 +446,7 @@ func (s *transferStore) resetForTest() {
 	s.mu.Lock()
 	s.transfers = make(map[string]Transfer)
 	s.fileHashes = make(map[fileHashKey]fileHashState)
-	s.windowHashes = make(map[windowHashKey]windowHashState)
+	s.windowHashes = make(map[windowHashKey]*windowHashState)
 	s.mu.Unlock()
 }
 
@@ -481,10 +490,19 @@ func (s *transferStore) setFileState(txferID string, fileID uint64, state uint8)
 	return true
 }
 
-func (s *transferStore) acknowledgeFile(txferID string, fileID uint64, ackBytes int64) bool {
+func (s *transferStore) acknowledgeFiles(entries []AckEntry) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	ok := true
+	for _, e := range entries {
+		if !s.acknowledgeFileLocked(e.TxferID, e.FileID, e.AckBytes) {
+			ok = false
+		}
+	}
+	return ok
+}
 
+func (s *transferStore) acknowledgeFileLocked(txferID string, fileID uint64, ackBytes int64) bool {
 	transfer, ok := s.transfers[txferID]
 	if !ok {
 		return false
@@ -542,9 +560,20 @@ func (s *transferStore) acknowledgeFile(txferID string, fileID uint64, ackBytes 
 	}
 
 	s.transfers[txferID] = transfer
-	for key := range s.windowHashes {
-		if key.txferID == txferID && key.fileID == fileID && key.endBytes <= target {
-			delete(s.windowHashes, key)
+
+	wKey := windowHashKey{txferID: txferID, fileID: fileID}
+	if ws, exists := s.windowHashes[wKey]; exists {
+		for {
+			cur := ws.ackedUpTo.Load()
+			if target <= cur {
+				break
+			}
+			if ws.ackedUpTo.CompareAndSwap(cur, target) {
+				break
+			}
+		}
+		if ws.ackedUpTo.Load() >= ws.endBytes {
+			delete(s.windowHashes, wKey)
 		}
 	}
 	return true
@@ -591,8 +620,8 @@ func (s *transferStore) reapExpiredLoop() {
 				delete(s.fileHashes, key)
 			}
 		}
-		for key, state := range s.windowHashes {
-			if !state.expiresAt.After(now) {
+		for key, ws := range s.windowHashes {
+			if !ws.expiresAt.After(now) {
 				delete(s.windowHashes, key)
 				continue
 			}
@@ -631,15 +660,13 @@ func (s *transferStore) setWindowHashToken(txferID string, fileID uint64, endByt
 	if !validHashToken(token) {
 		return false
 	}
-	key := windowHashKey{
-		txferID:  txferID,
-		fileID:   fileID,
-		endBytes: endBytes,
-	}
-	s.windowHashes[key] = windowHashState{
+	key := windowHashKey{txferID: txferID, fileID: fileID}
+	ws := &windowHashState{
 		hashToken: normalizeHashToken(token),
+		endBytes:  endBytes,
 		expiresAt: time.Now().Add(ttl),
 	}
+	s.windowHashes[key] = ws
 	return true
 }
 
@@ -650,16 +677,12 @@ func (s *transferStore) verifyWindowHashToken(txferID string, fileID uint64, end
 	if endBytes < 0 {
 		return false
 	}
-	key := windowHashKey{
-		txferID:  txferID,
-		fileID:   fileID,
-		endBytes: endBytes,
-	}
-	state, ok := s.windowHashes[key]
-	if !ok {
+	key := windowHashKey{txferID: txferID, fileID: fileID}
+	ws, ok := s.windowHashes[key]
+	if !ok || ws.endBytes != endBytes {
 		return false
 	}
-	return state.hashToken == normalizeHashToken(token)
+	return ws.hashToken == normalizeHashToken(token)
 }
 
 func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
@@ -770,7 +793,11 @@ func GetTransferFileStates(txferID string) ([]TransferFileState, bool) {
 }
 
 func AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool {
-	return manager.acknowledgeFile(txferID, fileID, ackBytes)
+	return manager.acknowledgeFiles([]AckEntry{{TxferID: txferID, FileID: fileID, AckBytes: ackBytes}})
+}
+
+func AcknowledgeTransferFiles(entries []AckEntry) bool {
+	return manager.acknowledgeFiles(entries)
 }
 
 func UpdateTransferFileHash(txferID string, fileID uint64, offset int64, chunk []byte) bool {

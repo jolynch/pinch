@@ -146,7 +146,7 @@ func handleACK(_ context.Context, req Request, out io.Writer, deps Deps) error {
 				v.item.TransferID,
 				v.item.FileID,
 				v.ackBytes,
-				v.ackHashToken,
+				encoding.AbbrevHashToken(v.ackHashToken),
 				v.ackTS,
 				nowTS,
 				lagMS,
