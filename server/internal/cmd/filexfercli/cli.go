@@ -87,9 +87,9 @@ func validateServerURL(raw string) error {
 func printCLIUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  pinch cli <file-listener> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--encrypt age] [--load-strategy fast|gentle] [--probe-bytes <size>] [-v|--verbose] [--max-manifest-chunk-size N]")
-	fmt.Fprintln(w, "  pinch cli <file-listener> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--encrypt age] [--concurrency N] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <file-listener> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--encrypt age] [--concurrency N] [-a|--ack-every <size>] [--batch-size <size>] [--no-sync] [-v|--verbose]")
 	fmt.Fprintln(w, "  pinch cli <file-listener> status --tid <id>")
-	fmt.Fprintln(w, "  pinch cli <file-listener> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--encrypt age] [--load-strategy fast|gentle] [-A|--ack-every <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <file-listener> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--encrypt age] [--load-strategy fast|gentle] [-a|--ack-every <size>] [--batch-size <size>] [--no-sync] [-v|--verbose]")
 }
 
 func resolveEncryptionOptions(mode string) (string, string, error) {
@@ -297,6 +297,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var encryptMode string
 	var loadStrategyRaw string
 	var ackEveryRaw string
+	var batchSizeRaw string
 	var noSync bool
 	var verbose bool
 	fs.StringVar(&txferID, "tid", "", "transfer id")
@@ -309,8 +310,10 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	fs.BoolVar(&verbose, "v", false, "verbose progress output")
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
-	fs.StringVar(&ackEveryRaw, "A", ackEveryRaw, "bytes between progress acks")
+	fs.StringVar(&ackEveryRaw, "a", ackEveryRaw, "bytes between progress acks")
 	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
+	fs.StringVar(&batchSizeRaw, "b", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
+	fs.StringVar(&batchSizeRaw, "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	fs.BoolVar(&noSync, "no-sync", false, "ack without disk sync")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -319,11 +322,22 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintln(stderr, "get requires --fd")
 		return 2
 	}
-	if ackEvery, err := encoding.ParseByteSize(ackEveryRaw); err != nil {
+	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
+	if err != nil {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
-	} else if ackEvery <= 0 {
+	}
+	if ackEvery <= 0 {
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
+		return 2
+	}
+	batchSize, err := encoding.ParseByteSize(batchSizeRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --batch-size: %v\n", err)
+		return 2
+	}
+	if batchSize <= 0 {
+		fmt.Fprintln(stderr, "--batch-size must be > 0")
 		return 2
 	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
@@ -396,11 +410,12 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	}
 	outputPath := resolveDownloadDestinationPath(entry, outRoot, outFile)
 	downloadBatchResp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
-		Manifest: manifest,
-		FileIDs:  []uint64{fileID},
-		OutputWriter: func(entry ManifestEntry) (io.WriteCloser, func() error, error) {
+		Manifest:      manifest,
+		FileIDs:       []uint64{fileID},
+		BatchMaxBytes: batchSize,
+		OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := resolveDownloadDestinationPath(entry, outRoot, outFile)
-			return openDownloadOutput(entry, destPath, stdout, noSync)
+			return openDownloadOutput(entry, offset, destPath, stdout, noSync)
 		},
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
@@ -438,6 +453,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var encryptMode string
 	var concurrency int
 	var ackEveryRaw string
+	var batchSizeRaw string
 	var noSync bool
 	var verbose bool
 	fs.StringVar(&txferID, "tid", "", "transfer id")
@@ -448,8 +464,10 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
 	fs.IntVar(&concurrency, "concurrency", 0, "parallel download workers (0=manifest default)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
-	fs.StringVar(&ackEveryRaw, "A", ackEveryRaw, "bytes between progress acks")
+	fs.StringVar(&ackEveryRaw, "a", ackEveryRaw, "bytes between progress acks")
 	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
+	fs.StringVar(&batchSizeRaw, "b", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
+	fs.StringVar(&batchSizeRaw, "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -471,6 +489,15 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	if ackEvery <= 0 {
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
+		return 2
+	}
+	batchSize, err := encoding.ParseByteSize(batchSizeRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --batch-size: %v\n", err)
+		return 2
+	}
+	if batchSize <= 0 {
+		fmt.Fprintln(stderr, "--batch-size must be > 0")
 		return 2
 	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
@@ -572,14 +599,14 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
 		Manifest: manifest,
 		Entries:  pendingEntries,
-		OutputWriter: func(entry ManifestEntry) (io.WriteCloser, func() error, error) {
+		OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
-			return openDownloadOutput(entry, destPath, nil, noSync)
+			return openDownloadOutput(entry, offset, destPath, nil, noSync)
 		},
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
 		Concurrency:     effectiveConcurrency,
-		BatchMaxBytes:   ackEvery,
+		BatchMaxBytes:   batchSize,
 		ProgressUpdates: progressUpdates,
 		OnFileDone: func(evt StartFileDoneEvent) {
 			entry, ok := manifest.EntryByID(evt.File.Meta.FileID)
@@ -726,9 +753,9 @@ func resolveDownloadDestinationPath(entry ManifestEntry, outRoot string, outFile
 	return filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
 }
 
-func openDownloadOutput(entry ManifestEntry, destPath string, stdout io.Writer, noSync bool) (io.WriteCloser, func() error, error) {
+func openDownloadOutput(entry ManifestEntry, offset int64, destPath string, stdout io.Writer, noSync bool) (io.WriteCloser, func() error, error) {
 	if destPath == "-" {
-		if entry.Progress.AckBytes > 0 {
+		if offset > 0 {
 			return nil, nil, errors.New("cannot resume when output is stdout")
 		}
 		if stdout == nil {
@@ -742,16 +769,19 @@ func openDownloadOutput(entry ManifestEntry, destPath string, stdout io.Writer, 
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 		return nil, nil, fmt.Errorf("create output parent directory: %w", err)
 	}
-	resumeFrom := entry.Progress.AckBytes
+	resumeBase := entry.Progress.AckBytes
+	if resumeBase < 0 {
+		resumeBase = 0
+	}
 	var (
 		fd  *os.File
 		err error
 	)
-	if resumeFrom > 0 {
+	if resumeBase > 0 {
 		fd, err = os.OpenFile(destPath, os.O_RDWR, 0)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return nil, nil, fmt.Errorf("resume requested at offset %d but output file is missing", resumeFrom)
+				return nil, nil, fmt.Errorf("resume requested at offset %d but output file is missing", resumeBase)
 			}
 			return nil, nil, fmt.Errorf("open output file for resume: %w", err)
 		}
@@ -760,22 +790,25 @@ func openDownloadOutput(entry ManifestEntry, destPath string, stdout io.Writer, 
 			_ = fd.Close()
 			return nil, nil, fmt.Errorf("stat output file for resume: %w", statErr)
 		}
-		if stat.Size() < resumeFrom {
+		if stat.Size() < resumeBase {
 			_ = fd.Close()
-			return nil, nil, fmt.Errorf("resume requested at offset %d but output file has only %d bytes", resumeFrom, stat.Size())
+			return nil, nil, fmt.Errorf("resume requested at offset %d but output file has only %d bytes", resumeBase, stat.Size())
 		}
-		if err := fd.Truncate(resumeFrom); err != nil {
-			_ = fd.Close()
-			return nil, nil, fmt.Errorf("truncate output file for resume: %w", err)
-		}
-		if _, err := fd.Seek(resumeFrom, io.SeekStart); err != nil {
-			_ = fd.Close()
-			return nil, nil, fmt.Errorf("seek output file for resume: %w", err)
+	} else if offset > 0 {
+		fd, err = os.OpenFile(destPath, os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open output file for sparse write: %w", err)
 		}
 	} else {
 		fd, err = os.Create(destPath)
 		if err != nil {
 			return nil, nil, fmt.Errorf("create output file: %w", err)
+		}
+	}
+	if offset > 0 {
+		if _, err := fd.Seek(offset, io.SeekStart); err != nil {
+			_ = fd.Close()
+			return nil, nil, fmt.Errorf("seek output file for resume: %w", err)
 		}
 	}
 	syncOutput := func() error {

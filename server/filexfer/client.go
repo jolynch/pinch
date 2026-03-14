@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -82,6 +83,12 @@ func WithFileRequestWindowBytes(windowBytes int64) ClientOption {
 	})
 }
 
+func WithBatchMaxBytes(batchMaxBytes int64) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.BatchMaxBytes = batchMaxBytes
+	})
+}
+
 func WithFrameBufferBytes(bufferBytes int) ClientOption {
 	return clientOptionFunc(func(c *Client) {
 		c.FrameBufferBytes = bufferBytes
@@ -116,6 +123,7 @@ type Client struct {
 	FileAddr                string
 	ServerAgePublicKey      string
 	FileRequestWindowBytes  int64
+	BatchMaxBytes           int64
 	FrameBufferBytes        int
 	MaxFrameReadBufferBytes int
 	AckRequestTimeout       time.Duration
@@ -197,9 +205,16 @@ type DownloadFileResponse struct {
 }
 
 type DownloadBatchRequest struct {
-	Manifest        *Manifest
-	FileIDs         []uint64
-	OutputWriter    func(ManifestEntry) (io.WriteCloser, func() error, error)
+	Manifest *Manifest
+	FileIDs  []uint64
+	OutputWriter func(ManifestEntry, int64) (io.WriteCloser, func() error, error)
+	// BatchMaxBytes is the unit of parallel work for a single large file: when a file
+	// exceeds BatchMaxBytes, it is split into windows of this size and downloaded
+	// concurrently. The number of concurrent windows is bounded by
+	// FileRequestWindowBytes/BatchMaxBytes — e.g. a 1 MiB batch with a 10 MiB window
+	// allows up to 10 concurrent requests against that file, while a 10 MiB batch allows
+	// only one. BatchMaxBytes must be <= Client.FileRequestWindowBytes.
+	BatchMaxBytes   int64
 	AgePublicKey    string
 	AgeIdentity     string
 	ProgressUpdates chan<- DownloadProgressUpdate
@@ -210,12 +225,13 @@ type DownloadBatchResponse struct {
 }
 
 type StartFromManifestRequest struct {
-	Manifest        *Manifest
-	Entries         []ManifestEntry
-	OutputWriter    func(ManifestEntry) (io.WriteCloser, func() error, error)
-	AgePublicKey    string
-	AgeIdentity     string
-	Concurrency     int
+	Manifest     *Manifest
+	Entries      []ManifestEntry
+	OutputWriter func(ManifestEntry, int64) (io.WriteCloser, func() error, error)
+	AgePublicKey string
+	AgeIdentity  string
+	Concurrency  int
+	// BatchMaxBytes is the unit of parallel work per file. See DownloadBatchRequest.BatchMaxBytes.
 	BatchMaxBytes   int64
 	ProgressUpdates chan<- DownloadProgressUpdate
 	OnFileDone      func(StartFileDoneEvent)
@@ -332,18 +348,29 @@ func (e *fileMissingError) Error() string {
 var ErrFileMissing = errors.New("file missing")
 
 const (
+	// Window and batch sizes. The window is max in-flight bytes per file; the batch is
+	// the unit of parallel work. parallelism = window / batch.
 	defaultClientRequestWindowBytes      int64 = 1024 * 1024 * 1024
-	defaultClientFrameBufferBytes        int   = 8 * 1024 * 1024
-	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024
-	minClientFrameReadBufferBytes        int   = 32 * 1024
-	defaultClientScratchBufferBytes      int   = 64 * 1024
-	maxClientScratchBufferPoolBytes      int   = 16 * 1024 * 1024
-	defaultClientAckRequestTimeout             = 15 * time.Second
-	defaultClientLoadStrategy                  = LoadStrategyFast
-	defaultClientProbeBytes              int64 = 1 * 1024 * 1024
-	defaultClientProbeSamples                  = 3
-	minAutoStartConcurrency                    = 2
-	maxAutoStartConcurrency                    = 256
+	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024 // also the fallback BatchMaxBytes
+
+	// Frame read-buffer bounds, scaled per stream based on file/frame size.
+	defaultClientFrameBufferBytes int = 8 * 1024 * 1024
+	minClientFrameReadBufferBytes int = 32 * 1024
+
+	// Scratch buffers used for request/response payloads (headers, manifests, etc.).
+	defaultClientScratchBufferBytes int = 64 * 1024
+	maxClientScratchBufferPoolBytes int = 16 * 1024 * 1024
+
+	defaultClientAckRequestTimeout = 15 * time.Second
+	defaultClientLoadStrategy      = LoadStrategyFast
+
+	// Probe parameters for server capability detection and concurrency selection.
+	defaultClientProbeBytes   int64 = 1 * 1024 * 1024
+	defaultClientProbeSamples       = 3
+
+	// Concurrency bounds for StartFromManifest auto-selection.
+	minAutoStartConcurrency = 2
+	maxAutoStartConcurrency = 256
 )
 
 func NewClient(fileAddr string, opts ...ClientOption) *Client {
@@ -522,7 +549,7 @@ func (c *Client) fetchFileWindow(
 	if err != nil {
 		return nil, nil, err
 	}
-	fileStream, meta, err := newFileStream(stream, "")
+	fileStream, meta, err := c.newFileStream(stream, "", target.Size)
 	if err != nil {
 		_ = stream.Close()
 		return nil, nil, err
@@ -586,6 +613,18 @@ type downloadBatchPlan struct {
 	resumeFrom int64
 }
 
+type splitWindow struct {
+	start int64
+	size  int64
+	end   int64
+}
+
+type splitWindowResult struct {
+	window   splitWindow
+	response DownloadFileResponse
+	ack      AcknowledgeFileProgressRequest
+}
+
 func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req DownloadBatchRequest) (DownloadBatchResponse, error) {
 	if req.Manifest == nil {
 		return DownloadBatchResponse{}, errors.New("nil manifest")
@@ -595,6 +634,18 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 	}
 	if req.OutputWriter == nil {
 		return DownloadBatchResponse{}, errors.New("missing output writer callback")
+	}
+	explicitBatch := req.BatchMaxBytes > 0 || (c != nil && c.BatchMaxBytes > 0)
+	req.BatchMaxBytes = c.effectiveBatchMaxBytes(req.BatchMaxBytes)
+	windowBytes := c.FileRequestWindowBytes
+	if windowBytes <= 0 {
+		windowBytes = defaultClientRequestWindowBytes
+	}
+	if explicitBatch && req.BatchMaxBytes > windowBytes {
+		return DownloadBatchResponse{}, fmt.Errorf(
+			"batch size %d exceeds window size %d: batch is the unit of parallel work per file, window is the max outstanding bytes across all concurrent requests for that file",
+			req.BatchMaxBytes, windowBytes,
+		)
 	}
 
 	plans := make([]downloadBatchPlan, 0, len(req.FileIDs))
@@ -623,6 +674,29 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 		targets = append(targets, target)
 	}
 
+	if shouldSplitSingleFileBatch(req, plans) {
+		return c.downloadManifestBatchWindows(ctx, req, plans[0])
+	}
+	return c.downloadManifestBatchSequential(ctx, req, plans, targets)
+}
+
+func shouldSplitSingleFileBatch(req DownloadBatchRequest, plans []downloadBatchPlan) bool {
+	if len(plans) != 1 || req.BatchMaxBytes <= 0 {
+		return false
+	}
+	entry := plans[0].entry
+	if entry.Size < 0 {
+		return false
+	}
+	return entry.Size-plans[0].resumeFrom > req.BatchMaxBytes
+}
+
+func (c *Client) downloadManifestBatchSequential(
+	ctx context.Context,
+	req DownloadBatchRequest,
+	plans []downloadBatchPlan,
+	targets []FetchFileTarget,
+) (DownloadBatchResponse, error) {
 	stream, err := c.fetchFileBatchTCP(ctx, req.Manifest.TransferID, targets, req.AgePublicKey, req.AgeIdentity)
 	if err != nil {
 		var missingErr *fileMissingError
@@ -668,7 +742,7 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 	}
 
 	for _, plan := range plans {
-		writer, syncOutput, err := req.OutputWriter(plan.entry)
+		writer, syncOutput, err := req.OutputWriter(plan.entry, plan.resumeFrom)
 		if err != nil {
 			return DownloadBatchResponse{}, fmt.Errorf("create output writer for file %d: %w", plan.entry.ID, err)
 		}
@@ -895,6 +969,390 @@ func (c *Client) DownloadFilesFromManifestBatch(ctx context.Context, req Downloa
 	return DownloadBatchResponse{Files: results}, nil
 }
 
+func (c *Client) downloadManifestBatchWindows(
+	ctx context.Context,
+	req DownloadBatchRequest,
+	plan downloadBatchPlan,
+) (DownloadBatchResponse, error) {
+	requestCtx := ctx
+	windows := buildSplitWindows(plan.resumeFrom, plan.entry.Size, req.BatchMaxBytes)
+	if len(windows) == 0 {
+		return DownloadBatchResponse{}, errors.New("empty split window plan")
+	}
+
+	ackTimeout := c.AckRequestTimeout
+	if ackTimeout <= 0 {
+		ackTimeout = defaultClientAckRequestTimeout
+	}
+	emitProgressUpdate := func(update DownloadProgressUpdate) {
+		if req.ProgressUpdates == nil {
+			return
+		}
+		select {
+		case req.ProgressUpdates <- update:
+		default:
+		}
+	}
+	if plan.resumeFrom > 0 {
+		emitProgressUpdate(DownloadProgressUpdate{
+			TransferID:  req.Manifest.TransferID,
+			FileID:      plan.entry.ID,
+			CopiedBytes: plan.resumeFrom,
+			TargetBytes: plan.entry.Size,
+			UpdateTime:  time.Now(),
+		})
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var initialWriter io.WriteCloser
+	var initialSync func() error
+	if plan.resumeFrom == 0 {
+		initialWriterResult, initialSyncResult, initialErr := req.OutputWriter(plan.entry, 0)
+		if initialErr != nil {
+			return DownloadBatchResponse{}, fmt.Errorf("create output writer for file %d: %w", plan.entry.ID, initialErr)
+		}
+		initialWriter, initialSync = initialWriterResult, initialSyncResult
+		if initialWriter == nil {
+			return DownloadBatchResponse{}, fmt.Errorf("create output writer for file %d: nil writer", plan.entry.ID)
+		}
+		if initialSync == nil {
+			initialSync = func() error { return nil }
+		}
+	}
+
+	maxWorkers := maxSplitWindowWorkers(c.FileRequestWindowBytes, req.BatchMaxBytes, len(windows))
+	limiter := make(chan struct{}, maxWorkers)
+	results := make(chan splitWindowResult, len(windows))
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
+	setErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errOnce.Do(func() {
+			firstErr = err
+			cancel()
+		})
+	}
+
+	// windows[0].start == plan.resumeFrom always, so initialWriter is only ever used by i==0.
+	for i, window := range windows {
+		w, s := io.WriteCloser(nil), func() error { return nil }
+		if i == 0 && initialWriter != nil {
+			w, s = initialWriter, initialSync
+		}
+		wg.Add(1)
+		go func(window splitWindow, w io.WriteCloser, s func() error) {
+			defer wg.Done()
+			select {
+			case limiter <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-limiter }()
+
+			result, err := c.downloadSplitWindow(ctx, req, plan, window, w, s, emitProgressUpdate)
+			if err != nil {
+				setErr(err)
+				return
+			}
+			select {
+			case results <- result:
+			case <-ctx.Done():
+			}
+		}(window, w, s)
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	completions := make(map[int64]splitWindowResult, len(windows))
+	pending := make(map[int64]splitWindowResult, len(windows))
+	nextAckOffset := plan.resumeFrom
+
+	for result := range results {
+		completions[result.window.start] = result
+		pending[result.window.start] = result
+
+		// Collect the contiguous chain of completed windows starting at nextAckOffset.
+		var ackBatch []AcknowledgeFileProgressRequest
+		for next := nextAckOffset; ; {
+			ready, ok := pending[next]
+			if !ok {
+				break
+			}
+			ackBatch = append(ackBatch, ready.ack)
+			next = ready.window.end
+		}
+		if len(ackBatch) == 0 {
+			continue
+		}
+		ackErr := retryAck(requestCtx, func(callCtx context.Context) error {
+			ackCtx, cancelAck := context.WithTimeout(callCtx, ackTimeout)
+			defer cancelAck()
+			_, err := c.acknowledgeFileProgressBatch(ackCtx, ackBatch)
+			return err
+		})
+		if ackErr != nil {
+			setErr(fmt.Errorf("acknowledge download failed: %w", ackErr))
+			break
+		}
+		for next := nextAckOffset; ; {
+			ready, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, ready.window.start)
+			nextAckOffset = ready.window.end
+			emitProgressUpdate(DownloadProgressUpdate{
+				TransferID:  req.Manifest.TransferID,
+				FileID:      plan.entry.ID,
+				TargetBytes: plan.entry.Size,
+				AckBytes:    ready.ack.AckBytes,
+				UpdateTime:  time.Now(),
+			})
+			next = nextAckOffset
+		}
+	}
+
+	if firstErr != nil {
+		var missingErr *fileMissingError
+		if errors.Is(firstErr, ErrFileMissing) && errors.As(firstErr, &missingErr) && shouldAcknowledgeMissing404(missingErr.Body) {
+			if ackErr := c.acknowledgeMissingFile(requestCtx, req.Manifest.TransferID, plan.entry.ID, plan.serverPath); ackErr != nil {
+				return DownloadBatchResponse{}, fmt.Errorf("%w (failed to ack missing: %v)", firstErr, ackErr)
+			}
+		}
+		return DownloadBatchResponse{}, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return DownloadBatchResponse{}, err
+	}
+	if nextAckOffset != plan.entry.Size {
+		return DownloadBatchResponse{}, fmt.Errorf("split ack offset mismatch: expected=%d got=%d", plan.entry.Size, nextAckOffset)
+	}
+
+	aggregate, err := aggregateSplitWindowResults(plan, windows, completions)
+	if err != nil {
+		return DownloadBatchResponse{}, err
+	}
+	return DownloadBatchResponse{Files: []DownloadFileResponse{aggregate}}, nil
+}
+
+func buildSplitWindows(start int64, end int64, maxBytes int64) []splitWindow {
+	if maxBytes <= 0 || end <= start {
+		return nil
+	}
+	windows := make([]splitWindow, 0, int((end-start+maxBytes-1)/maxBytes))
+	for offset := start; offset < end; {
+		size := min(maxBytes, end-offset)
+		windows = append(windows, splitWindow{
+			start: offset,
+			size:  size,
+			end:   offset + size,
+		})
+		offset += size
+	}
+	return windows
+}
+
+func maxSplitWindowWorkers(windowBytes int64, batchBytes int64, numWindows int) int {
+	if numWindows < 1 || batchBytes <= 0 {
+		return 1
+	}
+	if windowBytes <= 0 {
+		windowBytes = defaultClientRequestWindowBytes
+	}
+	return max(1, min(numWindows, int(windowBytes/batchBytes)))
+}
+
+func (c *Client) downloadSplitWindow(
+	ctx context.Context,
+	req DownloadBatchRequest,
+	plan downloadBatchPlan,
+	window splitWindow,
+	writer io.WriteCloser,
+	syncOutput func() error,
+	emitProgressUpdate func(DownloadProgressUpdate),
+) (splitWindowResult, error) {
+	start := time.Now()
+	reader, meta, err := c.fetchFileWindow(
+		ctx,
+		req.Manifest.TransferID,
+		plan.entry.ID,
+		plan.serverPath,
+		req.AgePublicKey,
+		req.AgeIdentity,
+		window.start,
+		window.size,
+	)
+	if err != nil {
+		if writer != nil {
+			_ = writer.Close()
+		}
+		return splitWindowResult{}, err
+	}
+
+	if writer == nil {
+		writer, syncOutput, err = req.OutputWriter(plan.entry, window.start)
+		if err != nil {
+			_ = reader.Close()
+			return splitWindowResult{}, fmt.Errorf("create output writer for file %d: %w", plan.entry.ID, err)
+		}
+		if writer == nil {
+			_ = reader.Close()
+			return splitWindowResult{}, fmt.Errorf("create output writer for file %d: nil writer", plan.entry.ID)
+		}
+	}
+	if syncOutput == nil {
+		syncOutput = func() error { return nil }
+	}
+
+	writerClosed := false
+	closeWriter := func() error {
+		if writerClosed {
+			return nil
+		}
+		writerClosed = true
+		return writer.Close()
+	}
+
+	frameBuf, releaseFrameBuf := c.acquireFrameReadBuffer(meta.MaxWireSizeHint)
+	defer releaseFrameBuf()
+
+	windowHasher := xxh3.New128()
+	copyErr := copyStreamWithProgress(io.MultiWriter(writer, windowHasher), reader, frameBuf, nil, func(written int64) error {
+		emitProgressUpdate(DownloadProgressUpdate{
+			TransferID:  req.Manifest.TransferID,
+			FileID:      plan.entry.ID,
+			CopiedBytes: window.start + written,
+			TargetBytes: plan.entry.Size,
+			UpdateTime:  time.Now(),
+		})
+		return nil
+	})
+	closeReadErr := reader.Close()
+	if copyErr != nil {
+		_ = closeWriter()
+		return splitWindowResult{}, fmt.Errorf("stream output file: %w", copyErr)
+	}
+	if closeReadErr != nil {
+		_ = closeWriter()
+		return splitWindowResult{}, closeReadErr
+	}
+	if meta.Offset != window.start {
+		_ = closeWriter()
+		return splitWindowResult{}, fmt.Errorf("split window offset mismatch: expected=%d got=%d", window.start, meta.Offset)
+	}
+	if meta.Size != window.size {
+		_ = closeWriter()
+		return splitWindowResult{}, fmt.Errorf("split window size mismatch: expected=%d got=%d", window.size, meta.Size)
+	}
+
+	syncStart := time.Now()
+	if err := syncOutput(); err != nil {
+		_ = closeWriter()
+		return splitWindowResult{}, fmt.Errorf("sync output for file %d: %w", plan.entry.ID, err)
+	}
+	syncMS := time.Since(syncStart).Milliseconds()
+	if err := closeWriter(); err != nil {
+		return splitWindowResult{}, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
+	}
+
+	localHash := intencoding.FormatXXH128HashToken(windowHasher.Sum128())
+	if meta.FileHashToken == "" {
+		return splitWindowResult{}, errors.New("window hash missing from trailer")
+	}
+	if !strings.EqualFold(meta.FileHashToken, localHash) {
+		return splitWindowResult{}, fmt.Errorf("window hash mismatch: server=%s client=%s", meta.FileHashToken, localHash)
+	}
+
+	recvMS := time.Since(start).Milliseconds()
+	return splitWindowResult{
+		window: window,
+		response: DownloadFileResponse{
+			Meta:          *meta,
+			LocalFileHash: localHash,
+		},
+		ack: AcknowledgeFileProgressRequest{
+			TransferID: req.Manifest.TransferID,
+			FileID:     plan.entry.ID,
+			FullPath:   plan.serverPath,
+			AckBytes:   window.end,
+			ServerTS:   meta.TrailerTS,
+			HashToken:  meta.FileHashToken,
+			DeltaBytes: window.size,
+			RecvMS:     recvMS,
+			SyncMS:     syncMS,
+		},
+	}, nil
+}
+
+func aggregateSplitWindowResults(
+	plan downloadBatchPlan,
+	windows []splitWindow,
+	results map[int64]splitWindowResult,
+) (DownloadFileResponse, error) {
+	if len(windows) == 0 {
+		return DownloadFileResponse{}, errors.New("missing split windows")
+	}
+	aggregate := DownloadFileResponse{
+		Meta: FileFrameMeta{
+			FileID: plan.entry.ID,
+			Comp:   "none",
+			Enc:    "none",
+			Offset: plan.resumeFrom,
+		},
+	}
+	for idx, window := range windows {
+		result, ok := results[window.start]
+		if !ok {
+			return DownloadFileResponse{}, fmt.Errorf("missing split window result at offset %d", window.start)
+		}
+		meta := result.response.Meta
+		if meta.HeaderTS > 0 {
+			if aggregate.Meta.HeaderTS == 0 || meta.HeaderTS < aggregate.Meta.HeaderTS {
+				aggregate.Meta.HeaderTS = meta.HeaderTS
+			}
+		}
+		aggregate.Meta.Size += meta.Size
+		aggregate.Meta.WireSize += meta.WireSize
+		if idx == 0 {
+			aggregate.Meta.Comp = meta.Comp
+			aggregate.Meta.Enc = meta.Enc
+		}
+		if len(meta.CompCounts) > 0 {
+			if aggregate.Meta.CompCounts == nil {
+				aggregate.Meta.CompCounts = copyCompCounts(meta.CompCounts)
+			} else {
+				mergeCompCounts(aggregate.Meta.CompCounts, meta.CompCounts)
+			}
+		} else if meta.Comp != "" {
+			if aggregate.Meta.CompCounts == nil {
+				aggregate.Meta.CompCounts = make(map[string]uint64, len(windows))
+			}
+			aggregate.Meta.CompCounts[meta.Comp]++
+		}
+		if idx == len(windows)-1 {
+			aggregate.Meta.TrailerTS = meta.TrailerTS
+			aggregate.Meta.TrailerMetadata = cloneTrailerMetadata(meta.TrailerMetadata)
+		}
+	}
+	if len(aggregate.Meta.CompCounts) == 1 {
+		for comp := range aggregate.Meta.CompCounts {
+			aggregate.Meta.Comp = comp
+		}
+	}
+	aggregate.Meta.FileHashToken = ""
+	aggregate.LocalFileHash = ""
+	return aggregate, nil
+}
+
 func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestRequest) (StartFromManifestResponse, error) {
 	if c == nil {
 		return StartFromManifestResponse{}, errors.New("nil client")
@@ -923,7 +1381,8 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 		}
 	}
 	req.Concurrency = clampConcurrency(req.Concurrency)
-	batches := buildManifestBatchesByBytes(entries, req.BatchMaxBytes)
+	batchMaxBytes := c.effectiveBatchMaxBytes(req.BatchMaxBytes)
+	batches := buildManifestBatchesByBytes(entries, batchMaxBytes)
 	workCh := make(chan []ManifestEntry)
 	errCh := make(chan error, len(entries))
 	var wg sync.WaitGroup
@@ -945,6 +1404,7 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 				Manifest:        req.Manifest,
 				FileIDs:         fileIDs,
 				OutputWriter:    req.OutputWriter,
+				BatchMaxBytes:   batchMaxBytes,
 				AgePublicKey:    req.AgePublicKey,
 				AgeIdentity:     req.AgeIdentity,
 				ProgressUpdates: req.ProgressUpdates,
@@ -995,6 +1455,16 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 	resp.TransferredBytes = transferred.Load()
 	resp.Failed = len(resp.Errors)
 	return resp, nil
+}
+
+func (c *Client) effectiveBatchMaxBytes(reqBatchMaxBytes int64) int64 {
+	if reqBatchMaxBytes > 0 {
+		return reqBatchMaxBytes
+	}
+	if c != nil && c.BatchMaxBytes > 0 {
+		return c.BatchMaxBytes
+	}
+	return int64(defaultClientMaxFrameReadBufferBytes)
 }
 
 func suggestedConcurrencyFromProbe(serverCPU int, strategy string) int {
@@ -1061,16 +1531,10 @@ func summarizeProbeSamples(results []probeResponse, probeBytes int64) ProbeRespo
 	serverCPU := 0
 	for _, result := range results {
 		serverCPU = result.ServerCPU
-		intervalMS := (result.CTS1 - result.CTS0) - (result.STS1 - result.STS0)
-		if intervalMS < 1 {
-			intervalMS = 1
-		}
+		intervalMS := max(int64(1), (result.CTS1-result.CTS0)-(result.STS1-result.STS0))
 		totalIntervalMS += intervalMS
 	}
-	avgMS := totalIntervalMS / int64(len(results))
-	if avgMS <= 0 {
-		avgMS = 1
-	}
+	avgMS := max(int64(1), totalIntervalMS/int64(len(results)))
 	mbps := ((probeBytes * 8 * 1000) / avgMS) / 1_000_000
 	roundedMbps := ((mbps + 50) / 100) * 100
 	return ProbeResponse{
@@ -1091,10 +1555,7 @@ func buildManifestBatchesByBytes(entries []ManifestEntry, maxBytes int64) [][]Ma
 	current := make([]ManifestEntry, 0, 8)
 	var currentBytes int64
 	for _, entry := range entries {
-		size := entry.Size
-		if size < 0 {
-			size = 0
-		}
+		size := max(int64(0), entry.Size)
 		if len(current) > 0 && currentBytes+size > maxBytes {
 			batches = append(batches, current)
 			current = make([]ManifestEntry, 0, 8)
@@ -1207,18 +1668,13 @@ func retryAck(ctx context.Context, fn func(context.Context) error) error {
 	return lastErr
 }
 
-func copyStream(dst io.Writer, src io.Reader, buf []byte, hash *xxh3.Hasher128) error {
-	return copyStreamWithProgress(dst, src, buf, hash, nil)
-}
 
 func copyCompCounts(src map[string]uint64) map[string]uint64 {
 	if len(src) == 0 {
 		return nil
 	}
 	out := make(map[string]uint64, len(src))
-	for k, v := range src {
-		out[k] = v
-	}
+	maps.Copy(out, src)
 	return out
 }
 
@@ -1282,13 +1738,7 @@ func effectiveFrameReadBufferSize(baseSize int, maxWireHint int64, capSize int) 
 			target = int(maxWireHint)
 		}
 	}
-	target = frameReadBucketSize(target)
-	if target < minClientFrameReadBufferBytes {
-		target = minClientFrameReadBufferBytes
-	}
-	if target > capSize {
-		target = capSize
-	}
+	target = max(minClientFrameReadBufferBytes, min(capSize, frameReadBucketSize(target)))
 	return target
 }
 
@@ -1336,16 +1786,22 @@ func (c *Client) acquireFrameReadBuffer(maxWireHint int64) ([]byte, func()) {
 	}
 }
 
-func (c *Client) acquireScratchBuffer() *bytes.Buffer {
+func (c *Client) acquireScratchBuffer(sizeHint int) *bytes.Buffer {
+	if sizeHint <= 0 {
+		sizeHint = defaultClientScratchBufferBytes
+	}
 	if c == nil {
-		return bytes.NewBuffer(make([]byte, 0, defaultClientScratchBufferBytes))
+		return bytes.NewBuffer(make([]byte, 0, sizeHint))
 	}
 	raw := c.scratchBufferPool.Get()
 	if buf, ok := raw.(*bytes.Buffer); ok && buf != nil {
-		buf.Reset()
-		return buf
+		if buf.Cap() >= sizeHint {
+			buf.Reset()
+			return buf
+		}
+		c.releaseScratchBuffer(buf)
 	}
-	return bytes.NewBuffer(make([]byte, 0, defaultClientScratchBufferBytes))
+	return bytes.NewBuffer(make([]byte, 0, sizeHint))
 }
 
 func (c *Client) releaseScratchBuffer(buf *bytes.Buffer) {
@@ -1528,11 +1984,8 @@ func encodePathToken(prev string, current string) string {
 }
 
 func commonPrefixLen(a string, b string) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	for i := 0; i < n; i++ {
+	n := min(len(a), len(b))
+	for i := range n {
 		if a[i] != b[i] {
 			return i
 		}
@@ -1719,21 +2172,6 @@ func parseManifestModeToken(raw string) (os.FileMode, error) {
 	return os.FileMode(v), nil
 }
 
-func parseLenPrefixed(token string) (string, error) {
-	sep := strings.IndexByte(token, ':')
-	if sep <= 0 {
-		return "", errors.New("invalid len-prefixed token")
-	}
-	n, err := strconv.Atoi(token[:sep])
-	if err != nil || n < 0 {
-		return "", errors.New("invalid len prefix")
-	}
-	data := token[sep+1:]
-	if len(data) != n {
-		return "", errors.New("len prefix mismatch")
-	}
-	return data, nil
-}
 
 func parseLenPrefixedPrefix(raw string) (string, int, error) {
 	sep := strings.IndexByte(raw, ':')
@@ -1753,18 +2191,17 @@ func parseLenPrefixedPrefix(raw string) (string, int, error) {
 }
 
 func decodeMtimeToken(prev string, token string) (string, error) {
-	sep := strings.IndexByte(token, ':')
-	if sep < 0 {
+	head, suffix, ok := strings.Cut(token, ":")
+	if !ok {
 		return "", errors.New("invalid mtime token")
 	}
-	prefixLen, err := strconv.Atoi(token[:sep])
+	prefixLen, err := strconv.Atoi(head)
 	if err != nil || prefixLen < 0 {
 		return "", errors.New("invalid mtime prefix length")
 	}
 	if prefixLen > len(prev) {
 		return "", errors.New("mtime prefix length exceeds previous value")
 	}
-	suffix := token[sep+1:]
 	if suffix == "" {
 		return "", errors.New("empty mtime suffix")
 	}
@@ -1812,7 +2249,7 @@ func decodePathToken(prev string, token string) (string, error) {
 
 type fileStream struct {
 	respBody io.Closer
-	br       *bufio.Reader
+	br       frameLineReader
 	identity age.Identity
 
 	meta *FileFrameMeta
@@ -1828,11 +2265,93 @@ type fileStream struct {
 	pendingErr error
 	finished   bool
 	closed     bool
+	pending    *FileFrameMeta
+	releaseBr  func()
 }
 
 type readerWithCloser struct {
 	io.Reader
 	io.Closer
+}
+
+type frameLineReader interface {
+	io.Reader
+	ReadString(delim byte) (string, error)
+}
+
+type pooledLineReader struct {
+	reader io.Reader
+	buf    []byte
+	off    int
+	n      int
+}
+
+func newPooledLineReader(reader io.Reader, buf []byte) *pooledLineReader {
+	if len(buf) == 0 {
+		buf = make([]byte, 4096)
+	}
+	return &pooledLineReader{
+		reader: reader,
+		buf:    buf,
+	}
+}
+
+func (r *pooledLineReader) Read(p []byte) (int, error) {
+	if r == nil {
+		return 0, errors.New("nil pooled line reader")
+	}
+	for {
+		if r.off < r.n {
+			n := copy(p, r.buf[r.off:r.n])
+			r.off += n
+			return n, nil
+		}
+		if err := r.fill(); err != nil {
+			return 0, err
+		}
+	}
+}
+
+func (r *pooledLineReader) fill() error {
+	for {
+		n, err := r.reader.Read(r.buf)
+		if n > 0 {
+			r.off = 0
+			r.n = n
+			return nil
+		}
+		if err != nil {
+			r.off = 0
+			r.n = 0
+			return err
+		}
+	}
+}
+
+func (r *pooledLineReader) ReadString(delim byte) (string, error) {
+	if r == nil {
+		return "", errors.New("nil pooled line reader")
+	}
+	out := make([]byte, 0, 128)
+	for {
+		if r.off >= r.n {
+			if err := r.fill(); err != nil {
+				if err == io.EOF && len(out) > 0 {
+					return string(out), io.EOF
+				}
+				return string(out), err
+			}
+		}
+		chunk := r.buf[r.off:r.n]
+		if idx := bytes.IndexByte(chunk, delim); idx >= 0 {
+			idx++
+			out = append(out, chunk[:idx]...)
+			r.off += idx
+			return string(out), nil
+		}
+		out = append(out, chunk...)
+		r.off = r.n
+	}
 }
 
 func (s *fileStream) LastTrailerTS() int64 {
@@ -1842,18 +2361,46 @@ func (s *fileStream) LastTrailerTS() int64 {
 	return s.meta.TrailerTS
 }
 
-func newFileStream(respBody io.ReadCloser, ageIdentity string) (io.ReadCloser, *FileFrameMeta, error) {
+func (c *Client) fileStreamBufferHint(fileSizeHint int64, firstFrameSize int64) int64 {
+	if fileSizeHint <= 0 {
+		fileSizeHint = firstFrameSize
+	}
+	return int64(effectiveFrameReadBufferSize(c.FrameBufferBytes, fileSizeHint, c.MaxFrameReadBufferBytes))
+}
+
+func (c *Client) newFileStream(respBody io.ReadCloser, ageIdentity string, fileSizeHint int64) (io.ReadCloser, *FileFrameMeta, error) {
 	identity, err := parseAgeIdentity(ageIdentity)
 	if err != nil {
 		return nil, nil, err
 	}
+	probe := bufio.NewReader(respBody)
+	headerLine, err := probe.ReadString('\n')
+	if err != nil {
+		return nil, nil, fmt.Errorf("read frame header: %w", err)
+	}
+	firstMeta, err := parseFXHeader(strings.TrimRight(headerLine, "\r\n"))
+	if err != nil {
+		return nil, nil, err
+	}
+	if firstMeta.Size < 0 || firstMeta.WireSize < 0 {
+		return nil, nil, errors.New("negative frame size")
+	}
+	if firstMeta.Offset < 0 {
+		return nil, nil, errors.New("negative frame offset")
+	}
+
+	bufferHint := c.fileStreamBufferHint(fileSizeHint, firstMeta.Size)
+	readBuf, release := c.acquireFrameReadBuffer(bufferHint)
 	stream := &fileStream{
 		respBody: respBody,
-		br:       bufio.NewReader(respBody),
+		br:       newPooledLineReader(probe, readBuf),
 		identity: identity,
 		meta:     &FileFrameMeta{},
+		pending:  &firstMeta,
+		releaseBr: release,
 	}
 	if err := stream.openNextFrame(); err != nil {
+		release()
 		return nil, nil, err
 	}
 	return stream, stream.meta, nil
@@ -1915,6 +2462,10 @@ func (s *fileStream) Close() error {
 	if s.logical != nil {
 		logicalErr = s.logical.Close()
 	}
+	if s.releaseBr != nil {
+		s.releaseBr()
+		s.releaseBr = nil
+	}
 	bodyErr := s.respBody.Close()
 	if logicalErr != nil {
 		return logicalErr
@@ -1926,33 +2477,39 @@ func (s *fileStream) Close() error {
 }
 
 func (s *fileStream) openNextFrame() error {
-	headerLine, err := s.br.ReadString('\n')
-	if err != nil {
-		if errors.Is(err, io.EOF) && headerLine == "" {
-			if s.expectNextFrame {
-				return errors.New("missing next frame after trailer next offset")
+	var meta FileFrameMeta
+	if s.pending != nil {
+		meta = *s.pending
+		s.pending = nil
+	} else {
+		headerLine, err := s.br.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) && headerLine == "" {
+				if s.expectNextFrame {
+					return errors.New("missing next frame after trailer next offset")
+				}
+				return io.EOF
 			}
-			return io.EOF
+			return fmt.Errorf("read frame header: %w", err)
 		}
-		return fmt.Errorf("read frame header: %w", err)
-	}
-	trimmedHeader := strings.TrimRight(headerLine, "\r\n")
-	if s.expectOffset && !s.expectNextFrame && isStatusLine(trimmedHeader) {
-		if err := parseErrControlFrame(trimmedHeader); err != nil {
+		trimmedHeader := strings.TrimRight(headerLine, "\r\n")
+		if s.expectOffset && !s.expectNextFrame && isStatusLine(trimmedHeader) {
+			if err := parseErrControlFrame(trimmedHeader); err != nil {
+				return err
+			}
+			if _, ok := parseOKStatusLine(trimmedHeader); ok {
+				return io.EOF
+			}
+			return errors.New("unexpected terminal status line")
+		}
+		if s.expectOffset && !s.expectNextFrame {
+			return errors.New("unexpected extra frame after terminal trailer")
+		}
+
+		meta, err = parseFXHeader(trimmedHeader)
+		if err != nil {
 			return err
 		}
-		if _, ok := parseOKStatusLine(trimmedHeader); ok {
-			return io.EOF
-		}
-		return errors.New("unexpected terminal status line")
-	}
-	if s.expectOffset && !s.expectNextFrame {
-		return errors.New("unexpected extra frame after terminal trailer")
-	}
-
-	meta, err := parseFXHeader(trimmedHeader)
-	if err != nil {
-		return err
 	}
 	if meta.Size < 0 || meta.WireSize < 0 {
 		return errors.New("negative frame size")
@@ -2153,22 +2710,17 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 	}
 	hasMeta := false
 	for _, token := range fields[2:] {
-		if strings.HasPrefix(token, "status=") {
-			status = strings.TrimPrefix(token, "status=")
-		}
-		if strings.HasPrefix(token, "ts=") {
-			tsRaw := strings.TrimPrefix(token, "ts=")
+		if val, ok := strings.CutPrefix(token, "status="); ok {
+			status = val
+		} else if tsRaw, ok := strings.CutPrefix(token, "ts="); ok {
 			parsedTS, parseErr := strconv.ParseInt(tsRaw, 10, 64)
 			if parseErr != nil || parsedTS < 0 {
 				return frameTrailer{}, errors.New("invalid trailer ts")
 			}
 			ts = parsedTS
-		}
-		if strings.HasPrefix(token, "file-hash=") {
-			fileHashToken = strings.TrimPrefix(token, "file-hash=")
-		}
-		if strings.HasPrefix(token, "next=") {
-			nextRaw := strings.TrimPrefix(token, "next=")
+		} else if val, ok := strings.CutPrefix(token, "file-hash="); ok {
+			fileHashToken = val
+		} else if nextRaw, ok := strings.CutPrefix(token, "next="); ok {
 			nextValue, parseErr := strconv.ParseInt(nextRaw, 10, 64)
 			if parseErr != nil || nextValue < 0 {
 				return frameTrailer{}, errors.New("invalid trailer next offset")

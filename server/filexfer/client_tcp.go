@@ -225,7 +225,7 @@ func (c *Client) sendTCPAuth(conn net.Conn, state tcpAuthState) error {
 		if err != nil {
 			return err
 		}
-		encrypted := c.acquireScratchBuffer()
+		encrypted := c.acquireScratchBuffer(0)
 		defer c.releaseScratchBuffer(encrypted)
 		ew, err := age.Encrypt(encrypted, recipient)
 		if err != nil {
@@ -312,7 +312,7 @@ func (c *Client) fetchManifestTCP(ctx context.Context, request FetchManifestRequ
 	}
 	br := bufio.NewReader(responseReader)
 
-	raw := c.acquireScratchBuffer()
+	raw := c.acquireScratchBuffer(maxTCPLineBytes)
 	defer c.releaseScratchBuffer(raw)
 	for {
 		line, err := readTCPLine(br, maxTCPLineBytes)
@@ -417,7 +417,7 @@ func (c *Client) fetchFileWindowTCP(
 	}
 
 	prefixed := io.MultiReader(strings.NewReader(firstLine), br)
-	stream, meta, streamErr := newFileStream(&readerWithCloser{Reader: prefixed, Closer: conn}, "")
+	stream, meta, streamErr := c.newFileStream(&readerWithCloser{Reader: prefixed, Closer: conn}, "", effectiveSize)
 	if streamErr != nil {
 		conn.Close()
 		return nil, nil, streamErr

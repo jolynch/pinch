@@ -377,6 +377,51 @@ func TestAcknowledgeTransferFileMissing(t *testing.T) {
 	}
 }
 
+func TestWindowHashesTrackedPerEndOffset(t *testing.T) {
+	resetTransferStore()
+
+	transfer, err := NewTransfer("/tmp/x", 1, 10)
+	if err != nil {
+		t.Fatalf("NewTransfer failed: %v", err)
+	}
+	updates := []TransferFileStateUpdate{
+		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/x/0")), FileSize: 10},
+	}
+	RegisterTransferFileStates(transfer.ID, updates, TransferStateRunning)
+
+	token4 := "xxh128:00000000000000000000000000000004"
+	token8 := "xxh128:00000000000000000000000000000008"
+	if ok := SetTransferFileWindowHash(transfer.ID, 0, 4, token4); !ok {
+		t.Fatalf("SetTransferFileWindowHash returned false for end=4")
+	}
+	if ok := SetTransferFileWindowHash(transfer.ID, 0, 8, token8); !ok {
+		t.Fatalf("SetTransferFileWindowHash returned false for end=8")
+	}
+	if !VerifyTransferFileWindowHash(transfer.ID, 0, 4, token4) {
+		t.Fatalf("expected window hash verification for end=4")
+	}
+	if !VerifyTransferFileWindowHash(transfer.ID, 0, 8, token8) {
+		t.Fatalf("expected window hash verification for end=8")
+	}
+
+	if ok := AcknowledgeTransferFile(transfer.ID, 0, 4); !ok {
+		t.Fatalf("AcknowledgeTransferFile returned false for end=4")
+	}
+	if VerifyTransferFileWindowHash(transfer.ID, 0, 4, token4) {
+		t.Fatalf("expected end=4 window hash to be cleared after ack")
+	}
+	if !VerifyTransferFileWindowHash(transfer.ID, 0, 8, token8) {
+		t.Fatalf("expected end=8 window hash to remain after end=4 ack")
+	}
+
+	if ok := AcknowledgeTransferFile(transfer.ID, 0, 8); !ok {
+		t.Fatalf("AcknowledgeTransferFile returned false for end=8")
+	}
+	if VerifyTransferFileWindowHash(transfer.ID, 0, 8, token8) {
+		t.Fatalf("expected end=8 window hash to be cleared after ack")
+	}
+}
+
 func setupLookupFixture(t *testing.T, fileName string, content []byte) (string, string) {
 	t.Helper()
 	root := t.TempDir()

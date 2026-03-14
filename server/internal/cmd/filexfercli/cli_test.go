@@ -231,7 +231,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	outRoot := filepath.Join(tmp, "out")
-	code = RunCLI([]string{srv.URL, "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-A", "1KiB"}, &stdout, &stderr)
+	code = RunCLI([]string{srv.URL, "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-a", "1KiB"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -297,7 +297,7 @@ func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--tid", "txresume", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-A", "1KiB"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "get", "--tid", "txresume", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-a", "1KiB"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get resume: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -308,8 +308,47 @@ func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read resumed output: %v", err)
 	}
-	if string(got) != "helloworld" {
+	if string(got) != "helloworldTAIL" {
 		t.Fatalf("unexpected resumed output: %q", got)
+	}
+}
+
+func TestRunCLIGetRejectsResumeToStdout(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txstdout.fm2")
+	manifestRaw := strings.Join([]string{
+		"FM/2 txstdout 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"0 10 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := os.WriteFile(manifestPath+".progress", []byte("0 5 0\n"), 0o644); err != nil {
+		t.Fatalf("write progress: %v", err)
+	}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrame(0, []byte("world"), 5))
+			return err
+		case intftcp.VerbACK:
+			return fmt.Errorf("unexpected ACK for stdout resume rejection")
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "get", "--tid", "txstdout", "--fd", "0", "--manifest", manifestPath, "-o", "-", "-a", "1KiB"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("get stdout resume: expected 1, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "cannot resume when output is stdout") {
+		t.Fatalf("expected stdout resume error, got: %s", stderr.String())
 	}
 }
 
@@ -344,7 +383,7 @@ func TestRunCLIGetOutRootDevNullDiscardsOutput(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--tid", "txdevnull", "--fd", "0", "--manifest", manifestPath, "--out-root", os.DevNull, "-A", "1KiB"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "get", "--tid", "txdevnull", "--fd", "0", "--manifest", manifestPath, "--out-root", os.DevNull, "-a", "1KiB"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get devnull: expected 0, got %d stderr=%s", code, stderr.String())
 	}

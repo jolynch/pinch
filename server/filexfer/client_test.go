@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -364,7 +365,7 @@ func downloadSingle(ctx context.Context, client *Client, req singleDownloadReque
 	resp, err := client.DownloadFilesFromManifestBatch(ctx, DownloadBatchRequest{
 		Manifest: req.Manifest,
 		FileIDs:  []uint64{req.FileID},
-		OutputWriter: func(entry ManifestEntry) (io.WriteCloser, func() error, error) {
+		OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := strings.TrimSpace(req.OutFile)
 			if destPath == "" {
 				outRoot := req.OutRoot
@@ -374,7 +375,7 @@ func downloadSingle(ctx context.Context, client *Client, req singleDownloadReque
 				destPath = filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
 			}
 			if destPath == "-" {
-				if entry.Progress.AckBytes > 0 {
+				if offset > 0 {
 					return nil, nil, errors.New("cannot resume when output is stdout")
 				}
 				out := req.Stdout
@@ -386,16 +387,15 @@ func downloadSingle(ctx context.Context, client *Client, req singleDownloadReque
 			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 				return nil, nil, fmt.Errorf("create output parent directory: %w", err)
 			}
-			resumeFrom := entry.Progress.AckBytes
 			var (
 				fd  *os.File
 				err error
 			)
-			if resumeFrom > 0 {
+			if offset > 0 {
 				fd, err = os.OpenFile(destPath, os.O_RDWR, 0)
 				if err != nil {
 					if errors.Is(err, os.ErrNotExist) {
-						return nil, nil, fmt.Errorf("resume requested at offset %d but output file is missing", resumeFrom)
+						return nil, nil, fmt.Errorf("resume requested at offset %d but output file is missing", offset)
 					}
 					return nil, nil, fmt.Errorf("open output file for resume: %w", err)
 				}
@@ -404,15 +404,11 @@ func downloadSingle(ctx context.Context, client *Client, req singleDownloadReque
 					_ = fd.Close()
 					return nil, nil, fmt.Errorf("stat output file for resume: %w", statErr)
 				}
-				if info.Size() < resumeFrom {
+				if info.Size() < offset {
 					_ = fd.Close()
-					return nil, nil, fmt.Errorf("resume requested at offset %d but output file has only %d bytes", resumeFrom, info.Size())
+					return nil, nil, fmt.Errorf("resume requested at offset %d but output file has only %d bytes", offset, info.Size())
 				}
-				if err := fd.Truncate(resumeFrom); err != nil {
-					_ = fd.Close()
-					return nil, nil, fmt.Errorf("truncate output file for resume: %w", err)
-				}
-				if _, err := fd.Seek(resumeFrom, io.SeekStart); err != nil {
+				if _, err := fd.Seek(offset, io.SeekStart); err != nil {
 					_ = fd.Close()
 					return nil, nil, fmt.Errorf("seek output file for resume: %w", err)
 				}
@@ -529,6 +525,72 @@ func TestEffectiveFrameReadBufferSize(t *testing.T) {
 				t.Fatalf("effectiveFrameReadBufferSize(%d,%d,%d)=%d want=%d", tc.base, tc.hint, tc.cap, got, tc.expected)
 			}
 		})
+	}
+}
+
+func TestFileStreamBufferHint(t *testing.T) {
+	client := NewClient(
+		"127.0.0.1:3453",
+		WithFrameBufferBytes(4*1024*1024),
+		WithMaxFrameReadBufferBytes(32*1024*1024),
+	)
+
+	if got := client.fileStreamBufferHint(64*1024*1024, 2*1024*1024); got != int64(effectiveFrameReadBufferSize(4*1024*1024, 64*1024*1024, 32*1024*1024)) {
+		t.Fatalf("expected file-size hint to win, got=%d want=%d", got, effectiveFrameReadBufferSize(4*1024*1024, 64*1024*1024, 32*1024*1024))
+	}
+
+	if got := client.fileStreamBufferHint(0, 2*1024*1024); got != int64(effectiveFrameReadBufferSize(4*1024*1024, 2*1024*1024, 32*1024*1024)) {
+		t.Fatalf("expected frame-size fallback, got=%d want=%d", got, effectiveFrameReadBufferSize(4*1024*1024, 2*1024*1024, 32*1024*1024))
+	}
+
+	if got := client.fileStreamBufferHint(0, 0); got != int64(effectiveFrameReadBufferSize(4*1024*1024, 0, 32*1024*1024)) {
+		t.Fatalf("expected default behavior when no hint, got=%d want=%d", got, effectiveFrameReadBufferSize(4*1024*1024, 0, 32*1024*1024))
+	}
+
+	client = NewClient(
+		"127.0.0.1:3453",
+		WithFrameBufferBytes(0),
+		WithMaxFrameReadBufferBytes(1),
+	)
+	if got := client.fileStreamBufferHint(0, 4*1024*1024); got != int64(effectiveFrameReadBufferSize(0, 4*1024*1024, 1)) {
+		t.Fatalf("expected clamp via effective policy, got=%d want=%d", got, effectiveFrameReadBufferSize(0, 4*1024*1024, 1))
+	}
+}
+
+func TestFetchFileWindowHonorsSizeHint(t *testing.T) {
+	logical := []byte("hello")
+	frame := buildFXFrame(t, 7, "none", 0, logical, nil)
+	expectedSize := int64(len(logical))
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbSEND {
+			return fmt.Errorf("expected SEND, got %v", req.Verb)
+		}
+		if len(req.Params) < 2 || req.Params[1]["size"] != strconv.FormatInt(expectedSize, 10) {
+			return fmt.Errorf("expected size=%d, got %q", expectedSize, req.Params[1]["size"])
+		}
+		_, err := io.WriteString(out, frame)
+		return err
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	stream, meta, err := client.fetchFileWindow(context.Background(), "tx", 7, "/root/a.txt", "", "", 0, expectedSize)
+	if err != nil {
+		t.Fatalf("fetchFileWindow failed: %v", err)
+	}
+	body, err := readAndClose(t, stream)
+	if err != nil {
+		t.Fatalf("read stream failed: %v", err)
+	}
+	if !bytes.Equal(body, logical) {
+		t.Fatalf("unexpected body: %q", body)
+	}
+	if meta.FileID != 7 {
+		t.Fatalf("unexpected file id: %d", meta.FileID)
+	}
+	if meta.Size != expectedSize {
+		t.Fatalf("unexpected logical size: %d", meta.Size)
 	}
 }
 
@@ -1340,7 +1402,7 @@ func TestDownloadFileFromManifestUsesSingleBatchACK(t *testing.T) {
 	}
 }
 
-func TestDownloadFileFromManifestResumesFromOffsetAndTruncatesTail(t *testing.T) {
+func TestDownloadFileFromManifestResumesFromOffsetWithoutTruncatingTail(t *testing.T) {
 	outRoot := t.TempDir()
 	manifest := &Manifest{
 		TransferID: "txresume",
@@ -1409,8 +1471,189 @@ func TestDownloadFileFromManifestResumesFromOffsetAndTruncatesTail(t *testing.T)
 	if err != nil {
 		t.Fatalf("read resumed output: %v", err)
 	}
-	if string(got) != "helloworld" {
+	if string(got) != "helloworldTAIL" {
 		t.Fatalf("unexpected resumed output: %q", got)
+	}
+}
+
+func TestDownloadFilesFromManifestBatchSplitsLargeSingleFileWindows(t *testing.T) {
+	outRoot := t.TempDir()
+	destPath := filepath.Join(outRoot, "big.bin")
+	if err := os.WriteFile(destPath, nil, 0o644); err != nil {
+		t.Fatalf("create destination: %v", err)
+	}
+
+	manifest := &Manifest{
+		TransferID: "txsplit",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 10, Path: "big.bin"},
+		},
+	}
+	payload := []byte("abcdefghij")
+
+	var (
+		mu            sync.Mutex
+		sendOffsets   []int64
+		sendSizes     []int64
+		writerOffsets []int64
+		ackBytes      []int64
+	)
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			sendParam := req.Params[len(req.Params)-1]
+			offset := int64(0)
+			if rawOffset := sendParam["offset"]; rawOffset != "" {
+				parsedOffset, err := strconv.ParseInt(rawOffset, 10, 64)
+				if err != nil {
+					return fmt.Errorf("parse offset: %w", err)
+				}
+				offset = parsedOffset
+			}
+			size, err := strconv.ParseInt(sendParam["size"], 10, 64)
+			if err != nil {
+				return fmt.Errorf("parse size: %w", err)
+			}
+			mu.Lock()
+			sendOffsets = append(sendOffsets, offset)
+			sendSizes = append(sendSizes, size)
+			mu.Unlock()
+			if offset == 0 {
+				time.Sleep(200 * time.Millisecond)
+			}
+			_, err = io.WriteString(out, buildFXFrame(t, 0, "none", offset, payload[offset:offset+size], nil))
+			return err
+		case intftcp.VerbACK:
+			mu.Lock()
+			for _, item := range req.Params {
+				rawAck := item["ack-token"]
+				ackPrefix, _, ok := strings.Cut(rawAck, "@")
+				if !ok {
+					mu.Unlock()
+					return fmt.Errorf("malformed ack-token: %q", rawAck)
+				}
+				ackByte, err := strconv.ParseInt(ackPrefix, 10, 64)
+				if err != nil {
+					mu.Unlock()
+					return fmt.Errorf("parse ack-token prefix: %w", err)
+				}
+				ackBytes = append(ackBytes, ackByte)
+			}
+			mu.Unlock()
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL, WithFileRequestWindowBytes(12))
+	progressUpdates := make(chan DownloadProgressUpdate, 32)
+
+	done := make(chan struct{})
+	var (
+		resp DownloadBatchResponse
+		err  error
+	)
+	go func() {
+		defer close(done)
+		resp, err = client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+			Manifest:      manifest,
+			FileIDs:       []uint64{0},
+			BatchMaxBytes: 4,
+			OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
+				mu.Lock()
+				writerOffsets = append(writerOffsets, offset)
+				mu.Unlock()
+				fd, err := os.OpenFile(destPath, os.O_RDWR|os.O_CREATE, 0o644)
+				if err != nil {
+					return nil, nil, err
+				}
+				if _, err := fd.Seek(offset, io.SeekStart); err != nil {
+					_ = fd.Close()
+					return nil, nil, err
+				}
+				return fd, func() error { return nil }, nil
+			},
+			ProgressUpdates: progressUpdates,
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for split download completion")
+	}
+
+	if err != nil {
+		t.Fatalf("DownloadFilesFromManifestBatch failed: %v", err)
+	}
+	if len(resp.Files) != 1 {
+		t.Fatalf("expected one aggregated file result, got %d", len(resp.Files))
+	}
+	if resp.Files[0].Meta.Size != int64(len(payload)) {
+		t.Fatalf("unexpected aggregated size: %d", resp.Files[0].Meta.Size)
+	}
+	if resp.Files[0].Meta.FileHashToken != "" || resp.Files[0].LocalFileHash != "" {
+		t.Fatalf("expected split aggregate hashes to be cleared, got meta=%q local=%q", resp.Files[0].Meta.FileHashToken, resp.Files[0].LocalFileHash)
+	}
+
+	got, readErr := os.ReadFile(destPath)
+	if readErr != nil {
+		t.Fatalf("read output: %v", readErr)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("unexpected split output: %q", got)
+	}
+
+	mu.Lock()
+	sendByOffset := make(map[int64]int64, len(sendOffsets))
+	for i := range sendOffsets {
+		sendByOffset[sendOffsets[i]] = sendSizes[i]
+	}
+	gotSendOffsets := append([]int64(nil), sendOffsets...)
+	gotWriterOffsets := append([]int64(nil), writerOffsets...)
+	gotAckBytes := append([]int64(nil), ackBytes...)
+	mu.Unlock()
+	sort.Slice(gotSendOffsets, func(i, j int) bool { return gotSendOffsets[i] < gotSendOffsets[j] })
+	sort.Slice(gotWriterOffsets, func(i, j int) bool { return gotWriterOffsets[i] < gotWriterOffsets[j] })
+
+	expectedOffsets := []int64{0, 4, 8}
+	if fmt.Sprint(gotSendOffsets) != fmt.Sprint(expectedOffsets) {
+		t.Fatalf("unexpected split offsets: got=%v want=%v", gotSendOffsets, expectedOffsets)
+	}
+	for _, offset := range expectedOffsets {
+		expectedSize := int64(4)
+		if offset == 8 {
+			expectedSize = 2
+		}
+		if got := sendByOffset[offset]; got != expectedSize {
+			t.Fatalf("unexpected split size at offset %d: got=%d want=%d", offset, got, expectedSize)
+		}
+	}
+	if fmt.Sprint(gotWriterOffsets) != fmt.Sprint(expectedOffsets) {
+		t.Fatalf("unexpected writer offsets: got=%v want=%v", gotWriterOffsets, expectedOffsets)
+	}
+	if fmt.Sprint(gotAckBytes) != fmt.Sprint([]int64{4, 8, 10}) {
+		t.Fatalf("unexpected split ack bytes: %v", gotAckBytes)
+	}
+
+	var lastAck int64
+	for {
+		select {
+		case update := <-progressUpdates:
+			if update.AckBytes > lastAck {
+				lastAck = update.AckBytes
+			}
+		default:
+			if lastAck != 10 {
+				t.Fatalf("unexpected final ack progress: %d", lastAck)
+			}
+			return
+		}
 	}
 }
 
@@ -1474,7 +1717,7 @@ func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
 	resp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
 		Manifest: manifest,
 		FileIDs:  []uint64{0, 1},
-		OutputWriter: func(entry ManifestEntry) (io.WriteCloser, func() error, error) {
+		OutputWriter: func(entry ManifestEntry, _ int64) (io.WriteCloser, func() error, error) {
 			destPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
 			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 				return nil, nil, err
@@ -1597,7 +1840,7 @@ func TestStartFromManifestNoLongerProbes(t *testing.T) {
 	client := NewClient(srv.URL, WithLoadStrategy(LoadStrategyGentle))
 	resp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
 		Manifest: manifest,
-		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+		OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
 			return noOpWriteCloser{Writer: io.Discard}, func() error { return nil }, nil
 		},
 		BatchMaxBytes: 1024,
@@ -1643,7 +1886,7 @@ func TestStartFromManifestRespectsExplicitConcurrency(t *testing.T) {
 	client := NewClient(srv.URL)
 	resp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
 		Manifest: manifest,
-		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+		OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
 			return noOpWriteCloser{Writer: io.Discard}, func() error { return nil }, nil
 		},
 		BatchMaxBytes: 1024,
@@ -1840,7 +2083,7 @@ func TestDownloadFilesFromManifestBatchRejectsNilWriterFromCallback(t *testing.T
 	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
 		Manifest: manifest,
 		FileIDs:  []uint64{0},
-		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+		OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
 			return nil, nil, nil
 		},
 	})
@@ -1877,7 +2120,7 @@ func TestDownloadFilesFromManifestBatchPropagatesSyncError(t *testing.T) {
 	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
 		Manifest: manifest,
 		FileIDs:  []uint64{0},
-		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+		OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
 			return noOpWriteCloser{Writer: io.Discard}, func() error { return errors.New("sync blew up") }, nil
 		},
 	})
@@ -1917,7 +2160,7 @@ func TestDownloadFilesFromManifestBatchPropagatesCloseError(t *testing.T) {
 	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
 		Manifest: manifest,
 		FileIDs:  []uint64{0},
-		OutputWriter: func(ManifestEntry) (io.WriteCloser, func() error, error) {
+		OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
 			return errCloseWriter{Writer: io.Discard, err: errors.New("close failed")}, func() error { return nil }, nil
 		},
 	})

@@ -17,7 +17,7 @@ const (
 
 const (
 	emaAlpha             = 0.80
-	hystStreak           = 4
+	hystStreak           = 2
 	downRatioCut         = 0.90
 	downReadOverWriteCut = 1.10
 	upReadOverWriteCut   = 0.20

@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
@@ -111,12 +110,11 @@ type fileHashState struct {
 type windowHashKey struct {
 	txferID string
 	fileID  uint64
+	endBytes int64
 }
 
 type windowHashState struct {
 	hashToken string
-	endBytes  int64
-	ackedUpTo atomic.Int64 // CAS-advanced; entry deleted when ackedUpTo >= endBytes
 	expiresAt time.Time
 }
 
@@ -561,20 +559,9 @@ func (s *transferStore) acknowledgeFileLocked(txferID string, fileID uint64, ack
 
 	s.transfers[txferID] = transfer
 
-	wKey := windowHashKey{txferID: txferID, fileID: fileID}
-	if ws, exists := s.windowHashes[wKey]; exists {
-		for {
-			cur := ws.ackedUpTo.Load()
-			if target <= cur {
-				break
-			}
-			if ws.ackedUpTo.CompareAndSwap(cur, target) {
-				break
-			}
-		}
-		if ws.ackedUpTo.Load() >= ws.endBytes {
-			delete(s.windowHashes, wKey)
-		}
+	wKey := windowHashKey{txferID: txferID, fileID: fileID, endBytes: target}
+	if _, exists := s.windowHashes[wKey]; exists {
+		delete(s.windowHashes, wKey)
 	}
 	return true
 }
@@ -660,10 +647,9 @@ func (s *transferStore) setWindowHashToken(txferID string, fileID uint64, endByt
 	if !validHashToken(token) {
 		return false
 	}
-	key := windowHashKey{txferID: txferID, fileID: fileID}
+	key := windowHashKey{txferID: txferID, fileID: fileID, endBytes: endBytes}
 	ws := &windowHashState{
 		hashToken: normalizeHashToken(token),
-		endBytes:  endBytes,
 		expiresAt: time.Now().Add(ttl),
 	}
 	s.windowHashes[key] = ws
@@ -677,9 +663,9 @@ func (s *transferStore) verifyWindowHashToken(txferID string, fileID uint64, end
 	if endBytes < 0 {
 		return false
 	}
-	key := windowHashKey{txferID: txferID, fileID: fileID}
+	key := windowHashKey{txferID: txferID, fileID: fileID, endBytes: endBytes}
 	ws, ok := s.windowHashes[key]
-	if !ok || ws.endBytes != endBytes {
+	if !ok {
 		return false
 	}
 	return ws.hashToken == normalizeHashToken(token)
