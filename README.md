@@ -3,7 +3,7 @@ Pinch
 Associated blog post: [Use Fast Data Algorithms](https://jolynch.github.io/posts/use_fast_data_algorithms/).
 
 A toolkit for rapidly compressing, hashing and otherwise making data smaller
-when you can't neccesarily install software (e.g. CI/CD envionments) but you
+when you can't necessarily install software (e.g. CI/CD environments) but you
 can run docker containers. The resulting `pinch` container container takes up
 about `15MiB` of disk space and contains multiple excellent compression/hashing
 utilities from [Yann Collet](https://github.com/Cyan4973) in addition to a few
@@ -11,8 +11,8 @@ other tools.
 
 * [zstd](https://github.com/facebook/zstd) v1.4.9 for great compression
 * [lz4](https://github.com/lz4/lz4) v1.9.3 for very fast compression
-* [xxHash](https://github.com/facebook/zstd) v0.8.0 for ridculously fast hashing
-* [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) v0.3.7 for ridculously fast cryptographic hashing
+* [xxHash](https://github.com/facebook/zstd) v0.8.0 for ridiculously fast hashing
+* [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) v0.3.7 for ridiculously fast cryptographic hashing
 * [age](https://github.com/FiloSottile/age) v0.3.7 for reasonably fast encryption/decryption
 
 Note that licenses of these tools are included in the
