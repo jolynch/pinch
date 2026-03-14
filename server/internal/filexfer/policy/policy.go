@@ -3,7 +3,7 @@ package policy
 import (
 	"time"
 
-	"github.com/jolynch/pinch/internal/filexfer/codec"
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
 )
 
 type CompressionMode uint8
@@ -20,7 +20,7 @@ const (
 	hystStreak           = 2
 	downRatioCut         = 0.90
 	downReadOverWriteCut = 1.10
-	upReadOverWriteCut   = 0.25
+	upReadOverWriteCut   = 0.10
 )
 
 type CompressionMetrics struct {
@@ -167,11 +167,11 @@ func CompressionModeFromStored(raw uint8) CompressionMode {
 func FrameCompTokenForMode(mode CompressionMode) string {
 	switch mode {
 	case CompressionModeLz4:
-		return codec.EncodingLz4
+		return encoding.EncodingLz4
 	case CompressionModeNone:
 		return "none"
 	default:
-		return codec.EncodingZstd
+		return encoding.EncodingZstd
 	}
 }
 

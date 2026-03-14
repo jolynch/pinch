@@ -3,7 +3,6 @@ package store
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jolynch/pinch/internal/filexfer/codec"
+	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/jolynch/pinch/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 )
@@ -39,6 +38,9 @@ const (
 type Transfer struct {
 	ID        string
 	Directory string
+	Mode      string
+	LinkMbps  int64
+	Concurrency int
 	NumFiles  int
 	TotalSize int64
 	Done      uint64
@@ -83,9 +85,10 @@ func (e *FileLookupError) Error() string {
 }
 
 type transferStore struct {
-	mu         sync.RWMutex
-	transfers  map[string]Transfer
-	fileHashes map[fileHashKey]fileHashState
+	mu           sync.RWMutex
+	transfers    map[string]Transfer
+	fileHashes   map[fileHashKey]fileHashState
+	windowHashes map[windowHashKey]*windowHashState
 }
 
 type fileHashKey struct {
@@ -104,6 +107,24 @@ type fileHashState struct {
 	expiresAt     time.Time
 }
 
+type windowHashKey struct {
+	txferID string
+	fileID  uint64
+	endBytes int64
+}
+
+type windowHashState struct {
+	hashToken string
+	expiresAt time.Time
+}
+
+// AckEntry is a single (transfer, file, ackBytes) tuple for batch acknowledgement.
+type AckEntry struct {
+	TxferID  string
+	FileID   uint64
+	AckBytes int64
+}
+
 var (
 	ttl     = defaultTransferTTL
 	manager = newTransferStore()
@@ -115,8 +136,9 @@ func init() {
 
 func newTransferStore() *transferStore {
 	return &transferStore{
-		transfers:  make(map[string]Transfer),
-		fileHashes: make(map[fileHashKey]fileHashState),
+		transfers:    make(map[string]Transfer),
+		fileHashes:   make(map[fileHashKey]fileHashState),
+		windowHashes: make(map[windowHashKey]*windowHashState),
 	}
 }
 
@@ -146,6 +168,21 @@ func (s *transferStore) setState(txferID string, state uint8) bool {
 			transfer.State[i] = state
 		}
 	}
+	s.transfers[txferID] = transfer
+	return true
+}
+
+func (s *transferStore) setTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	transfer, ok := s.transfers[txferID]
+	if !ok {
+		return false
+	}
+	transfer.Mode = strings.ToLower(strings.TrimSpace(mode))
+	transfer.LinkMbps = linkMbps
+	transfer.Concurrency = concurrency
 	s.transfers[txferID] = transfer
 	return true
 }
@@ -324,6 +361,11 @@ func (s *transferStore) delete(txferID string) bool {
 			delete(s.fileHashes, key)
 		}
 	}
+	for key := range s.windowHashes {
+		if key.txferID == txferID {
+			delete(s.windowHashes, key)
+		}
+	}
 	return true
 }
 
@@ -402,6 +444,7 @@ func (s *transferStore) resetForTest() {
 	s.mu.Lock()
 	s.transfers = make(map[string]Transfer)
 	s.fileHashes = make(map[fileHashKey]fileHashState)
+	s.windowHashes = make(map[windowHashKey]*windowHashState)
 	s.mu.Unlock()
 }
 
@@ -445,10 +488,19 @@ func (s *transferStore) setFileState(txferID string, fileID uint64, state uint8)
 	return true
 }
 
-func (s *transferStore) acknowledgeFile(txferID string, fileID uint64, ackBytes int64) bool {
+func (s *transferStore) acknowledgeFiles(entries []AckEntry) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	ok := true
+	for _, e := range entries {
+		if !s.acknowledgeFileLocked(e.TxferID, e.FileID, e.AckBytes) {
+			ok = false
+		}
+	}
+	return ok
+}
 
+func (s *transferStore) acknowledgeFileLocked(txferID string, fileID uint64, ackBytes int64) bool {
 	transfer, ok := s.transfers[txferID]
 	if !ok {
 		return false
@@ -506,6 +558,9 @@ func (s *transferStore) acknowledgeFile(txferID string, fileID uint64, ackBytes 
 	}
 
 	s.transfers[txferID] = transfer
+
+	wKey := windowHashKey{txferID: txferID, fileID: fileID, endBytes: target}
+	delete(s.windowHashes, wKey)
 	return true
 }
 
@@ -550,8 +605,68 @@ func (s *transferStore) reapExpiredLoop() {
 				delete(s.fileHashes, key)
 			}
 		}
+		for key, ws := range s.windowHashes {
+			if !ws.expiresAt.After(now) {
+				delete(s.windowHashes, key)
+				continue
+			}
+			if _, ok := s.transfers[key.txferID]; !ok {
+				delete(s.windowHashes, key)
+			}
+		}
 		s.mu.Unlock()
 	}
+}
+
+func validHashToken(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	parts := strings.SplitN(raw, ":", 2)
+	return len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
+}
+
+func normalizeHashToken(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+func (s *transferStore) setWindowHashToken(txferID string, fileID uint64, endBytes int64, token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	transfer, ok := s.transfers[txferID]
+	if !ok {
+		return false
+	}
+	if fileID >= uint64(len(transfer.State)) || endBytes < 0 {
+		return false
+	}
+	if !validHashToken(token) {
+		return false
+	}
+	key := windowHashKey{txferID: txferID, fileID: fileID, endBytes: endBytes}
+	ws := &windowHashState{
+		hashToken: normalizeHashToken(token),
+		expiresAt: time.Now().Add(ttl),
+	}
+	s.windowHashes[key] = ws
+	return true
+}
+
+func (s *transferStore) verifyWindowHashToken(txferID string, fileID uint64, endBytes int64, token string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if endBytes < 0 {
+		return false
+	}
+	key := windowHashKey{txferID: txferID, fileID: fileID, endBytes: endBytes}
+	ws, ok := s.windowHashes[key]
+	if !ok {
+		return false
+	}
+	return ws.hashToken == normalizeHashToken(token)
 }
 
 func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
@@ -564,6 +679,9 @@ func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, err
 		transfer := Transfer{
 			ID:        txferID,
 			Directory: directory,
+			Mode:      "",
+			LinkMbps:  0,
+			Concurrency: 0,
 			NumFiles:  numFiles,
 			TotalSize: totalSize,
 			Done:      0,
@@ -631,6 +749,10 @@ func GetTransfer(txferID string) (Transfer, bool) {
 	return manager.get(txferID)
 }
 
+func SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
+	return manager.setTransferHints(txferID, mode, linkMbps, concurrency)
+}
+
 func GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
 	return manager.resolveFileRef(txferID, fileID, fullPathRaw)
 }
@@ -650,24 +772,16 @@ func GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileR
 	return fd, ref, nil
 }
 
-func writeLookupErr(w http.ResponseWriter, err error) {
-	if err == nil {
-		return
-	}
-	var lookupErr *FileLookupError
-	if errors.As(err, &lookupErr) {
-		http.Error(w, lookupErr.Msg, lookupErr.Code)
-		return
-	}
-	http.Error(w, "internal server error", http.StatusInternalServerError)
-}
-
 func GetTransferFileStates(txferID string) ([]TransferFileState, bool) {
 	return manager.getFileStates(txferID)
 }
 
 func AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool {
-	return manager.acknowledgeFile(txferID, fileID, ackBytes)
+	return manager.acknowledgeFiles([]AckEntry{{TxferID: txferID, FileID: fileID, AckBytes: ackBytes}})
+}
+
+func AcknowledgeTransferFiles(entries []AckEntry) bool {
+	return manager.acknowledgeFiles(entries)
 }
 
 func UpdateTransferFileHash(txferID string, fileID uint64, offset int64, chunk []byte) bool {
@@ -676,6 +790,14 @@ func UpdateTransferFileHash(txferID string, fileID uint64, offset int64, chunk [
 
 func VerifyTransferFileHash(txferID string, fileID uint64, expectedBytes int64, hashToken string) bool {
 	return manager.verifyFileHashToken(txferID, fileID, expectedBytes, hashToken)
+}
+
+func SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
+	return manager.setWindowHashToken(txferID, fileID, endBytes, hashToken)
+}
+
+func VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
+	return manager.verifyWindowHashToken(txferID, fileID, endBytes, hashToken)
 }
 
 func FinalizeTransferFileHash(txferID string, fileID uint64) (string, bool) {
@@ -731,7 +853,7 @@ func transferID() (string, error) {
 }
 
 func formatXXH128HashToken(v xxh3.Uint128) string {
-	return codec.FormatXXH128HashToken(v)
+	return intencoding.FormatXXH128HashToken(v)
 }
 
 func pathWithinRoot(root string, p string) bool {

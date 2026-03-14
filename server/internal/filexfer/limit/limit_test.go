@@ -1,10 +1,9 @@
 package limit
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -45,55 +44,23 @@ func TestParseRateBytesPerSecond(t *testing.T) {
 	}
 }
 
-func TestParseByteSize(t *testing.T) {
-	tests := []struct {
-		in      string
-		want    int64
-		wantErr bool
-	}{
-		{in: "1MiB", want: 1 * 1024 * 1024},
-		{in: "4MB", want: 4 * 1000 * 1000},
-		{in: "512", want: 512},
-		{in: "", wantErr: true},
-		{in: "-1MiB", wantErr: true},
-	}
-	for _, tc := range tests {
-		got, err := parseByteSize(tc.in)
-		if tc.wantErr {
-			if err == nil {
-				t.Fatalf("expected error for %q", tc.in)
-			}
-			continue
-		}
-		if err != nil {
-			t.Fatalf("unexpected error for %q: %v", tc.in, err)
-		}
-		if got != tc.want {
-			t.Fatalf("unexpected value for %q: got=%d want=%d", tc.in, got, tc.want)
-		}
-	}
-}
-
-func TestLimitedResponseWriterNoopWhenDisabled(t *testing.T) {
-	rec := httptest.NewRecorder()
-	lw := wrapLimitedResponseWriter(rec, context.Background(), fileStreamLimitState{
+func TestRateLimitedWriterNoopWhenDisabled(t *testing.T) {
+	var out bytes.Buffer
+	lw := wrapRateLimitedWriter(&out, context.Background(), fileStreamLimitState{
 		cfg: fileStreamLimitConfig{},
 	})
 
 	if _, err := lw.Write([]byte("hello")); err != nil {
 		t.Fatalf("write failed: %v", err)
 	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("unexpected status: %d", rec.Code)
-	}
-	if rec.Body.String() != "hello" {
-		t.Fatalf("unexpected body: %q", rec.Body.String())
+	if out.String() != "hello" {
+		t.Fatalf("unexpected body: %q", out.String())
 	}
 }
 
-func TestLimitedResponseWriterTimeout(t *testing.T) {
-	rec := httptest.NewRecorder()
-	lw := wrapLimitedResponseWriter(rec, context.Background(), fileStreamLimitState{
+func TestRateLimitedWriterTimeout(t *testing.T) {
+	var out bytes.Buffer
+	lw := wrapRateLimitedWriter(&out, context.Background(), fileStreamLimitState{
 		cfg: fileStreamLimitConfig{
 			TimeLimit: 1 * time.Millisecond,
 		},
@@ -115,33 +82,32 @@ func TestWaitRateLimitedOverBurst(t *testing.T) {
 	}
 }
 
-func TestConfigureFileStreamLimiter(t *testing.T) {
-	t.Cleanup(func() {
-		if err := configureFileStreamLimits(fileStreamLimitConfig{}); err != nil {
-			t.Fatalf("reset stream limits: %v", err)
-		}
+func TestNewLimiter(t *testing.T) {
+	limiter, err := NewLimiter(Config{
+		Rate:      "100MiB",
+		Burst:     "1MiB",
+		TimeLimit: 10 * time.Second,
 	})
-
-	if err := ConfigureFileStreamLimiter("100MiB", "1MiB", 10*time.Second); err != nil {
-		t.Fatalf("configure failed: %v", err)
+	if err != nil {
+		t.Fatalf("new limiter failed: %v", err)
 	}
-	state := currentFileStreamLimitState()
-	if state.cfg.RateBps != 100*1024*1024 {
-		t.Fatalf("unexpected rate: %d", state.cfg.RateBps)
+	cfg := limiter.Config()
+	if cfg.RateBps != 100*1024*1024 {
+		t.Fatalf("unexpected rate: %d", cfg.RateBps)
 	}
-	if state.cfg.BurstBytes != 1*1024*1024 {
-		t.Fatalf("unexpected burst: %d", state.cfg.BurstBytes)
+	if cfg.BurstBytes != 1*1024*1024 {
+		t.Fatalf("unexpected burst: %d", cfg.BurstBytes)
 	}
-	if state.cfg.TimeLimit != 10*time.Second {
-		t.Fatalf("unexpected time limit: %s", state.cfg.TimeLimit)
+	if cfg.TimeLimit != 10*time.Second {
+		t.Fatalf("unexpected time limit: %s", cfg.TimeLimit)
 	}
-	if state.bucket == nil {
+	if limiter.state.bucket == nil {
 		t.Fatalf("expected rate limiter bucket")
 	}
 }
 
-func TestConfigureFileStreamLimiterRejectsBurstWhenRateEnabled(t *testing.T) {
-	if err := ConfigureFileStreamLimiter("100MiB", "0", 0); err == nil {
+func TestNewLimiterRejectsBurstWhenRateEnabled(t *testing.T) {
+	if _, err := NewLimiter(Config{Rate: "100MiB", Burst: "0"}); err == nil {
 		t.Fatalf("expected error for zero burst when rate enabled")
 	}
 }

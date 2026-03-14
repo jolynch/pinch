@@ -1,13 +1,7 @@
 # Filexfer Framing Specification (Draft v1)
 
 This document defines the wire framing for fast efficient
-file transfers over plain TCP sockets. Note that while
-we may choose to use HTTP to wrap this framing format, this
-allows us to manipulate the compression and hashing as we
-go, in a way chunked encoding does not. It also allows for
-the client to initiate multiple round trips which retrieve
-say 128MiB at a time and then acknowledge as it is writing
-that data to disk, preventing re-work.
+file transfers over plain TCP sockets.
 
 ## Scope
 
@@ -106,7 +100,7 @@ Receiver behavior:
 
 ## Semantics
 
-- `mtime` and full-file `size` are manifest properties, not framing properties.
+- `mtime`, mode/permissions, and full-file `size` are manifest properties, not framing properties.
 - `offset` allows resumable/partial writes.
 - `size` is the logical uncompressed bytes covered by this frame.
 - `wsize` is the exact payload byte count that follows the header newline.
@@ -203,80 +197,100 @@ Common trailer properties:
 - Non-`ok` status indicates segment rejected or incomplete; sender should treat as failed for retry logic.
 - Trailer `hash=<algo>:<value>` is the frame checksum token for this frame payload and framing bytes.
 
-## `/fs/file` Contract
+## TCP Command Contract
 
-`GET /fs/file/{txferid}/{fid}` returns one or more frame triplets:
+The command protocol is line-based:
+
+- command line: `<VERB> <args...>\r\n`
+- status line:
+  - `OK\r\n`
+  - `OK <message>\r\n`
+  - `ERR <code> <message>\r\n`
+
+Commands:
+
+- `AUTH [<blob>]` (optional unless server requires auth)
+- `TXFER <path> [verbose=<0|1>] [max-manifest-chunk-size=<n>]`
+- `SEND <txferid> [comp=<mode>] <fid> <offset> <size> <path> ...`
+- `ACK <txferid> <fid> <ack-token> <delta-bytes> <recv-ms> <sync-ms> <path>`
+- `CXSUM <txferid> <fid> <window-size> <checksums_csv> <path>`
+- `STATUS <txferid>`
+
+Path/blob args are encoded as quoted strings or length-prefixed tokens (`<len>:<bytes>`).
+
+`SEND` returns one or more `FX/1` frame triplets, then a terminal status line:
 
 1. `FX/1` header line
 2. `wsize` payload bytes (raw or compressed per `comp`)
 3. `FXT/1` trailer line
+4. `OK` or `ERR ...` status line
 
-The server repeats these triplets until the requested window is complete.
-Default logical frame size cap is `8 MiB`, so large responses are split into
-multiple frames.
+The server repeats these triplets until each requested window is complete.
+Default logical frame size cap is `8 MiB`.
 
-For `/fs/file` responses, header properties are emitted in this order:
+For `SEND` responses, header properties are emitted in this order:
 `offset`, `size`, `wsize`, `comp`, `enc`, `hash`, optional `max-wsize`, then `ts`.
+Current implementation supports adaptive compression and may vary `comp` per frame.
 
-Current trailer shape:
+Current trailer shape for `SEND`:
 
 ```text
-FXT/1 <file_id> status=ok ts=<unix_ms> hash=<algo>:<value> [file-hash=<algo>:<value>] next=<offset>
+FXT/1 <file_id> status=ok ts=<unix_ms> [file-hash=<algo>:<value>] next=<offset> [meta:*=...]
 ```
 
 `next` is the offset that the following frame starts at (`offset + size`).
 The final trailer uses `next=0` as a terminal marker.
 
-`file-hash` is emitted on final trailer as the full-file checksum token for the served file window.
+`file-hash` is emitted on final trailer as the checksum token for the served request window.
 The final trailer also includes file metadata tokens:
 `meta:size`, `meta:mtime_ns`, `meta:mode`, `meta:uid`, `meta:gid`, `meta:user`, `meta:group`.
+Clients may use `meta:mode`, `meta:uid`, and `meta:gid` to mirror ownership/permissions
+only after payload integrity verification succeeds.
 
-`hash=<algo>:<value>` is the canonical checksum token for `/fs/file` trailers.
-For `/fs/file`, trailer hash is `hash=xxh64:<hex16>` and covers:
-- header line bytes (including trailing `\n`)
-- payload bytes (`wsize`)
-- trailer prefix bytes up to but not including ` hash=...`
-
-`file-hash=<algo>:<value>` on terminal trailer is the full logical object checksum.
-Current implementation emits `file-hash=xxh128:<hex32>`.
+`file-hash=<algo>:<value>` on terminal trailer is the authoritative per-window
+checksum token. Current implementation emits `file-hash=xxh128:<hex32>`.
 
 `max-wsize` is a first-frame hint only. Clients may use it to pre-size a reusable
 frame buffer, but they may cap allocation (current client default cap is `64 MiB`)
 and still stream larger frames in multiple reads.
 
-## `/fs/file` Ack Semantics
+## `ACK` Semantics
 
 `ack-bytes` is interpreted as:
 
 - `-1` for missing-file acknowledgement.
-- `<bytes>@<server_ts_ms>` for positive progress acknowledgement.
-- `<bytes>@<server_ts_ms>@<algo>:<value>` for final completion acknowledgement with full-file hash.
+- `<bytes>@<server_ts_ms>@<algo>:<value>` for positive window acknowledgement.
+
+Positive ack hash token is required and must match the server-stored expected
+window hash for that `ack-bytes` boundary.
 
 Legacy positive numeric-only acks are not accepted.
 
-Ack-only calls are supported using:
+Acks are submitted using the `ACK` command:
 
 ```text
-GET /fs/file/{txferid}/{fid}?path=<abs>&offset=0&size=0&ack-bytes=...
+ACK <txferid> <fid> <ack-token> <delta-bytes> <recv-ms> <sync-ms> <path>
 ```
 
-Successful ack-only requests return `204 No Content` and no frame payload.
+Successful ack requests return status line `OK` (or `OK <message>`).
 
-## `/fs/file/{txferid}/{fid}/checksum` Contract
+## `CXSUM` Contract
 
-`GET /fs/file/{txferid}/{fid}/checksum` returns framing lines only (no payload bytes):
+`CXSUM` returns framing lines only (no payload bytes), followed by a terminal
+status line:
 
 1. `FX/1` header line
 2. zero payload bytes (`wsize=0`)
 3. `FXT/1` trailer line
+4. terminal status line (`OK` or `ERR ...`)
 
 The response emits one frame per checksum window and flushes after every frame when possible.
 
-Query parameters:
+Command arguments:
 
-- `path=<abs>` (required)
-- `window-size=<bytes>` (optional, default `min(64 MiB, file_size)`)
-- `checksum=<algo>` (optional, repeatable and comma-separated)
+- `<path>` (required; quoted or `<len>:<bytes>`)
+- `<window-size>` (optional behavior via caller value, commonly `min(64 MiB, file_size)`)
+- `<checksums_csv>` (comma-separated)
   - supported: `none`, `xxh128`, `xxh64`
   - default: `xxh128`
 
@@ -285,4 +299,4 @@ Checksum trailer semantics:
 - Per-window frames include repeated `file-hash=<algo>:<value>` tokens as rolling cumulative checksum snapshots.
 - Terminal frame (`next=0`) includes final `file-hash=<algo>:<value>` values.
 - Every frame still includes `hash=xxh64:<hex16>` as frame integrity checksum.
-- Terminal frame includes the same metadata tokens as `/fs/file`.
+- Terminal frame includes the same metadata tokens as `SEND`.

@@ -1,20 +1,46 @@
-package frame
+package encoding
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/user"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/jolynch/pinch/internal/filexfer/codec"
 	"github.com/zeebo/xxh3"
 )
+
+var userNameCache sync.Map  // map[string]string  uid  → username
+var groupNameCache sync.Map // map[string]string  gid  → group name
+
+func lookupUserName(uid string) string {
+	if v, ok := userNameCache.Load(uid); ok {
+		return v.(string)
+	}
+	name := "unknown"
+	if u, err := user.LookupId(uid); err == nil {
+		name = u.Username
+	}
+	userNameCache.Store(uid, name)
+	return name
+}
+
+func lookupGroupName(gid string) string {
+	if v, ok := groupNameCache.Load(gid); ok {
+		return v.(string)
+	}
+	name := "unknown"
+	if g, err := user.LookupGroupId(gid); err == nil {
+		name = g.Name
+	}
+	groupNameCache.Store(gid, name)
+	return name
+}
 
 type FileFrameMetadata struct {
 	Size    int64
@@ -26,13 +52,11 @@ type FileFrameMetadata struct {
 	Group   string
 }
 
-type fileFrameMetadata = FileFrameMetadata
-
 func CollectFileFrameMetadata(path string, info os.FileInfo) FileFrameMetadata {
 	meta := FileFrameMetadata{
 		Size:    info.Size(),
 		MtimeNS: info.ModTime().UnixNano(),
-		Mode:    info.Mode().String(),
+		Mode:    fmt.Sprintf("%04o", info.Mode().Perm()|(info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky))),
 		UID:     "unknown",
 		GID:     "unknown",
 		User:    "unknown",
@@ -41,26 +65,18 @@ func CollectFileFrameMetadata(path string, info os.FileInfo) FileFrameMetadata {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		meta.UID = strconv.FormatUint(uint64(st.Uid), 10)
 		meta.GID = strconv.FormatUint(uint64(st.Gid), 10)
-		if u, err := user.LookupId(meta.UID); err == nil {
-			meta.User = u.Username
-		}
-		if g, err := user.LookupGroupId(meta.GID); err == nil {
-			meta.Group = g.Name
-		}
+		meta.User = lookupUserName(meta.UID)
+		meta.Group = lookupGroupName(meta.GID)
 	}
 	_ = path
 	return meta
-}
-
-func collectFileFrameMetadata(path string, info os.FileInfo) fileFrameMetadata {
-	return CollectFileFrameMetadata(path, info)
 }
 
 func (m FileFrameMetadata) trailerTokens() []string {
 	return []string{
 		fmt.Sprintf("meta:size=%d", m.Size),
 		fmt.Sprintf("meta:mtime_ns=%d", m.MtimeNS),
-		fmt.Sprintf("meta:mode=%s", strings.ReplaceAll(m.Mode, " ", "_")),
+		fmt.Sprintf("meta:mode=%s", m.Mode),
 		fmt.Sprintf("meta:uid=%s", m.UID),
 		fmt.Sprintf("meta:gid=%s", m.GID),
 		fmt.Sprintf("meta:user=%s", strings.ReplaceAll(m.User, " ", "_")),
@@ -86,16 +102,12 @@ type WriteArgs struct {
 	Metadata     *FileFrameMetadata
 }
 
-type frameWriteArgs = WriteArgs
-
 type WriteStats struct {
 	WriteLatency      time.Duration
 	WireThroughputBps float64
 }
 
-type frameWriteStats = WriteStats
-
-func WriteFrame(w http.ResponseWriter, args WriteArgs) (WriteStats, error) {
+func WriteFrame(w io.Writer, args WriteArgs) (WriteStats, error) {
 	start := time.Now()
 	header := ""
 	if args.MaxWSizeHint != nil {
@@ -148,7 +160,7 @@ func WriteFrame(w http.ResponseWriter, args WriteArgs) (WriteStats, error) {
 		return WriteStats{}, err
 	}
 
-	if fl, ok := w.(http.Flusher); ok {
+	if fl, ok := w.(interface{ Flush() }); ok {
 		fl.Flush()
 	}
 	writeLatency := time.Since(start)
@@ -160,10 +172,6 @@ func WriteFrame(w http.ResponseWriter, args WriteArgs) (WriteStats, error) {
 		WriteLatency:      writeLatency,
 		WireThroughputBps: wireBps,
 	}, nil
-}
-
-func writeFrame(w http.ResponseWriter, args frameWriteArgs) (frameWriteStats, error) {
-	return WriteFrame(w, args)
 }
 
 type FileFrameMeta struct {
@@ -308,9 +316,6 @@ func ParseFXTrailer(line string) (FrameTrailer, error) {
 	if ts < 0 {
 		return FrameTrailer{}, errors.New("trailer missing ts")
 	}
-	if !ValidHashToken(hashToken) {
-		return FrameTrailer{}, errors.New("trailer missing or invalid hash token")
-	}
 	if fileHashToken != "" && !ValidHashToken(fileHashToken) {
 		return FrameTrailer{}, errors.New("trailer invalid file hash token")
 	}
@@ -327,7 +332,7 @@ func ParseFXTrailer(line string) (FrameTrailer, error) {
 func splitTrailerPrefixAndHash(line string) (string, string, error) {
 	idx := strings.LastIndex(line, " hash=")
 	if idx <= 0 {
-		return "", "", errors.New("trailer missing hash token")
+		return strings.TrimSpace(line), "", nil
 	}
 	prefix := line[:idx]
 	hashToken := strings.TrimSpace(line[idx+len(" hash="):])
@@ -345,12 +350,24 @@ func ValidHashToken(raw string) bool {
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
+func AbbrevHashToken(raw string) string {
+	raw = strings.TrimSpace(raw)
+	parts := strings.SplitN(raw, ":", 2)
+	if len(parts) != 2 {
+		return raw
+	}
+	if len(parts[1]) <= 8 {
+		return raw
+	}
+	return parts[0] + ":" + parts[1][:8] + "..."
+}
+
 func DecodePayloadReaderByComp(payload io.Reader, comp string) (io.ReadCloser, error) {
 	switch comp {
 	case "none":
 		return io.NopCloser(payload), nil
-	case codec.EncodingZstd, codec.EncodingLz4:
-		reader, err := codec.WrapDecompressedReader(payload, comp)
+	case EncodingZstd, EncodingLz4:
+		reader, err := WrapDecompressedReader(payload, comp)
 		if err != nil {
 			return nil, err
 		}

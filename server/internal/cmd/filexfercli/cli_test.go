@@ -1,19 +1,139 @@
 package filexfercli
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
+	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 	"github.com/zeebo/xxh3"
 )
+
+type ftcpTestServer struct {
+	URL      string
+	listener net.Listener
+	wg       sync.WaitGroup
+}
+
+func (s *ftcpTestServer) Close() {
+	if s == nil {
+		return
+	}
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
+	s.wg.Wait()
+}
+
+func newFTCPTestServer(t *testing.T, handler func(intftcp.Request, io.Writer) error) *ftcpTestServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	s := &ftcpTestServer{URL: ln.Addr().String(), listener: ln}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			s.wg.Add(1)
+			go func(c net.Conn) {
+				defer s.wg.Done()
+				defer c.Close()
+				serveFTCPConn(c, handler)
+			}(conn)
+		}
+	}()
+	return s
+}
+
+func serveFTCPConn(conn net.Conn, handler func(intftcp.Request, io.Writer) error) {
+	br := bufio.NewReader(conn)
+	firstLine, err := readFTCPLine(br)
+	if err != nil {
+		return
+	}
+	req, err := intftcp.ParseRequest([]byte(firstLine))
+	if err != nil {
+		_, _ = io.WriteString(conn, "ERR BAD_REQUEST "+err.Error()+"\r\n")
+		return
+	}
+
+	out := io.Writer(conn)
+	closeOut := func() error { return nil }
+	cmdReq := req
+	if req.Verb == intftcp.VerbAUTH {
+		if len(req.Params) > 0 {
+			blob := strings.TrimSpace(req.Params[0]["blob"])
+			if blob != "" {
+				if recipient, parseErr := age.ParseX25519Recipient(blob); parseErr == nil {
+					ew, encErr := age.Encrypt(conn, recipient)
+					if encErr != nil {
+						return
+					}
+					out = ew
+					closeOut = ew.Close
+				}
+			}
+		}
+		cmdLine, cmdErr := readFTCPLine(br)
+		if cmdErr != nil {
+			_, _ = io.WriteString(out, "ERR BAD_REQUEST missing command\r\n")
+			_ = closeOut()
+			return
+		}
+		cmdReq, err = intftcp.ParseRequest([]byte(cmdLine))
+		if err != nil {
+			_, _ = io.WriteString(out, "ERR BAD_REQUEST "+err.Error()+"\r\n")
+			_ = closeOut()
+			return
+		}
+	}
+	if cmdReq.Verb == intftcp.VerbPROBE && len(cmdReq.Params) > 0 {
+		n, convErr := strconv.ParseInt(strings.TrimSpace(cmdReq.Params[0]["probe-bytes"]), 10, 64)
+		if convErr != nil || n < 0 {
+			_, _ = io.WriteString(out, "ERR BAD_REQUEST invalid probe-bytes\r\n")
+			_ = closeOut()
+			return
+		}
+		if n > 0 {
+			if _, drainErr := io.CopyN(io.Discard, br, n); drainErr != nil {
+				_, _ = io.WriteString(out, "ERR BAD_REQUEST invalid probe payload\r\n")
+				_ = closeOut()
+				return
+			}
+		}
+	}
+
+	if err := handler(cmdReq, out); err != nil {
+		_, _ = io.WriteString(out, "ERR INTERNAL "+err.Error()+"\r\n")
+	}
+	_ = closeOut()
+}
+
+func readFTCPLine(br *bufio.Reader) (string, error) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
 
 func xxh128HexCLI(data []byte) string {
 	h := xxh3.Hash128(data).Bytes()
@@ -30,7 +150,7 @@ func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 		len(body),
 		xsum,
 	)
-	trailerPrefix := fmt.Sprintf("FXT/1 %d status=ok ts=1001", fileID)
+	trailerPrefix := fmt.Sprintf("FXT/1 %d status=ok ts=1001 next=0 file-hash=xxh128:%s", fileID, xsum)
 	h := xxh3.New()
 	_, _ = h.Write([]byte(header))
 	_, _ = h.Write(body)
@@ -41,40 +161,66 @@ func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 func TestRunCLITransferAndGet(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txcli 7:/remote",
-		"0 5 0:100 0:5:a.txt",
+		"FM/2 txcli 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 	fileBody := []byte("hello")
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPut && r.URL.Path == "/fs/transfer":
-			_, _ = w.Write([]byte(manifestRaw))
-		case r.Method == http.MethodGet && r.URL.Path == "/fs/file/txcli/0":
-			_, _ = w.Write([]byte(buildCLIFrame(0, fileBody, 0)))
-		case r.Method == http.MethodPut && r.URL.Path == "/fs/file/txcli/0/ack":
-			ack := r.URL.Query().Get("ack-bytes")
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			cts0 := req.Params[0]["cts0"]
+			n, err := strconv.Atoi(req.Params[0]["probe-bytes"])
+			if err != nil || n < 0 {
+				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
+			}
+			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+				return err
+			}
+			if n > 0 {
+				if _, err := out.Write(make([]byte, n)); err != nil {
+					return err
+				}
+			}
+			_, err = io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbTXFER:
+			if got := req.Params[0]["directory"]; got != "/remote" {
+				return fmt.Errorf("unexpected directory: %q", got)
+			}
+			if got := req.Params[0]["mode"]; got != LoadStrategyFast {
+				return fmt.Errorf("unexpected mode: %q", got)
+			}
+			if _, err := io.WriteString(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSEND:
+			if got := req.Params[0]["txferid"]; got != "txcli" {
+				return fmt.Errorf("unexpected transfer id: %q", got)
+			}
+			_, err := io.WriteString(out, buildCLIFrame(0, fileBody, 0))
+			return err
+		case intftcp.VerbACK:
+			ack := req.Params[0]["ack-token"]
 			expectedAck := "5@1001@xxh128:" + xxh128HexCLI(fileBody)
 			if ack != expectedAck {
-				t.Fatalf("expected ack-bytes=%s, got %q", expectedAck, ack)
+				return fmt.Errorf("expected ack-token=%s, got %q", expectedAck, ack)
 			}
-			w.WriteHeader(http.StatusNoContent)
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
 		default:
-			http.NotFound(w, r)
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
-	}))
+	})
 	defer srv.Close()
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-
-	manifestPath := filepath.Join(tmp, "txcli.fm1")
-	code := RunCLI(
-		[]string{srv.URL, "transfer", "-s", "/remote", "-o", manifestPath},
-		&stdout,
-		&stderr,
-	)
+	manifestPath := filepath.Join(tmp, "txcli.fm2")
+	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", "-o", manifestPath}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -82,34 +228,14 @@ func TestRunCLITransferAndGet(t *testing.T) {
 		t.Fatalf("manifest not written: %v", err)
 	}
 
-	manifestPath2 := filepath.Join(tmp, "txcli-long.fm1")
-	stdout.Reset()
-	stderr.Reset()
-	code = RunCLI(
-		[]string{srv.URL, "transfer", "--source-directory", "/remote", "-o", manifestPath2},
-		&stdout,
-		&stderr,
-	)
-	if code != 0 {
-		t.Fatalf("transfer long flag: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	if _, err := os.Stat(manifestPath2); err != nil {
-		t.Fatalf("manifest not written for long flag: %v", err)
-	}
-
 	stdout.Reset()
 	stderr.Reset()
 	outRoot := filepath.Join(tmp, "out")
-	code = RunCLI(
-		[]string{srv.URL, "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-A", "1024"},
-		&stdout,
-		&stderr,
-	)
+	code = RunCLI([]string{srv.URL, "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-a", "1KiB"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	outFile := filepath.Join(outRoot, "a.txt")
-	got, err := os.ReadFile(outFile)
+	got, err := os.ReadFile(filepath.Join(outRoot, "a.txt"))
 	if err != nil {
 		t.Fatalf("read output: %v", err)
 	}
@@ -118,105 +244,266 @@ func TestRunCLITransferAndGet(t *testing.T) {
 	}
 }
 
-func TestRunCLITransferDefaultsToStdoutManifest(t *testing.T) {
+func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txresume.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstdout 7:/remote",
-		"0 5 0:100 0:5:a.txt",
+		"FM/2 txresume 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"0 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := os.WriteFile(manifestPath+".progress", []byte("0 5 0\n"), 0o644); err != nil {
+		t.Fatalf("write progress: %v", err)
+	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && r.URL.Path == "/fs/transfer" {
-			_, _ = w.Write([]byte(manifestRaw))
-			return
+	outRoot := filepath.Join(tmp, "out")
+	if err := os.MkdirAll(outRoot, 0o755); err != nil {
+		t.Fatalf("mkdir out root: %v", err)
+	}
+	destPath := filepath.Join(outRoot, "a.txt")
+	if err := os.WriteFile(destPath, []byte("helloSTALETAIL"), 0o644); err != nil {
+		t.Fatalf("write stale destination: %v", err)
+	}
+	partB := []byte("world")
+
+	var sawSend bool
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			sawSend = true
+			if got := req.Params[1]["offset"]; got != "5" {
+				return fmt.Errorf("expected resume offset 5, got %q", got)
+			}
+			if got := req.Params[1]["size"]; got != "5" {
+				return fmt.Errorf("expected resume size 5, got %q", got)
+			}
+			_, err := io.WriteString(out, buildCLIFrame(0, partB, 5))
+			return err
+		case intftcp.VerbACK:
+			expectedAck := "10@1001@xxh128:" + xxh128HexCLI(partB)
+			if got := req.Params[0]["ack-token"]; got != expectedAck {
+				return fmt.Errorf("expected ack-token=%s, got %q", expectedAck, got)
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
-		http.NotFound(w, r)
-	}))
+	})
 	defer srv.Close()
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "get", "--tid", "txresume", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-a", "1KiB"}, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
+		t.Fatalf("get resume: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if got := stdout.String(); got != manifestRaw {
-		t.Fatalf("expected raw manifest on stdout, got %q", got)
+	if !sawSend {
+		t.Fatalf("expected SEND request")
 	}
-	if !strings.Contains(stderr.String(), "manifest=stdout") {
-		t.Fatalf("expected stderr summary mentioning manifest=stdout, got: %s", stderr.String())
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("read resumed output: %v", err)
+	}
+	if string(got) != "helloworldTAIL" {
+		t.Fatalf("unexpected resumed output: %q", got)
 	}
 }
 
-func TestRunCLITransferDashOutputWritesManifestToStdout(t *testing.T) {
+func TestRunCLIGetRejectsResumeToStdout(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txstdout.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstdoutdash 7:/remote",
-		"0 5 0:100 0:5:a.txt",
+		"FM/2 txstdout 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"0 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := os.WriteFile(manifestPath+".progress", []byte("0 5 0\n"), 0o644); err != nil {
+		t.Fatalf("write progress: %v", err)
+	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && r.URL.Path == "/fs/transfer" {
-			_, _ = w.Write([]byte(manifestRaw))
-			return
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrame(0, []byte("world"), 5))
+			return err
+		case intftcp.VerbACK:
+			return fmt.Errorf("unexpected ACK for stdout resume rejection")
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
-		http.NotFound(w, r)
-	}))
+	})
 	defer srv.Close()
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", "-o", "-"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "get", "--tid", "txstdout", "--fd", "0", "--manifest", manifestPath, "-o", "-", "-a", "1KiB"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("get stdout resume: expected 1, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "cannot resume when output is stdout") {
+		t.Fatalf("expected stdout resume error, got: %s", stderr.String())
+	}
+}
+
+func TestRunCLIGetOutRootDevNullDiscardsOutput(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txdevnull.fm2")
+	manifestRaw := strings.Join([]string{
+		"FM/2 txdevnull 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	payload := []byte("hello")
+	var sawAck bool
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
+			return err
+		case intftcp.VerbACK:
+			sawAck = true
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "get", "--tid", "txdevnull", "--fd", "0", "--manifest", manifestPath, "--out-root", os.DevNull, "-a", "1KiB"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("get devnull: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !sawAck {
+		t.Fatalf("expected ACK request")
+	}
+	if !strings.Contains(stdout.String(), "  path: "+os.DevNull) {
+		t.Fatalf("expected file metrics path %q, got: %s", os.DevNull, stdout.String())
+	}
+}
+
+func TestRunCLITransferWithEncryptAge(t *testing.T) {
+	tmp := t.TempDir()
+	manifestRaw := strings.Join([]string{
+		"FM/2 txenccli 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			cts0 := req.Params[0]["cts0"]
+			n, err := strconv.Atoi(req.Params[0]["probe-bytes"])
+			if err != nil || n < 0 {
+				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
+			}
+			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+				return err
+			}
+			if n > 0 {
+				if _, err := out.Write(make([]byte, n)); err != nil {
+					return err
+				}
+			}
+			_, err = io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	manifestPath := filepath.Join(tmp, "txenccli.fm2")
+	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", "--encrypt", "age", "-o", manifestPath}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if got := stdout.String(); got != manifestRaw {
-		t.Fatalf("expected raw manifest on stdout, got %q", got)
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
 	}
-	if !strings.Contains(stderr.String(), "manifest=stdout") {
-		t.Fatalf("expected stderr summary mentioning manifest=stdout, got: %s", stderr.String())
+	if string(raw) != manifestRaw {
+		t.Fatalf("unexpected decrypted manifest: %q", string(raw))
 	}
 }
 
 func TestRunCLIStartDownloadsAll(t *testing.T) {
 	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txstart.fm1")
+	manifestPath := filepath.Join(tmp, "txstart.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstart 7:/remote",
-		"0 5 0:100 0:5:a.txt",
-		"1 4 0:101 0:5:b.txt",
+		"FM/2 txstart 7:/remote mode=gentle link-mbps=700 concurrency=3",
+		"0 5 0:100 0644 0:5:a.txt",
+		"1 4 0:101 0644 0:5:b.txt",
 		"",
 	}, "\n")
 	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/fs/file/txstart/0":
-			body := []byte("hello")
-			_, _ = w.Write([]byte(buildCLIFrame(0, body, 0)))
-		case "/fs/file/txstart/1":
-			body := []byte("test")
-			_, _ = w.Write([]byte(buildCLIFrame(1, body, 0)))
-		case "/fs/file/txstart/0/ack", "/fs/file/txstart/1/ack":
-			w.WriteHeader(http.StatusNoContent)
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			for _, p := range req.Params[1:] {
+				if got := p["mode"]; got != LoadStrategyGentle {
+					return fmt.Errorf("expected SEND mode=%s, got %q", LoadStrategyGentle, got)
+				}
+			}
+			for _, p := range req.Params[1:] {
+				switch p["fid"] {
+				case "0":
+					if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+						return err
+					}
+				case "1":
+					if _, err := io.WriteString(out, buildCLIFrame(1, []byte("test"), 0)); err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf("unexpected fid: %q", p["fid"])
+				}
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
 		default:
-			http.NotFound(w, r)
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
-	}))
+	})
 	defer srv.Close()
 
 	outRoot := filepath.Join(tmp, "out")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI(
-		[]string{srv.URL, "start", "--tid", "txstart", "--manifest", manifestPath, "--out-root", outRoot, "--concurrency", "2", "--ack-every", "1KiB"},
-		&stdout,
-		&stderr,
-	)
+	code := RunCLI([]string{srv.URL, "start", "--tid", "txstart", "--manifest", manifestPath, "--out-root", outRoot, "--concurrency", "2", "--ack-every", "1KiB"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "start-plan: strategy=gentle link=700Mbps concurrency=2 (manifest=3)") {
+		t.Fatalf("missing start plan line: %s", stdout.String())
 	}
 	for _, p := range []string{"a.txt", "b.txt"} {
 		if _, err := os.Stat(filepath.Join(outRoot, p)); err != nil {
@@ -225,15 +512,96 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	}
 }
 
-func TestRunCLIStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/fs/transfer/abc/status" {
-			http.NotFound(w, r)
-			return
+func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txstartdefault.fm2")
+	manifestRaw := strings.Join([]string{
+		"FM/2 txstartdefault 7:/remote mode=fast link-mbps=1200 concurrency=5",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			if got := req.Params[1]["mode"]; got != LoadStrategyFast {
+				return fmt.Errorf("expected SEND mode=%s, got %q", LoadStrategyFast, got)
+			}
+			if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"transfer_id":"abc","directory":"/r","num_files":10,"total_size":1000,"done":3,"done_size":200,"percent_files":30,"percent_bytes":20,"download_status":{"started":5,"running":2,"done":3,"missing":0}}`))
-	}))
+	})
+	defer srv.Close()
+
+	outRoot := filepath.Join(tmp, "out")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "start", "--tid", "txstartdefault", "--manifest", manifestPath, "--out-root", outRoot, "--ack-every", "1KiB"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "start-plan: strategy=fast link=1200Mbps concurrency=5 (manifest=5)") {
+		t.Fatalf("missing default start plan line: %s", stdout.String())
+	}
+}
+
+func TestRunCLIStartOutRootDevNullDiscardsOutput(t *testing.T) {
+	tmp := t.TempDir()
+	manifestPath := filepath.Join(tmp, "txstartdevnull.fm2")
+	manifestRaw := strings.Join([]string{
+		"FM/2 txstartdevnull 7:/remote mode=fast link-mbps=1200 concurrency=2",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	payload := []byte("hello")
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "start", "--tid", "txstartdevnull", "--manifest", manifestPath, "--out-root", os.DevNull, "--ack-every", "1KiB"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start devnull: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "start-file: fd=0 path="+os.DevNull) {
+		t.Fatalf("missing start-file devnull path line: %s", stdout.String())
+	}
+}
+
+func TestRunCLIStatus(t *testing.T) {
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbSTATUS {
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+		_, err := io.WriteString(out, `OK {"transfer_id":"abc","directory":"/r","num_files":10,"total_size":1000,"done":3,"done_size":200,"percent_files":30,"percent_bytes":20,"download_status":{"started":5,"running":2,"done":3,"missing":0}}`+"\r\n")
+		return err
+	})
 	defer srv.Close()
 
 	var stdout bytes.Buffer
@@ -250,194 +618,6 @@ func TestRunCLIStatus(t *testing.T) {
 	}
 }
 
-func TestRunCLIGetWritesProgressFile(t *testing.T) {
-	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txp.fm1")
-	manifestRaw := strings.Join([]string{
-		"FM/1 txp 7:/remote",
-		"0 5 0:100 0:5:a.txt",
-		"",
-	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
-	fileBody := []byte("hello")
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/fs/file/txp/0":
-			_, _ = w.Write([]byte(buildCLIFrame(0, fileBody, 0)))
-		case r.Method == http.MethodPut && r.URL.Path == "/fs/file/txp/0/ack":
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	outRoot := filepath.Join(tmp, "out")
-	code := RunCLI(
-		[]string{srv.URL, "get", "--tid", "txp", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-v"},
-		&stdout,
-		&stderr,
-	)
-	if code != 0 {
-		t.Fatalf("get: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	progressPath := manifestPath + ".progress"
-	progressRaw, err := os.ReadFile(progressPath)
-	if err != nil {
-		t.Fatalf("read progress file: %v", err)
-	}
-	if !strings.Contains(string(progressRaw), "0 5") {
-		t.Fatalf("expected progress file to contain final ack, got %q", string(progressRaw))
-	}
-	if !strings.Contains(stderr.String(), "progress: tid=txp fd=0 10%") {
-		t.Fatalf("expected 10%% progress output, got: %s", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "progress: tid=txp fd=0 100%") {
-		t.Fatalf("expected 100%% progress output, got: %s", stderr.String())
-	}
-}
-
-func TestRunCLIGetInfersTransferIDFromManifest(t *testing.T) {
-	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txinfer.fm1")
-	manifestRaw := strings.Join([]string{
-		"FM/1 txinfer 7:/remote",
-		"0 5 0:100 0:5:a.txt",
-		"",
-	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
-	fileBody := []byte("hello")
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/fs/file/txinfer/0":
-			_, _ = w.Write([]byte(buildCLIFrame(0, fileBody, 0)))
-		case r.Method == http.MethodPut && r.URL.Path == "/fs/file/txinfer/0/ack":
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	outRoot := filepath.Join(tmp, "out")
-	code := RunCLI(
-		[]string{srv.URL, "get", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot},
-		&stdout,
-		&stderr,
-	)
-	if code != 0 {
-		t.Fatalf("get: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	if _, err := os.Stat(filepath.Join(outRoot, "a.txt")); err != nil {
-		t.Fatalf("missing output file: %v", err)
-	}
-}
-
-func TestRunCLIGetRejectsManifestTransferIDMismatch(t *testing.T) {
-	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txmismatch.fm1")
-	manifestRaw := strings.Join([]string{
-		"FM/1 txmanifest 7:/remote",
-		"0 5 0:100 0:5:a.txt",
-		"",
-	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := RunCLI(
-		[]string{"http://127.0.0.1:1", "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath},
-		&stdout,
-		&stderr,
-	)
-	if code != 1 {
-		t.Fatalf("expected mismatch to return 1, got %d stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "manifest transfer id mismatch") {
-		t.Fatalf("expected mismatch error in stderr, got: %s", stderr.String())
-	}
-}
-
-func TestFormatCompSummaryOrdersByCompressionStrength(t *testing.T) {
-	meta := FileFrameMeta{
-		CompCounts: map[string]uint64{
-			"zstd": 31,
-			"lz4":  2,
-			"none": 2,
-		},
-	}
-	got := formatCompSummary(meta)
-	want := "[none=2, lz4=2, zstd=31]"
-	if got != want {
-		t.Fatalf("unexpected comp summary ordering: got %q want %q", got, want)
-	}
-}
-
-func TestRunCLIStartSkipsCompletedFromProgress(t *testing.T) {
-	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txskip.fm1")
-	manifestRaw := strings.Join([]string{
-		"FM/1 txskip 7:/remote",
-		"0 5 0:100 0:5:a.txt",
-		"1 4 0:101 0:5:b.txt",
-		"",
-	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
-	if err := os.WriteFile(manifestPath+".progress", []byte("0 5\n"), 0o644); err != nil {
-		t.Fatalf("write progress: %v", err)
-	}
-
-	var servedID0 bool
-	var servedID1 bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/fs/file/txskip/0":
-			servedID0 = true
-			_, _ = w.Write([]byte(buildCLIFrame(0, []byte("hello"), 0)))
-		case "/fs/file/txskip/1":
-			servedID1 = true
-			_, _ = w.Write([]byte(buildCLIFrame(1, []byte("test"), 0)))
-		case "/fs/file/txskip/0/ack", "/fs/file/txskip/1/ack":
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	outRoot := filepath.Join(tmp, "out")
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := RunCLI(
-		[]string{srv.URL, "start", "--tid", "txskip", "--manifest", manifestPath, "--out-root", outRoot, "--concurrency", "1"},
-		&stdout,
-		&stderr,
-	)
-	if code != 0 {
-		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	if servedID0 {
-		t.Fatalf("expected file id 0 to be skipped from progress state")
-	}
-	if !servedID1 {
-		t.Fatalf("expected file id 1 to be downloaded")
-	}
-}
-
 func TestRunCLIUsageErrors(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -445,36 +625,178 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	if code := RunCLI([]string{}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2, got %d", code)
 	}
-	if code := RunCLI([]string{"http://x", "bogus"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"127.0.0.1:1", "bogus"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for unknown cmd, got %d", code)
 	}
-	if code := RunCLI([]string{"http://x", "get", "--tid", "t"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for missing --fd, got %d", code)
 	}
-	if code := RunCLI([]string{"http://x", "get", "--fd", "0"}, &stdout, &stderr); code != 1 {
+	if code := RunCLI([]string{"127.0.0.1:1", "get", "--fd", "0"}, &stdout, &stderr); code != 1 {
 		t.Fatalf("expected runtime error when get has no --tid and no --manifest, got %d", code)
 	}
-	if code := RunCLI([]string{"http://x", "get", "--tid", "t", "--fd", "0", "--ack-every", "0"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t", "--fd", "0", "--ack-every", "0"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --ack-every, got %d", code)
 	}
-	if code := RunCLI([]string{"http://x", "start", "--tid", "t", "--no-sync"}, &stdout, &stderr); code != 1 {
-		t.Fatalf("expected runtime error with accepted --no-sync flag, got %d", code)
+	stderr.Reset()
+	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t", "--fd", "0", "--load-strategy", "slow"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --load-strategy on get, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --load-strategy") {
+		t.Fatalf("expected invalid --load-strategy message, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"http://x", "get", "--tid", "t", "--fd", "0", "--ack-every", "bad"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t", "--fd", "0", "--ack-every", "bad"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --ack-every size, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "invalid --ack-every") {
 		t.Fatalf("expected invalid --ack-every message, got: %s", stderr.String())
 	}
-	if code := RunCLI([]string{"http://x", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
+	stderr.Reset()
+	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for legacy --directory flag, got %d", code)
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"--tid", "tx", "get"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for missing server URL, got %d", code)
+	if code := RunCLI([]string{"127.0.0.1:1", "start", "--tid", "t", "--probe-bytes", "bad"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for unknown --probe-bytes, got %d", code)
 	}
-	if !strings.Contains(stderr.String(), "first argument must be server URL") {
-		t.Fatalf("expected explicit server-url error, got: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("expected unknown flag message, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := RunCLI([]string{"127.0.0.1:1", "start", "--tid", "t", "--load-strategy", "slow"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for unknown --load-strategy on start, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("expected unknown flag message, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "-s", "/tmp", "--encrypt", "aes"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for unsupported --encrypt mode, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --encrypt") {
+		t.Fatalf("expected invalid --encrypt error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := RunCLI([]string{"--tid", "tx", "get"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for missing server address, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "file-listener address") {
+		t.Fatalf("expected explicit server address error, got: %s", stderr.String())
+	}
+}
+
+func TestVerboseProgressReporterIncludesAckedBytes(t *testing.T) {
+	var stderr bytes.Buffer
+	reporter := newVerboseProgressReporter(&stderr)
+	t0 := time.Unix(0, 0)
+
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      42,
+		CopiedBytes: 20,
+		TargetBytes: 100,
+		UpdateTime:  t0,
+	})
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      42,
+		AckBytes:    10,
+		TargetBytes: 100,
+		UpdateTime:  t0.Add(500 * time.Millisecond),
+	})
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      42,
+		CopiedBytes: 40,
+		TargetBytes: 100,
+		UpdateTime:  t0.Add(1 * time.Second),
+	})
+
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 progress lines, got %d: %q", len(lines), stderr.String())
+	}
+	if got := lines[0]; !strings.Contains(got, "progress: fd=42 20% bytes=20 B/100 B [0 B]") {
+		t.Fatalf("unexpected first progress line: %q", got)
+	}
+	if got := lines[1]; !strings.Contains(got, "progress: fd=42 40% bytes=40 B/100 B [10 B]") {
+		t.Fatalf("unexpected second progress line: %q", got)
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "tid=") {
+			t.Fatalf("progress line should not include tid: %q", line)
+		}
+	}
+}
+
+func TestVerboseProgressReporterTimeCadenceAndCompletion(t *testing.T) {
+	var stderr bytes.Buffer
+	reporter := newVerboseProgressReporter(&stderr)
+	t0 := time.Unix(0, 0)
+
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      7,
+		CopiedBytes: 5,
+		TargetBytes: 100,
+		UpdateTime:  t0,
+	})
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      7,
+		CopiedBytes: 10,
+		TargetBytes: 100,
+		UpdateTime:  t0.Add(2 * time.Second),
+	})
+	reporter.ReportUpdate(DownloadProgressUpdate{
+		FileID:      7,
+		CopiedBytes: 100,
+		TargetBytes: 100,
+		UpdateTime:  t0.Add(3 * time.Second),
+	})
+
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 progress lines, got %d: %q", len(lines), stderr.String())
+	}
+	if got := lines[0]; !strings.Contains(got, "progress: fd=7 10% ") {
+		t.Fatalf("expected timed 10%% line, got %q", got)
+	}
+	if got := lines[1]; !strings.Contains(got, "progress: fd=7 100% ") {
+		t.Fatalf("expected final 100%% line, got %q", got)
+	}
+}
+
+func TestVerboseProgressReporterConcurrentUse(t *testing.T) {
+	var stderr bytes.Buffer
+	reporter := newVerboseProgressReporter(&stderr)
+	start := time.Unix(0, 0)
+
+	var wg sync.WaitGroup
+	runFile := func(fileID uint64) {
+		defer wg.Done()
+		for pct := int64(20); pct <= 100; pct += 20 {
+			copied := pct
+			reporter.ReportUpdate(DownloadProgressUpdate{
+				FileID:      fileID,
+				CopiedBytes: copied,
+				TargetBytes: 100,
+				UpdateTime:  start.Add(time.Duration(copied) * time.Millisecond),
+			})
+			reporter.ReportUpdate(DownloadProgressUpdate{
+				FileID:      fileID,
+				AckBytes:    copied / 2,
+				TargetBytes: 100,
+				UpdateTime:  start.Add(time.Duration(copied)*time.Millisecond + 500*time.Microsecond),
+			})
+		}
+	}
+
+	wg.Add(2)
+	go runFile(1)
+	go runFile(2)
+	wg.Wait()
+
+	out := stderr.String()
+	if !strings.Contains(out, "progress: fd=1 ") {
+		t.Fatalf("expected fd=1 progress lines, got %q", out)
+	}
+	if !strings.Contains(out, "progress: fd=2 ") {
+		t.Fatalf("expected fd=2 progress lines, got %q", out)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"runtime/trace"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,7 +24,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/jolynch/pinch/internal/cmd/filexfercli"
-	"github.com/jolynch/pinch/internal/filexfer/fhttp"
+	"github.com/jolynch/pinch/internal/filexfer/ftcp"
 	"github.com/jolynch/pinch/internal/filexfer/limit"
 	"github.com/jolynch/pinch/state"
 	"github.com/jolynch/pinch/utils"
@@ -31,6 +32,7 @@ import (
 
 var (
 	listen       = "127.0.0.1:8080"
+	fileListener = "127.0.0.1:3453"
 	inputDir     = "/var/lib/pinch/in"
 	outputDir    = "/var/lib/pinch/out"
 	keysDir      = "/var/lib/pinch/keys"
@@ -41,21 +43,39 @@ var (
 	fsFileBurst  = "1MiB"
 )
 
-func maxSocketWriteBufferBytes() int {
-	// 4MiB baseline if kernel cap cannot be read.
-	const baseline = 4 * 1024 * 1024
-	raw, err := os.ReadFile("/proc/sys/net/core/wmem_max")
+func loadServerAgeIdentity(dir string) (*age.X25519Identity, error) {
+	keyPath := path.Join(dir, "key")
+	if raw, err := os.ReadFile(keyPath); err == nil {
+		lines := strings.Split(string(raw), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			identity, parseErr := age.ParseX25519Identity(line)
+			if parseErr != nil {
+				return nil, fmt.Errorf("invalid existing key file %s: %w", keyPath, parseErr)
+			}
+			return identity, nil
+		}
+		return nil, fmt.Errorf("existing key file %s has no identity", keyPath)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read key file %s: %w", keyPath, err)
+	}
+
+	identity, err := age.GenerateX25519Identity()
 	if err != nil {
-		return baseline
+		return nil, fmt.Errorf("generate age identity: %w", err)
 	}
-	v, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || v <= 0 {
-		return baseline
+	out, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open key file %s: %w", keyPath, err)
 	}
-	if v > baseline {
-		return v
-	}
-	return baseline
+	defer out.Close()
+	fmt.Fprintf(out, "# created: %s\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(out, "# public key: %s\n", identity.Recipient())
+	fmt.Fprintf(out, "%s\n", identity)
+	return identity, nil
 }
 
 func compress(
@@ -674,20 +694,40 @@ func main() {
 	}
 
 	flag.StringVar(&listen, "listen", listen, "The address to listen on")
+	flag.StringVar(&fileListener, "file-listen", fileListener, "The file transfer TCP listen address")
 	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
 	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
 	flag.StringVar(&keysDir, "keys", keysDir, "The directory to create output pipes in")
 	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
-	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should buffers be")
-	flag.StringVar(&fsFileRate, "fs-file-rate", fsFileRate, "Global /fs/file rate limit (examples: 100MiB, 1000mbps). Empty/0 disables limiting")
-	flag.StringVar(&fsFileBurst, "fs-file-rate-burst", fsFileBurst, "Token-bucket burst for /fs/file rate limit (examples: 1MiB, 4MB)")
-	fsFileTimeLimit := flag.Duration("fs-file-time-limit", 0, "Per-request wall-clock limit for GET /fs/file (0 disables)")
+	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should pipe buffers be")
+	flag.StringVar(&fsFileRate, "fs-file-rate", fsFileRate, "Global file-listener response rate limit (examples: 100MiB, 1000mbps). Empty/0 disables limiting")
+	flag.StringVar(&fsFileBurst, "fs-file-rate-burst", fsFileBurst, "Token-bucket burst for file-listener response rate limit (examples: 1MiB, 4MB)")
+	fsFileTimeLimit := flag.Duration("fs-file-time-limit", 0, "Per-request wall-clock limit for file-listener responses (0 disables)")
+	fsRequireAuth := flag.Bool("fs-require-auth", false, "Require AUTH before using file-listen commands")
+	fsTraceFile := flag.String("fs-trace", "", "Write runtime/trace output to this file")
 	dieAfter := flag.Duration("die-after", 0, "Die after this duration. Zero seconds indicates live forever")
 
 	flag.Parse()
 
-	if err := limit.ConfigureFileStreamLimiter(fsFileRate, fsFileBurst, *fsFileTimeLimit); err != nil {
-		log.Fatalf("Invalid file stream limiter configuration: %v", err)
+	if *fsTraceFile != "" {
+		tf, err := os.Create(*fsTraceFile)
+		if err != nil {
+			log.Fatalf("Failed to create trace file %s: %v", *fsTraceFile, err)
+		}
+		defer tf.Close()
+		if err := trace.Start(tf); err != nil {
+			log.Fatalf("Failed to start trace: %v", err)
+		}
+		defer trace.Stop()
+	}
+
+	fileStreamLimiter, limiterErr := limit.NewLimiter(limit.Config{
+		Rate:      fsFileRate,
+		Burst:     fsFileBurst,
+		TimeLimit: *fsFileTimeLimit,
+	})
+	if limiterErr != nil {
+		log.Fatalf("Invalid file stream limiter configuration: %v", limiterErr)
 	}
 
 	if !makeDirs(inputDir) {
@@ -699,23 +739,12 @@ func main() {
 	if !makeDirs(keysDir) {
 		log.Fatalf("Could not setup key directory, dying")
 	}
-	serverKey, err := age.GenerateX25519Identity()
+	var err error
+	serverKey, err = loadServerAgeIdentity(keysDir)
 	if err != nil {
-		log.Fatalf("AGE could not generate private and public keys for this node")
-	} else {
-		keyPath := path.Join(keysDir, "key")
-		out, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-
-		if err != nil {
-			log.Fatalf("Error while opening key file: %v", err)
-		}
-		fmt.Fprintf(out, "# created: %s\n", time.Now().Format(time.RFC3339))
-		fmt.Fprintf(out, "# public key: %s\n", serverKey.Recipient())
-		fmt.Fprintf(out, "%s\n", serverKey)
-		log.Printf("Public key %s", serverKey.Recipient().String())
-		defer out.Close()
-		log.Printf("AGE key file generated and saved to %s", keyPath)
+		log.Fatalf("AGE key setup failed: %v", err)
 	}
+	log.Printf("Public key %s", serverKey.Recipient().String())
 
 	log.Printf("Scanning input directory [%s] to clean up.", inputDir)
 	if err := cleanupDir(inputDir); err != nil {
@@ -732,21 +761,31 @@ func main() {
 	mux.HandleFunc("/unpinch", unpinch)
 	mux.HandleFunc("/io/", handleIO)
 	mux.HandleFunc("/status/", getStatus)
+	socketWriteBufBytes := utils.MaxSocketWriteBufferBytes()
+	log.Printf("Detected ideal socket write buffer of size %d", socketWriteBufBytes)
 
-	// Filesystem API
-	mux.HandleFunc("PUT /fs/transfer", fhttp.TransferHandler)
-	mux.HandleFunc("GET /fs/transfer/{txferid}/status", fhttp.TransferStatusHandler)
-	mux.HandleFunc("GET /fs/file/{txferid}/{fid}", fhttp.FileHandler)
-	mux.HandleFunc("PUT /fs/file/{txferid}/{fid}/ack", fhttp.FileAckHandler)
-	mux.HandleFunc("GET /fs/file/{txferid}/{fid}/checksum", fhttp.FileChecksumHandler)
+	fileLn, err := net.Listen("tcp", fileListener)
+	if err != nil {
+		log.Fatalf("Failed to bind file listener at %s: %v", fileListener, err)
+	}
+	defer fileLn.Close()
+	go func() {
+		log.Printf("File transfer listener at %s", fileListener)
+		if serveErr := ftcp.Serve(fileLn, ftcp.ServerOptions{
+			RequireAuth:            *fsRequireAuth,
+			ServerIdentity:         serverKey,
+			Limiter:                fileStreamLimiter,
+			SocketWriteBufferBytes: socketWriteBufBytes,
+		}); serveErr != nil {
+			log.Fatalf("File transfer listener stopped: %v", serveErr)
+		}
+	}()
 
 	if *dieAfter > 0 {
 		go die(*dieAfter)
 	}
 
 	log.Printf("Listening at %s/pinch", listen)
-	socketWriteBufBytes := maxSocketWriteBufferBytes()
-	log.Printf("Detected ideal socket write buffer of size %d", socketWriteBufBytes)
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           mux,

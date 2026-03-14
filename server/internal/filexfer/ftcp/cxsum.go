@@ -1,74 +1,90 @@
-package fhttp
+package ftcp
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 )
 
 const defaultChecksumWindowSize int64 = 64 * 1024 * 1024
 const checksumReadBufferSize int64 = 1 * 1024 * 1024
 
-func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
-	txferID := req.PathValue("txferid")
-	if txferID == "" {
-		http.Error(w, "missing required path parameter: txferid", http.StatusBadRequest)
-		return
-	}
-	fileIDRaw := req.PathValue("fid")
-	if fileIDRaw == "" {
-		http.Error(w, "missing required path parameter: fid", http.StatusBadRequest)
-		return
-	}
-	fileID, err := strconv.ParseUint(fileIDRaw, 10, 64)
-	if err != nil {
-		http.Error(w, "invalid path parameter: fid", http.StatusBadRequest)
-		return
-	}
-	fullPathRaw := req.URL.Query().Get("path")
-	if fullPathRaw == "" {
-		http.Error(w, "missing required query parameter: path", http.StatusBadRequest)
-		return
-	}
+type cxsumRequest struct {
+	TransferID   string
+	FileID       uint64
+	WindowSize   int64
+	ChecksumsCSV string
+	Path         string
+}
 
-	fd, fileRef, err := GetFile(txferID, fileID, fullPathRaw)
+func parseCXSUMRequest(req Request) (cxsumRequest, error) {
+	if req.Verb != VerbCXSUM {
+		return cxsumRequest{}, protocolErr{code: "BAD_COMMAND", message: "not CXSUM"}
+	}
+	if len(req.Params) != 1 {
+		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM arguments"}
+	}
+	p := req.Params[0]
+	txferID := p["txferid"]
+	if txferID == "" {
+		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
+	}
+	fileID, err := strconv.ParseUint(p["fid"], 10, 64)
 	if err != nil {
-		writeLookupErr(w, err)
-		return
+		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid file id"}
+	}
+	windowSize, err := strconv.ParseInt(p["window-size"], 10, 64)
+	if err != nil || windowSize <= 0 {
+		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid window size"}
+	}
+	path := p["path"]
+	if path == "" {
+		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing path"}
+	}
+	return cxsumRequest{
+		TransferID:   txferID,
+		FileID:       fileID,
+		WindowSize:   windowSize,
+		ChecksumsCSV: p["checksums-csv"],
+		Path:         path,
+	}, nil
+}
+
+func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error {
+	parsed, err := parseCXSUMRequest(req)
+	if err != nil {
+		return err
+	}
+	fd, fileRef, err := deps.GetFile(parsed.TransferID, parsed.FileID, parsed.Path)
+	if err != nil {
+		return mapLookupError(err)
 	}
 	defer fd.Close()
 
 	fileInfo, err := fd.Stat()
 	if err != nil {
-		http.Error(w, "failed to stat file", http.StatusInternalServerError)
-		return
+		return protocolErr{code: "INTERNAL", message: "failed to stat file"}
 	}
 	fileSize := fileInfo.Size()
 	if fileSize < 0 {
-		http.Error(w, "invalid file size", http.StatusInternalServerError)
-		return
+		return protocolErr{code: "INTERNAL", message: "invalid file size"}
 	}
-
-	windowSize, err := parseChecksumWindowSize(req.URL.Query().Get("window-size"), fileSize)
+	windowSize, err := parseChecksumWindowSize(strconv.FormatInt(parsed.WindowSize, 10), fileSize)
 	if err != nil {
-		http.Error(w, "invalid query parameter: window-size", http.StatusBadRequest)
-		return
+		return protocolErr{code: "BAD_REQUEST", message: "invalid window size"}
 	}
-	algorithms, err := parseRequestedChecksums(req.URL.Query()["checksum"])
+	algorithms, err := parseRequestedChecksums([]string{parsed.ChecksumsCSV})
 	if err != nil {
-		http.Error(w, "invalid query parameter: checksum", http.StatusBadRequest)
-		return
+		return protocolErr{code: "BAD_REQUEST", message: "invalid checksum parameter"}
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Add("Vary", "Accept-Encoding")
-
-	metadata := collectFileFrameMetadata(fileRef.Path, fileInfo)
+	metadata := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
 	full128 := xxh3.New128()
 	full64 := xxh3.New()
 
@@ -80,8 +96,8 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 		if len(fileHashes) > 0 {
 			headerHash = fileHashes[0]
 		}
-		if _, err := writeFrame(w, frameWriteArgs{
-			FileID:     fileID,
+		_, err := encoding.WriteFrame(out, encoding.WriteArgs{
+			FileID:     parsed.FileID,
 			Offset:     0,
 			Size:       0,
 			WSize:      0,
@@ -93,10 +109,11 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 			FileHashes: fileHashes,
 			Next:       0,
 			Metadata:   &metadata,
-		}); err != nil {
-			return
+		})
+		if err != nil {
+			return err
 		}
-		return
+		return nil
 	}
 
 	bufSize := checksumReadBufferSize
@@ -117,24 +134,22 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 		reader := io.NewSectionReader(fd, cursor, chunkSize)
 		remaining := chunkSize
 		for remaining > 0 {
-			n, err := reader.Read(buf)
+			n, readErr := reader.Read(buf)
 			if n > 0 {
 				part := buf[:n]
 				_, _ = full128.Write(part)
 				_, _ = full64.Write(part)
 				remaining -= int64(n)
 			}
-			if err == io.EOF {
+			if readErr == io.EOF {
 				break
 			}
-			if err != nil {
-				http.Error(w, "failed to read file chunk", http.StatusInternalServerError)
-				return
+			if readErr != nil {
+				return protocolErr{code: "INTERNAL", message: "failed to read file chunk"}
 			}
 		}
 		if remaining != 0 {
-			http.Error(w, "failed to read complete file chunk", http.StatusInternalServerError)
-			return
+			return protocolErr{code: "INTERNAL", message: "failed to read complete file chunk"}
 		}
 
 		rollingFileHashes := finalChecksumTokens(algorithms, full128, full64)
@@ -142,7 +157,7 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 		isTerminal := nextOffset == fileSize
 		nextValue := nextOffset
 		fileHashes := rollingFileHashes
-		var meta *fileFrameMetadata
+		var meta *encoding.FileFrameMetadata
 		if isTerminal {
 			nextValue = 0
 			meta = &metadata
@@ -154,8 +169,8 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 
 		headerTS := time.Now().UnixMilli()
 		trailerTS := time.Now().UnixMilli()
-		if _, err := writeFrame(w, frameWriteArgs{
-			FileID:     fileID,
+		_, err := encoding.WriteFrame(out, encoding.WriteArgs{
+			FileID:     parsed.FileID,
 			Offset:     cursor,
 			Size:       chunkSize,
 			WSize:      0,
@@ -167,11 +182,13 @@ func FileChecksumHandler(w http.ResponseWriter, req *http.Request) {
 			FileHashes: fileHashes,
 			Next:       nextValue,
 			Metadata:   meta,
-		}); err != nil {
-			return
+		})
+		if err != nil {
+			return err
 		}
 		cursor = nextOffset
 	}
+	return nil
 }
 
 func parseChecksumWindowSize(raw string, fileSize int64) (int64, error) {
@@ -195,7 +212,6 @@ func parseRequestedChecksums(raw []string) ([]string, error) {
 	if len(raw) == 0 {
 		return []string{"xxh128"}, nil
 	}
-
 	set := make(map[string]struct{})
 	for _, token := range raw {
 		for _, part := range strings.Split(token, ",") {
@@ -234,9 +250,9 @@ func finalChecksumTokens(algorithms []string, full128 *xxh3.Hasher128, full64 *x
 	for _, name := range algorithms {
 		switch name {
 		case "xxh128":
-			tokens = append(tokens, formatXXH128HashToken(full128.Sum128()))
+			tokens = append(tokens, encoding.FormatXXH128HashToken(full128.Sum128()))
 		case "xxh64":
-			tokens = append(tokens, formatXXH64HashToken(full64.Sum64()))
+			tokens = append(tokens, encoding.FormatXXH64HashToken(full64.Sum64()))
 		}
 	}
 	return tokens

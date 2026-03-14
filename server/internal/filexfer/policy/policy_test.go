@@ -42,7 +42,7 @@ func TestCompressionPolicyUpgradesStepwise(t *testing.T) {
 	mode := CompressionModeNone
 
 	for i := 0; i < 10; i++ {
-		d := pushDecision(p, mode, 1.20, 0.10)
+		d := pushDecision(p, mode, 1.20, 0.05)
 		if d.Next != mode {
 			mode = d.Next
 		}
@@ -58,7 +58,7 @@ func TestCompressionPolicyCanUpgradeFromNoneWithLatencySignalOnly(t *testing.T) 
 
 	// While in "none", measured ratio is ~1.0 by definition, so upgrade must rely on latency signal.
 	for i := 0; i < 4; i++ {
-		d := pushDecision(p, mode, 1.0, 0.10)
+		d := pushDecision(p, mode, 1.0, 0.05)
 		if d.Next != mode {
 			mode = d.Next
 		}
@@ -73,7 +73,7 @@ func TestCompressionPolicyUpgradeIgnoresRatio(t *testing.T) {
 	mode := CompressionModeLz4
 
 	for i := 0; i < 4; i++ {
-		d := pushDecision(p, mode, 0.80, 0.10)
+		d := pushDecision(p, mode, 0.80, 0.05)
 		if d.Next != mode {
 			mode = d.Next
 		}

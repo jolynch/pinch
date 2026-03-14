@@ -1,8 +1,9 @@
-package fhttp
+package ftcp
 
 import (
+	"context"
 	"encoding/json"
-	"net/http"
+	"io"
 )
 
 type DownloadStatus struct {
@@ -24,20 +25,36 @@ type TransferStatus struct {
 	DownloadStatus DownloadStatus `json:"download_status"`
 }
 
-func TransferStatusHandler(w http.ResponseWriter, req *http.Request) {
-	txferID := req.PathValue("txferid")
-	if txferID == "" {
-		http.Error(w, "missing required path parameter: txferid", http.StatusBadRequest)
-		return
+type statusRequest struct {
+	TransferID string
+}
+
+func parseSTATUSRequest(req Request) (statusRequest, error) {
+	if req.Verb != VerbSTATUS {
+		return statusRequest{}, protocolErr{code: "BAD_COMMAND", message: "not STATUS"}
 	}
-	transfer, ok := GetTransfer(txferID)
+	if len(req.Params) != 1 {
+		return statusRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid STATUS arguments"}
+	}
+	txferID := req.Params[0]["txferid"]
+	if txferID == "" {
+		return statusRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
+	}
+	return statusRequest{TransferID: txferID}, nil
+}
+
+func handleSTATUS(_ context.Context, req Request, out io.Writer, deps Deps) error {
+	parsed, err := parseSTATUSRequest(req)
+	if err != nil {
+		return err
+	}
+	transfer, ok := deps.GetTransfer(parsed.TransferID)
 	if !ok {
-		http.Error(w, "transfer not found", http.StatusNotFound)
-		return
+		return protocolErr{code: "NOT_FOUND", message: "transfer not found"}
 	}
 
 	status := TransferStatus{
-		TransferID: txferID,
+		TransferID: parsed.TransferID,
 		Directory:  transfer.Directory,
 		NumFiles:   transfer.NumFiles,
 		TotalSize:  transfer.TotalSize,
@@ -63,6 +80,9 @@ func TransferStatusHandler(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(status)
+	payload, err := json.Marshal(status)
+	if err != nil {
+		return protocolErr{code: "INTERNAL", message: "failed to encode status"}
+	}
+	return writeOKLine(out, string(payload))
 }
