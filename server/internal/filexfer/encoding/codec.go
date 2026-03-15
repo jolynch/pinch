@@ -244,7 +244,7 @@ func releasePooledLZ4Reader(reader *lz4.Reader) {
 }
 
 func MaxFrameWireSizeHintBytes(comp string, logicalSize int64) (int64, error) {
-	maxWire, err := maxEncodedFrameSizeBytes(comp, logicalSize)
+	maxWire, err := MaxEncodedFrameSizeBytes(comp, logicalSize)
 	if err != nil {
 		return 0, err
 	}
@@ -296,14 +296,6 @@ func ceilingMaxWSizeBucketBytes(size int64) int64 {
 		return maxWSizeBucket32MiB
 	}
 	return maxWSizeBucket64MiB
-}
-
-func maxEncodedFrameSizeBytes(comp string, logicalSize int64) (int64, error) {
-	return MaxEncodedFrameSizeBytes(comp, logicalSize)
-}
-
-func CeilingMaxWSizeBucketBytes(size int64) int64 {
-	return ceilingMaxWSizeBucketBytes(size)
 }
 
 func FormatXXH128HashToken(v xxh3.Uint128) string {

@@ -59,6 +59,25 @@ func ParseRequest(payload []byte) (Request, error) {
 		}
 		req.Params = append(req.Params, param)
 		return req, nil
+	case VerbSYNC:
+		directory, readErr := c.readPathValue()
+		if readErr != nil {
+			return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SYNC directory"}
+		}
+		param := map[string]string{"directory": string(directory)}
+		for !c.eof() {
+			tok, tokErr := c.readToken()
+			if tokErr != nil {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SYNC option"}
+			}
+			key, val, ok := strings.Cut(tok, "=")
+			if !ok {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid SYNC option"}
+			}
+			param[key] = val
+		}
+		req.Params = append(req.Params, param)
+		return req, nil
 	case VerbSEND:
 		txferID, readErr := c.readToken()
 		if readErr != nil || txferID == "" {

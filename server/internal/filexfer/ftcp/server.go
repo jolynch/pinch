@@ -23,6 +23,7 @@ type ServerOptions struct {
 	Deps                   Deps
 	Limiter                *limit.Limiter
 	SocketWriteBufferBytes int
+	SyncTimeout            time.Duration // 0 = no timeout; bounds SYNC response write time
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -35,6 +36,7 @@ var handlers = map[Verb]HandlerFunc{
 	VerbCXSUM:  handleCXSUM,
 	VerbSTATUS: handleSTATUS,
 	VerbPROBE:  handlePROBECommand,
+	VerbSYNC:   handleSYNCCommand,
 }
 
 func Serve(listener net.Listener, opts ServerOptions) error {
@@ -65,6 +67,7 @@ type connSession struct {
 	deps                   Deps
 	limiter                *limit.Limiter
 	socketWriteBufferBytes int
+	syncTimeout            time.Duration
 	respOut                io.Writer
 	closeResp              func() error
 	wroteBytes             bool
@@ -79,6 +82,7 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps) {
 		deps:                   deps,
 		limiter:                opts.Limiter,
 		socketWriteBufferBytes: opts.SocketWriteBufferBytes,
+		syncTimeout:            opts.SyncTimeout,
 		respOut:                conn,
 		closeResp:              func() error { return nil },
 	}
@@ -153,7 +157,7 @@ func (s *connSession) run() error {
 		s.wroteBytes = countingOut.n > 0
 		return err
 	}
-	if cmdReq.Verb == VerbTXFER || cmdReq.Verb == VerbSEND || cmdReq.Verb == VerbCXSUM || cmdReq.Verb == VerbPROBE {
+	if cmdReq.Verb == VerbTXFER || cmdReq.Verb == VerbSEND || cmdReq.Verb == VerbCXSUM || cmdReq.Verb == VerbPROBE || cmdReq.Verb == VerbSYNC {
 		if err := writeOKLine(countingOut, ""); err != nil {
 			s.wroteBytes = countingOut.n > 0
 			return err
@@ -169,6 +173,12 @@ func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Read
 	}
 	if req.Verb == VerbPROBE {
 		return handlePROBEWithInput(ctx, req, in, out, s.deps)
+	}
+	if req.Verb == VerbSYNC {
+		if s.syncTimeout > 0 {
+			_ = s.conn.SetWriteDeadline(time.Now().Add(s.syncTimeout))
+		}
+		return handleSYNCWithInput(ctx, req, in, out, s.deps)
 	}
 	handler, ok := handlers[req.Verb]
 	if !ok || req.Verb == VerbUnknown {
