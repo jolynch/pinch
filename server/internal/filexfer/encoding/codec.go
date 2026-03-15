@@ -211,7 +211,7 @@ func acquirePooledZstdDecoder(src io.Reader) (*zstd.Decoder, error) {
 			decoder.Close()
 		}
 	}
-	return zstd.NewReader(src)
+	return zstd.NewReader(src, zstd.WithDecoderConcurrency(1))
 }
 
 func releasePooledZstdDecoder(decoder *zstd.Decoder) {

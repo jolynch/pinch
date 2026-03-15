@@ -741,15 +741,22 @@ func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta Fi
 	default:
 		checksum = "checksum=[-]"
 	}
-	fmt.Fprintf(
-		stdout,
-		"start-file: fd=%d path=%s %s comp=%s rate=%s\n",
-		fileID,
-		path,
-		checksum,
-		compSummary,
-		encoding.HumanRate(speed),
-	)
+	// Build the full line before writing to avoid multiple Write calls (and lock
+	// acquisitions) on the synchronized stdout writer.
+	var sb strings.Builder
+	sb.Grow(128)
+	sb.WriteString("start-file: fd=")
+	sb.WriteString(strconv.FormatUint(fileID, 10))
+	sb.WriteString(" path=")
+	sb.WriteString(path)
+	sb.WriteByte(' ')
+	sb.WriteString(checksum)
+	sb.WriteString(" comp=")
+	sb.WriteString(compSummary)
+	sb.WriteString(" rate=")
+	sb.WriteString(encoding.HumanRate(speed))
+	sb.WriteByte('\n')
+	io.WriteString(stdout, sb.String())
 }
 
 func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer) func() {

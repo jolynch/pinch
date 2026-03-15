@@ -160,6 +160,12 @@ type Client struct {
 	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
 	bufferPool sync.Map // map[int]*sync.Pool
 
+	// lineReaderPool caches reusable *bufio.Reader objects for protocol header reading.
+	// bufio.Reader is pooled (not its []byte) because Reset() reuses the internal allocation
+	// and its Read(p) passes directly to the socket when len(p) >= internal size, avoiding
+	// an extra copy that pooledLineReader would introduce for bulk payload reads.
+	lineReaderPool sync.Pool
+
 	// scratchBufferPool caches reusable temporary byte buffers.
 	scratchBufferPool sync.Pool
 }
@@ -385,6 +391,9 @@ const (
 	defaultClientFrameBufferBytes int = 8 * 1024 * 1024
 	minClientFrameReadBufferBytes int = 32 * 1024
 
+	// Line reader buffers used for protocol header reading (matches minClientFrameReadBufferBytes).
+	defaultClientLineReaderBytes int = 32 * 1024
+
 	// Scratch buffers used for request/response payloads (headers, manifests, etc.).
 	defaultClientScratchBufferBytes int = 64 * 1024
 	maxClientScratchBufferPoolBytes int = 16 * 1024 * 1024
@@ -420,6 +429,11 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 		opt.apply(c)
 	}
 	c.bufferPool = sync.Map{}
+	c.lineReaderPool = sync.Pool{
+		New: func() any {
+			return bufio.NewReaderSize(nil, defaultClientLineReaderBytes)
+		},
+	}
 	c.scratchBufferPool = sync.Pool{
 		New: func() any {
 			return bytes.NewBuffer(make([]byte, 0, defaultClientScratchBufferBytes))
@@ -752,7 +766,8 @@ func (c *Client) downloadManifestGroupSequential(
 		return nil, nil, nil, err
 	}
 	defer stream.Close()
-	br := bufio.NewReader(stream)
+	br := c.acquireLineReader(stream)
+	defer c.releaseLineReader(br)
 
 	results := make([]DownloadFileResponse, 0, len(plans))
 	pendingAcks := make([]AcknowledgeFileProgressRequest, 0, len(plans))
@@ -788,7 +803,6 @@ func (c *Client) downloadManifestGroupSequential(
 			return writer.Close()
 		}
 
-		fileHasher := xxh3.New128()
 		if plan.resumeFrom > 0 {
 			emitProgressUpdate(DownloadProgressUpdate{
 				TransferID:  req.Manifest.TransferID,
@@ -847,7 +861,7 @@ func (c *Client) downloadManifestGroupSequential(
 				return nil, nil, nil, fmt.Errorf("decode payload reader: %w", decodeErr)
 			}
 			frameStartOffset := offset
-			copyErr := copyStreamWithProgress(io.MultiWriter(writer, fileHasher, windowHasher), logicalReader, frameBuf, nil, func(written int64) error {
+			copyErr := copyStreamWithProgress(newParallelMultiWriter(writer, windowHasher), logicalReader, frameBuf, func(written int64) error {
 				emitProgressUpdate(DownloadProgressUpdate{
 					TransferID:  req.Manifest.TransferID,
 					FileID:      plan.entry.ID,
@@ -932,7 +946,7 @@ func (c *Client) downloadManifestGroupSequential(
 			return nil, nil, nil, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
 		}
 
-		localHash := intencoding.FormatXXH128HashToken(fileHasher.Sum128())
+		localHash := windowHash
 		recvMS := time.Since(fileStart).Milliseconds()
 		deltaBytes := offset - plan.resumeFrom
 		pendingAcks = append(pendingAcks, AcknowledgeFileProgressRequest{
@@ -1360,7 +1374,7 @@ func (c *Client) downloadSplitWindow(
 	defer releaseFrameBuf()
 
 	windowHasher := xxh3.New128()
-	copyErr := copyStreamWithProgress(io.MultiWriter(writer, windowHasher), reader, frameBuf, nil, func(written int64) error {
+	copyErr := copyStreamWithProgress(newParallelMultiWriter(writer, windowHasher), reader, frameBuf, func(written int64) error {
 		emitProgressUpdate(DownloadProgressUpdate{
 			TransferID:  req.Manifest.TransferID,
 			FileID:      plan.entry.ID,
@@ -1834,18 +1848,47 @@ func mergeCompCounts(dst map[string]uint64, src map[string]uint64) {
 	}
 }
 
-func copyStreamWithProgress(dst io.Writer, src io.Reader, buf []byte, hash *xxh3.Hasher128, onWrite func(written int64) error) error {
+// parallelMultiWriter writes to primary in the calling goroutine and to each
+// secondary concurrently, joining all before returning from Write.
+// The buffer passed to Write must not be modified until Write returns.
+type parallelMultiWriter struct {
+	primary     io.Writer
+	secondaries []io.Writer
+}
+
+func newParallelMultiWriter(primary io.Writer, secondaries ...io.Writer) io.Writer {
+	if len(secondaries) == 0 {
+		return primary
+	}
+	return &parallelMultiWriter{primary: primary, secondaries: secondaries}
+}
+
+func (w *parallelMultiWriter) Write(p []byte) (int, error) {
+	errs := make([]chan error, len(w.secondaries))
+	for i, s := range w.secondaries {
+		ch := make(chan error, 1)
+		errs[i] = ch
+		go func(s io.Writer) {
+			_, err := s.Write(p)
+			ch <- err
+		}(s)
+	}
+	n, err := w.primary.Write(p)
+	for _, ch := range errs {
+		if sErr := <-ch; sErr != nil && err == nil {
+			err = sErr
+		}
+	}
+	return n, err
+}
+
+func copyStreamWithProgress(dst io.Writer, src io.Reader, buf []byte, onWrite func(written int64) error) error {
 	var written int64
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			if _, err := dst.Write(buf[:n]); err != nil {
 				return err
-			}
-			if hash != nil {
-				if _, err := hash.Write(buf[:n]); err != nil {
-					return err
-				}
 			}
 			written += int64(n)
 			if onWrite != nil {
@@ -1959,11 +2002,28 @@ func (c *Client) releaseScratchBuffer(buf *bytes.Buffer) {
 	c.scratchBufferPool.Put(buf)
 }
 
+func (c *Client) acquireLineReader(r io.Reader) *bufio.Reader {
+	raw := c.lineReaderPool.Get()
+	br := raw.(*bufio.Reader)
+	br.Reset(r)
+	return br
+}
+
+func (c *Client) releaseLineReader(br *bufio.Reader) {
+	br.Reset(nil) // release reference to the underlying reader
+	c.lineReaderPool.Put(br)
+}
+
 func parseManifest(raw []byte) (*Manifest, error) {
 	reader := bufio.NewReader(bytes.NewReader(raw))
 	manifest := &Manifest{}
+	// Pre-allocate based on newline count — an upper bound on entry count that
+	// avoids repeated growslice doublings (and the GC pauses they trigger) for
+	// large manifests.
+	capacityHint := bytes.Count(raw, []byte{'\n'})
+	manifest.Entries = make([]ManifestEntry, 0, capacityHint)
 	seenHeader := false
-	seenIDs := make(map[uint64]struct{})
+	seenIDs := make(map[uint64]struct{}, capacityHint)
 	var prevPath string
 	var prevMtime string
 	var lastID uint64
