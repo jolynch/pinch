@@ -11,10 +11,12 @@ ENV PATH=$PATH:$GOPATH/bin:/opt/protoc/bin
 # Now copy over our code
 RUN mkdir -p /go/src/
 
-COPY go.mod /go/src/go.mod
+COPY go.mod go.sum /go/src/
 COPY main.go /go/src/main.go
 COPY state /go/src/state
 COPY utils /go/src/utils
+COPY internal /go/src/internal
+COPY filexfer /go/src/filexfer
 
 WORKDIR /go/src/
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -tags netgo -ldflags='-s -w -extldflags "-static"' -o pinch-server
