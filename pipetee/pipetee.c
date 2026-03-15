@@ -2,12 +2,14 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
 
 void usage (char *argv[]) {
     fprintf(stderr, "Usage: %s [OPTION] [FILE]...\n", argv[0]);
+    fprintf(stderr, "  -a    Append to files instead of truncating.\n");
     fprintf(stderr, "  -b    Pipe buffer sizes in bytes. Defaults to the size of the input pipe or 131072 for files.\n");
     exit(EXIT_FAILURE);
 }
@@ -23,13 +25,23 @@ int main(int argc, char *argv[]) {
     int len, dlen, slen, nfd, ret;
     long buf_size = 0;
     long inpipe_size = 0;
+    int append = 0;
     int opt;
 
-    while ((opt = getopt(argc, argv, "b:")) != -1 ) {
+    while ((opt = getopt(argc, argv, "ab:")) != -1 ) {
         switch (opt) {
-        case 'b':
-            buf_size = atoi(optarg);
+        case 'a':
+            append = 1;
             break;
+        case 'b': {
+            char *end;
+            buf_size = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || buf_size <= 0) {
+                fprintf(stderr, "Invalid buffer size: %s\n", optarg);
+                usage(argv);
+            }
+            break;
+        }
         default:
             usage(argv);
             exit(EXIT_FAILURE);
@@ -66,7 +78,7 @@ int main(int argc, char *argv[]) {
      * The tee syscall can only duplicate to pipes, so we need to have
      * a kernel "buffer" (aka pipe) we control per output file and
      * one for our output. Without this approach we can't know that our
-     * destinatios can receive the full copy in one tee call.
+     * destinations can receive the full copy in one tee call.
      */
     int buffers[nfd+1][2];
 
@@ -76,6 +88,12 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Could not open %s\n", argv[i+optind]);
             perror("open");
             exit(EXIT_FAILURE);
+        }
+        if (!append) {
+            struct stat st;
+            if (fstat(fds[i], &st) == 0 && S_ISREG(st.st_mode)) {
+                ftruncate(fds[i], 0);
+            }
         }
         if (pipe(buffers[i]) < 0) {
             perror("buffer");
@@ -132,7 +150,7 @@ int main(int argc, char *argv[]) {
             dlen = tee(buffers[nfd][0], buffers[i][1], len, 0);
             if (dlen != len) {
                 // Since we can't "re-copy" this is a failure condition
-                fprintf(stderr, "Not able to do a full tee zero-copy! %d %d\n", slen, len);
+                fprintf(stderr, "Not able to do a full tee zero-copy! %d %d\n", dlen, len);
                 exit(EXIT_FAILURE);
             }
             // Drain the "copied" buffer to the downstream FDs
