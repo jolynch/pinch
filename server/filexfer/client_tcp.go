@@ -22,9 +22,10 @@ import (
 const maxTCPLineBytes = 4 * 1024 * 1024
 
 type tcpAuthState struct {
-	publicKey       string
-	identity        string
-	hasAuth         bool
+	publicKey      string
+	identity       string
+	parsedIdentity age.Identity
+	hasAuth        bool
 	encryptCommands bool
 }
 
@@ -204,9 +205,11 @@ func (c *Client) resolveTCPAuthState(requestPub string, requestIdentity string) 
 		return tcpAuthState{}, errors.New("missing age identity for authenticated response")
 	}
 	if state.hasAuth {
-		if _, err := parseAgeIdentity(state.identity); err != nil {
+		parsed, err := parseAgeIdentity(state.identity)
+		if err != nil {
 			return tcpAuthState{}, err
 		}
+		state.parsedIdentity = parsed
 	}
 	if state.encryptCommands {
 		if _, err := age.ParseX25519Recipient(serverPub); err != nil {
@@ -265,10 +268,7 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 	if !state.hasAuth {
 		return conn, nil
 	}
-	identity, err := parseAgeIdentity(state.identity)
-	if err != nil {
-		return nil, err
-	}
+	identity := state.parsedIdentity
 	if identity == nil {
 		return nil, errors.New("missing age identity for encrypted response")
 	}

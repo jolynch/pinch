@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
@@ -19,12 +20,15 @@ const (
 	EncodingLz4      = "lz4"
 )
 
+const defaultZstdFrameSize = 8 * 1024 * 1024
+
 type zstdMaxEncodedSizeCache struct {
-	once sync.Once
-	mu   sync.Mutex
-	enc  *zstd.Encoder
-	err  error
-	size map[int]int
+	once           sync.Once
+	mu             sync.RWMutex
+	enc            *zstd.Encoder
+	err            error
+	size           map[int]int
+	defaultMaxSize atomic.Int64
 }
 
 var zstdMaxSizer zstdMaxEncodedSizeCache
@@ -36,12 +40,29 @@ func (c *zstdMaxEncodedSizeCache) maxEncodedSize(n int) (int, error) {
 		c.enc, c.err = zstd.NewWriter(io.Discard)
 		if c.err == nil {
 			c.size = make(map[int]int)
+			defaultMax := c.enc.MaxEncodedSize(defaultZstdFrameSize)
+			c.defaultMaxSize.Store(int64(defaultMax))
+			c.size[defaultZstdFrameSize] = defaultMax
 		}
 	})
 	if c.err != nil {
 		return 0, c.err
 	}
 
+	// Lock-free fast path for the default frame size.
+	if n == defaultZstdFrameSize {
+		return int(c.defaultMaxSize.Load()), nil
+	}
+
+	// Read-lock fast path for other cached sizes.
+	c.mu.RLock()
+	if cached, ok := c.size[n]; ok {
+		c.mu.RUnlock()
+		return cached, nil
+	}
+	c.mu.RUnlock()
+
+	// Write-lock slow path for cache miss.
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if cached, ok := c.size[n]; ok {

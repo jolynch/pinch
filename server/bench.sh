@@ -9,6 +9,7 @@ Arguments:
   SOURCE_DIRECTORY           Source directory for transfer (required).
 
 Options:
+  --rsync                    Run an rsync baseline instead of a pinch transfer.
   --flamegraph               Run start benchmark under perf and emit flamegraph SVG.
   --trace                    Capture runtime/trace for client and server (view with go tool trace).
   --build                    Build ./pinch before benchmarking (default: true).

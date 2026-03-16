@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -422,6 +423,189 @@ func TestWindowHashesTrackedPerEndOffset(t *testing.T) {
 	}
 }
 
+func TestDeleteTransferInvalidatesManagedTransfer(t *testing.T) {
+	resetTransferStore()
+
+	transfer, err := NewTransfer("/tmp/x", 1, 10)
+	if err != nil {
+		t.Fatalf("NewTransfer failed: %v", err)
+	}
+	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
+		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/x/0")), FileSize: 10},
+	}, TransferStateRunning)
+
+	managed, ok := manager.getManagedTransfer(transfer.ID)
+	if !ok {
+		t.Fatalf("expected managed transfer")
+	}
+	if ok := DeleteTransfer(transfer.ID); !ok {
+		t.Fatalf("DeleteTransfer returned false")
+	}
+	if _, ok := GetTransfer(transfer.ID); ok {
+		t.Fatalf("deleted transfer should not be visible")
+	}
+
+	managed.mu.RLock()
+	if !managed.deleted {
+		managed.mu.RUnlock()
+		t.Fatalf("expected managed transfer to be marked deleted")
+	}
+	managed.mu.RUnlock()
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if ok := manager.acknowledgeFileLocked(managed, 0, 4); ok {
+		t.Fatalf("expected stale managed transfer mutation to fail after delete")
+	}
+}
+
+func TestAcknowledgeTransferFilesMixedTransfers(t *testing.T) {
+	resetTransferStore()
+
+	first, err := NewTransfer("/tmp/a", 1, 10)
+	if err != nil {
+		t.Fatalf("NewTransfer first failed: %v", err)
+	}
+	second, err := NewTransfer("/tmp/b", 1, 12)
+	if err != nil {
+		t.Fatalf("NewTransfer second failed: %v", err)
+	}
+	RegisterTransferFileStates(first.ID, []TransferFileStateUpdate{
+		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/a/0")), FileSize: 10},
+	}, TransferStateRunning)
+	RegisterTransferFileStates(second.ID, []TransferFileStateUpdate{
+		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/b/0")), FileSize: 12},
+	}, TransferStateRunning)
+
+	firstToken := "xxh128:0000000000000000000000000000000a"
+	secondToken := "xxh128:0000000000000000000000000000000b"
+	if ok := SetTransferFileWindowHash(first.ID, 0, 6, firstToken); !ok {
+		t.Fatalf("SetTransferFileWindowHash first returned false")
+	}
+	if ok := SetTransferFileWindowHash(second.ID, 0, 8, secondToken); !ok {
+		t.Fatalf("SetTransferFileWindowHash second returned false")
+	}
+
+	if ok := AcknowledgeTransferFiles([]AckEntry{
+		{TxferID: first.ID, FileID: 0, AckBytes: 6},
+		{TxferID: second.ID, FileID: 0, AckBytes: 8},
+	}); !ok {
+		t.Fatalf("AcknowledgeTransferFiles returned false")
+	}
+
+	firstStored, ok := GetTransfer(first.ID)
+	if !ok {
+		t.Fatalf("first transfer not found")
+	}
+	if firstStored.DoneSize != 6 || firstStored.Done != 0 {
+		t.Fatalf("unexpected first counters: done=%d doneSize=%d", firstStored.Done, firstStored.DoneSize)
+	}
+	secondStored, ok := GetTransfer(second.ID)
+	if !ok {
+		t.Fatalf("second transfer not found")
+	}
+	if secondStored.DoneSize != 8 || secondStored.Done != 0 {
+		t.Fatalf("unexpected second counters: done=%d doneSize=%d", secondStored.Done, secondStored.DoneSize)
+	}
+	if VerifyTransferFileWindowHash(first.ID, 0, 6, firstToken) {
+		t.Fatalf("expected first window hash cleared after ack")
+	}
+	if VerifyTransferFileWindowHash(second.ID, 0, 8, secondToken) {
+		t.Fatalf("expected second window hash cleared after ack")
+	}
+}
+
+func TestWindowHashesAreTransferLocal(t *testing.T) {
+	resetTransferStore()
+
+	first, err := NewTransfer("/tmp/a", 1, 10)
+	if err != nil {
+		t.Fatalf("NewTransfer first failed: %v", err)
+	}
+	second, err := NewTransfer("/tmp/b", 1, 10)
+	if err != nil {
+		t.Fatalf("NewTransfer second failed: %v", err)
+	}
+	RegisterTransferFileStates(first.ID, []TransferFileStateUpdate{
+		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/a/0")), FileSize: 10},
+	}, TransferStateRunning)
+	RegisterTransferFileStates(second.ID, []TransferFileStateUpdate{
+		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/b/0")), FileSize: 10},
+	}, TransferStateRunning)
+
+	firstToken := "xxh128:0000000000000000000000000000000c"
+	secondToken := "xxh128:0000000000000000000000000000000d"
+	if ok := SetTransferFileWindowHash(first.ID, 0, 4, firstToken); !ok {
+		t.Fatalf("SetTransferFileWindowHash first returned false")
+	}
+	if ok := SetTransferFileWindowHash(second.ID, 0, 4, secondToken); !ok {
+		t.Fatalf("SetTransferFileWindowHash second returned false")
+	}
+	if !VerifyTransferFileWindowHash(first.ID, 0, 4, firstToken) {
+		t.Fatalf("expected first transfer window hash")
+	}
+	if !VerifyTransferFileWindowHash(second.ID, 0, 4, secondToken) {
+		t.Fatalf("expected second transfer window hash")
+	}
+
+	if ok := AcknowledgeTransferFile(first.ID, 0, 4); !ok {
+		t.Fatalf("AcknowledgeTransferFile first returned false")
+	}
+	if VerifyTransferFileWindowHash(first.ID, 0, 4, firstToken) {
+		t.Fatalf("expected first transfer window hash cleared")
+	}
+	if !VerifyTransferFileWindowHash(second.ID, 0, 4, secondToken) {
+		t.Fatalf("expected second transfer window hash to remain")
+	}
+}
+
+func TestGetTransferSnapshotsAreCopies(t *testing.T) {
+	resetTransferStore()
+
+	transfer, err := NewTransfer("/tmp/x", 1, 10)
+	if err != nil {
+		t.Fatalf("NewTransfer failed: %v", err)
+	}
+	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
+		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/x/0")), FileSize: 10},
+	}, TransferStateRunning)
+
+	stored, ok := GetTransfer(transfer.ID)
+	if !ok {
+		t.Fatalf("GetTransfer returned not found")
+	}
+	stored.State[0] = TransferStateMissing
+	stored.PathHash[0] = xxh3.Hash128([]byte("mutated"))
+	stored.FileSize[0] = 999
+	stored.AckedSize[0] = 999
+
+	storedAgain, ok := GetTransfer(transfer.ID)
+	if !ok {
+		t.Fatalf("GetTransfer returned not found on second read")
+	}
+	if storedAgain.State[0] != TransferStateRunning {
+		t.Fatalf("expected original transfer state to remain running, got %d", storedAgain.State[0])
+	}
+	if storedAgain.FileSize[0] != 10 || storedAgain.AckedSize[0] != 0 {
+		t.Fatalf("expected original transfer sizes to remain unchanged")
+	}
+
+	states, ok := GetTransferFileStates(transfer.ID)
+	if !ok {
+		t.Fatalf("GetTransferFileStates returned not found")
+	}
+	states[0].State = TransferStateMissing
+	states[0].PathHash = xxh3.Hash128([]byte("mutated-again"))
+
+	statesAgain, ok := GetTransferFileStates(transfer.ID)
+	if !ok {
+		t.Fatalf("GetTransferFileStates returned not found on second read")
+	}
+	if statesAgain[0].State != TransferStateRunning {
+		t.Fatalf("expected wrapped state snapshot to be isolated, got %d", statesAgain[0].State)
+	}
+}
+
 func setupLookupFixture(t *testing.T, fileName string, content []byte) (string, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -538,4 +722,50 @@ func TestGetFileSuccess(t *testing.T) {
 	if ref.FileSize != 5 {
 		t.Fatalf("unexpected ref size: %d", ref.FileSize)
 	}
+}
+
+func BenchmarkTransferStoreConcurrentHotPaths(b *testing.B) {
+	resetTransferStore()
+
+	const numTransfers = 32
+	const filesPerTransfer = 8
+	transferIDs := make([]string, 0, numTransfers)
+	for i := 0; i < numTransfers; i++ {
+		transfer, err := NewTransfer("/tmp/bench-"+strconv.Itoa(i), filesPerTransfer, int64(filesPerTransfer*1024))
+		if err != nil {
+			b.Fatalf("NewTransfer failed: %v", err)
+		}
+		updates := make([]TransferFileStateUpdate, 0, filesPerTransfer)
+		for fileID := 0; fileID < filesPerTransfer; fileID++ {
+			updates = append(updates, TransferFileStateUpdate{
+				FileID:   uint64(fileID),
+				PathHash: xxh3.Hash128([]byte(transfer.ID + "-" + strconv.Itoa(fileID))),
+				FileSize: 1024,
+			})
+		}
+		RegisterTransferFileStates(transfer.ID, updates, TransferStateRunning)
+		transferIDs = append(transferIDs, transfer.ID)
+	}
+
+	var counter atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n := counter.Add(1)
+			txferID := transferIDs[int(n)%len(transferIDs)]
+			fileID := uint64((n / uint64(len(transferIDs))) % filesPerTransfer)
+			endBytes := int64((n%8)+1) * 64
+			token := "xxh128:" + strconv.FormatUint(n, 16)
+
+			if !SetTransferFileState(txferID, fileID, TransferStateRunning) {
+				b.Fatalf("SetTransferFileState returned false")
+			}
+			if !SetTransferFileWindowHash(txferID, fileID, endBytes, token) {
+				b.Fatalf("SetTransferFileWindowHash returned false")
+			}
+			if !AcknowledgeTransferFiles([]AckEntry{{TxferID: txferID, FileID: fileID, AckBytes: endBytes}}) {
+				b.Fatalf("AcknowledgeTransferFiles returned false")
+			}
+		}
+	})
 }
