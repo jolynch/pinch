@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"os"
 	"runtime"
 	"runtime/trace"
@@ -63,6 +64,7 @@ type frameStreamArgs struct {
 	TerminalMD    *encoding.FileFrameMetadata
 	WindowHasher  *xxh3.Hasher128
 	Output        io.Writer
+	OutputTCPConn *net.TCPConn
 	PipeSizeBytes int
 	DirectIO      bool
 }
@@ -207,7 +209,6 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 		return protocolErr{code: "INTERNAL", message: "failed to compute max frame size hint"}
 	}
 	pipeSizeBytes := desiredPipeSizeBytes(windowLen, firstFrameLogical)
-	useLinuxSplice := runtime.GOOS == "linux" && item.Mode == loadStrategyFast
 	firstFrame := true
 
 	adaptive := item.Comp == "adapt"
@@ -249,14 +250,15 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 			TerminalMD:    terminalMD,
 			WindowHasher:  windowHasher,
 			Output:        out,
+			OutputTCPConn: extractTCPConn(out),
 			PipeSizeBytes: pipeSizeBytes,
 			DirectIO:      usedDirectOpen,
 		}
 
 		frameOffset := cursor
 		var stats frameStreamStats
-		if useLinuxSplice {
-			stats, err = streamFramePayloadLinuxSplice(fd, &frameOffset, frameArgs)
+		if canZeroCopy(frameArgs) {
+			stats, err = streamFramePayloadZeroCopy(fd, &frameOffset, frameArgs)
 		} else {
 			stats, err = streamFramePayloadBuffered(fd, &frameOffset, frameArgs)
 		}
@@ -273,7 +275,6 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 					return mapLookupError(err)
 				}
 				usedDirectOpen = false
-				useLinuxSplice = runtime.GOOS == "linux" && item.Mode == loadStrategyFast
 				remaining = item.Offset + windowLen - cursor
 				if remaining < 0 {
 					return protocolErr{code: "INTERNAL", message: "invalid resume offset after direct I/O retry"}
@@ -389,6 +390,30 @@ func isDirectIOReadError(err error) bool {
 		return false
 	}
 	return errors.Is(err, syscall.EINVAL) || errors.Is(err, unix.EINVAL)
+}
+
+// canZeroCopy reports whether a frame can use the tee+splice zero-copy send
+// path, which avoids copying payload bytes into userspace for the network
+// write. The path requires all of:
+//   - Linux (tee/splice are Linux-only syscalls)
+//   - No compression (compressed data must be assembled in userspace)
+//   - No O_DIRECT (direct I/O requires aligned userspace buffers, not pipes)
+//   - A raw TCP socket (no encryption or rate-limit wrapper over the conn)
+func canZeroCopy(args frameStreamArgs) bool {
+	return runtime.GOOS == "linux" &&
+		args.Comp == "none" &&
+		!args.DirectIO &&
+		args.OutputTCPConn != nil
+}
+
+func extractTCPConn(w io.Writer) *net.TCPConn {
+	if cw, ok := w.(*countingWriter); ok {
+		w = cw.w
+	}
+	if tc, ok := w.(*net.TCPConn); ok {
+		return tc
+	}
+	return nil
 }
 
 func initialCompressionMode(comp string) policy.CompressionMode {
@@ -622,18 +647,56 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	}, nil
 }
 
-func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
-	if args.Comp == "none" && args.DirectIO {
-		return streamFramePayloadBuffered(fd, fileOffset, args)
+func dupConnFD(conn *net.TCPConn) (int, error) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return -1, err
 	}
+	dupFD := -1
+	var dupErr error
+	if err := raw.Control(func(fd uintptr) {
+		dupFD, dupErr = unix.Dup(int(fd))
+	}); err != nil {
+		return -1, err
+	}
+	if dupErr != nil {
+		return -1, dupErr
+	}
+	if dupFD < 0 {
+		return -1, errors.New("failed to duplicate connection fd")
+	}
+	return dupFD, nil
+}
 
+const zeroCopyPollTimeoutMs = 30_000 // 30s per poll wait
+
+func waitSocketWritable(fd int) error {
+	pollFDs := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+	for {
+		n, err := unix.Poll(pollFDs, zeroCopyPollTimeoutMs)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return err
+		}
+		if n == 0 {
+			return errors.New("zero-copy splice timed out waiting for socket writable")
+		}
+		if pollFDs[0].Revents&(unix.POLLERR|unix.POLLHUP) != 0 {
+			return errors.New("socket error during zero-copy splice")
+		}
+		return nil
+	}
+}
+
+func streamFramePayloadZeroCopy(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
 	srcR, srcW, err := os.Pipe()
 	if err != nil {
 		return frameStreamStats{}, err
 	}
 	defer srcR.Close()
 	defer srcW.Close()
-
 	growPipeBestEffort(srcR, args.PipeSizeBytes)
 	growPipeBestEffort(srcW, args.PipeSizeBytes)
 
@@ -644,42 +707,42 @@ func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, args frameStr
 	}
 	defer releaseCopyBuf()
 
+	outFD, err := dupConnFD(args.OutputTCPConn)
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+	defer unix.Close(outFD)
+
+	// Hash pipe: tee duplicates pipe1 data here for hashing, while pipe1
+	// data is spliced directly to the socket without entering userspace.
+	hashPipeR, hashPipeW, err := os.Pipe()
+	if err != nil {
+		return frameStreamStats{}, err
+	}
+	defer hashPipeR.Close()
+	defer hashPipeW.Close()
+	growPipeBestEffort(hashPipeR, args.PipeSizeBytes)
+	growPipeBestEffort(hashPipeW, args.PipeSizeBytes)
+
 	writeLatency := time.Duration(0)
-	isCompressed := args.Comp != "none"
-
-	// For compressed: buffer payload into frameBuf so wireSize is known before writing the header.
-	// For none: wireSize == frameSize, write the header immediately and splice directly.
-	payloadWriter := io.Writer(args.Output)
-	var frameBuf *bytes.Buffer
-	var closeCompWriter func() error
-
-	if isCompressed {
-		frameBuf = acquireCompressedFrameBuffer(args.FrameSize, args.Comp)
-		defer releaseCompressedFrameBuffer(frameBuf)
-		var compWriter io.Writer
-		var selected string
-		compWriter, closeCompWriter, selected, err = encoding.WrapCompressedWriter(frameBuf, args.Comp, args.Mode)
-		if err != nil {
-			return frameStreamStats{}, err
-		}
-		if selected != args.Comp {
-			return frameStreamStats{}, errors.New("compression mode negotiation mismatch")
-		}
-		payloadWriter = compWriter
-	} else {
-		if err := writeFrameHeader(args.Output, args, args.FrameSize, &writeLatency); err != nil {
-			return frameStreamStats{}, err
-		}
+	if err := writeFrameHeader(args.Output, args, args.FrameSize, &writeLatency); err != nil {
+		return frameStreamStats{}, err
 	}
 
 	prepareLatency := time.Duration(0)
 	remaining := args.FrameSize
-	readRegion := trace.StartRegion(args.Ctx, "frame-read")
+
+	// Fd() puts these into blocking mode — required for raw tee/splice syscalls.
+	srcRFD := int(srcR.Fd())
+	hashPipeWFD := int(hashPipeW.Fd())
+
+	readRegion := trace.StartRegion(args.Ctx, "frame-read-zerocopy")
 	for remaining > 0 {
 		step := remaining
 		if step > int64(args.PipeSizeBytes) {
 			step = int64(args.PipeSizeBytes)
 		}
+
 		spliceStart := time.Now()
 		splicedIn, spliceErr := unix.Splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), unix.SPLICE_F_MOVE)
 		prepareLatency += time.Since(spliceStart)
@@ -692,63 +755,67 @@ func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, args frameStr
 			return frameStreamStats{}, io.ErrUnexpectedEOF
 		}
 
-		sourceRemaining := int64(splicedIn)
+		// tee(2) does not consume src bytes. If tee returns a partial
+		// duplicate, we must consume exactly that amount from src before
+		// calling tee again, otherwise we'd duplicate the same prefix
+		// repeatedly.
+		sourceRemaining := splicedIn
 		for sourceRemaining > 0 {
-			chunk := sourceRemaining
-			if chunk > int64(len(copyBuf)) {
-				chunk = int64(len(copyBuf))
+			teeStart := time.Now()
+			teed, teeErr := unix.Tee(srcRFD, hashPipeWFD, int(sourceRemaining), 0)
+			prepareLatency += time.Since(teeStart)
+			if teeErr != nil {
+				readRegion.End()
+				return frameStreamStats{}, teeErr
 			}
+			if teed <= 0 {
+				readRegion.End()
+				return frameStreamStats{}, io.ErrUnexpectedEOF
+			}
+
+			// splice: consume teed bytes from pipe1 → socket (zero-copy)
+			writeStart := time.Now()
+			moveRemaining := teed
+			for moveRemaining > 0 {
+				moved, moveErr := unix.Splice(srcRFD, nil, outFD, nil, int(moveRemaining), unix.SPLICE_F_MOVE)
+				if moveErr != nil {
+					if errors.Is(moveErr, unix.EINTR) {
+						continue
+					}
+					if errors.Is(moveErr, unix.EAGAIN) {
+						if waitErr := waitSocketWritable(outFD); waitErr != nil {
+							readRegion.End()
+							return frameStreamStats{}, waitErr
+						}
+						continue
+					}
+					readRegion.End()
+					return frameStreamStats{}, moveErr
+				}
+				if moved <= 0 {
+					readRegion.End()
+					return frameStreamStats{}, io.ErrUnexpectedEOF
+				}
+				moveRemaining -= moved
+			}
+			writeLatency += time.Since(writeStart)
+
+			// read from hash pipe + hash (the only userspace copy)
 			readStart := time.Now()
-			n, readErr := io.ReadFull(srcR, copyBuf[:chunk])
+			n, readErr := io.ReadFull(hashPipeR, copyBuf[:teed])
 			prepareLatency += time.Since(readStart)
 			if n > 0 {
 				_, _ = args.WindowHasher.Write(copyBuf[:n])
-				writeStart := time.Now()
-				written, writeErr := payloadWriter.Write(copyBuf[:n])
-				if !isCompressed {
-					writeLatency += time.Since(writeStart)
-				} else {
-					prepareLatency += time.Since(writeStart)
-				}
-				if writeErr != nil {
-					readRegion.End()
-					return frameStreamStats{}, writeErr
-				}
-				if written != n {
-					readRegion.End()
-					return frameStreamStats{}, io.ErrShortWrite
-				}
-				sourceRemaining -= int64(n)
 			}
 			if readErr != nil {
 				readRegion.End()
 				return frameStreamStats{}, readErr
 			}
+			sourceRemaining -= teed
 		}
-		remaining -= int64(splicedIn)
+		remaining -= splicedIn
 	}
 	readRegion.End()
-
-	wireSize := args.FrameSize
-	if isCompressed {
-		compRegion := trace.StartRegion(args.Ctx, "frame-compress")
-		if err := closeCompWriter(); err != nil {
-			compRegion.End()
-			return frameStreamStats{}, err
-		}
-		wireSize = int64(frameBuf.Len())
-		if err := writeFrameHeader(args.Output, args, wireSize, &writeLatency); err != nil {
-			compRegion.End()
-			return frameStreamStats{}, err
-		}
-		writeStart := time.Now()
-		if _, err := args.Output.Write(frameBuf.Bytes()); err != nil {
-			compRegion.End()
-			return frameStreamStats{}, err
-		}
-		writeLatency += time.Since(writeStart)
-		compRegion.End()
-	}
 
 	windowHashToken, err := writeFrameTrailer(args.Output, args, &writeLatency)
 	if err != nil {
@@ -757,7 +824,7 @@ func streamFramePayloadLinuxSplice(fd *os.File, fileOffset *int64, args frameStr
 
 	return frameStreamStats{
 		LogicalSize:     args.FrameSize,
-		WireSize:        wireSize,
+		WireSize:        args.FrameSize,
 		PrepareLatency:  prepareLatency,
 		WriteLatency:    writeLatency,
 		NextOffset:      *fileOffset,
