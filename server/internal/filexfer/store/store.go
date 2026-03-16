@@ -36,21 +36,21 @@ const (
 )
 
 type Transfer struct {
-	ID        string
-	Directory string
-	Mode      string
-	LinkMbps  int64
+	ID          string
+	Directory   string
+	Mode        string
+	LinkMbps    int64
 	Concurrency int
-	NumFiles  int
-	TotalSize int64
-	Done      uint64
-	DoneSize  int64
-	State     []uint8
-	PathHash  []xxh3.Uint128
-	FileSize  []int64
-	AckedSize []int64
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	NumFiles    int
+	TotalSize   int64
+	Done        uint64
+	DoneSize    int64
+	State       []uint8
+	PathHash    []xxh3.Uint128
+	FileSize    []int64
+	AckedSize   []int64
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
 }
 
 type TransferFileState struct {
@@ -84,16 +84,17 @@ func (e *FileLookupError) Error() string {
 	return e.Msg
 }
 
-type transferStore struct {
+type managedTransfer struct {
 	mu           sync.RWMutex
-	transfers    map[string]Transfer
-	fileHashes   map[fileHashKey]fileHashState
+	deleted      bool
+	transfer     Transfer
+	fileHashes   map[uint64]fileHashState
 	windowHashes map[windowHashKey]*windowHashState
 }
 
-type fileHashKey struct {
-	txferID string
-	fileID  uint64
+type transferStore struct {
+	mu        sync.RWMutex
+	transfers map[string]*managedTransfer
 }
 
 type fileHashState struct {
@@ -108,8 +109,7 @@ type fileHashState struct {
 }
 
 type windowHashKey struct {
-	txferID string
-	fileID  uint64
+	fileID   uint64
 	endBytes int64
 }
 
@@ -136,8 +136,14 @@ func init() {
 
 func newTransferStore() *transferStore {
 	return &transferStore{
-		transfers:    make(map[string]Transfer),
-		fileHashes:   make(map[fileHashKey]fileHashState),
+		transfers: make(map[string]*managedTransfer),
+	}
+}
+
+func newManagedTransfer(transfer Transfer) *managedTransfer {
+	return &managedTransfer{
+		transfer:     transfer,
+		fileHashes:   make(map[uint64]fileHashState),
 		windowHashes: make(map[windowHashKey]*windowHashState),
 	}
 }
@@ -146,44 +152,65 @@ func shouldAdvanceState(current uint8, next uint8) bool {
 	return next >= current
 }
 
+func cloneTransfer(transfer Transfer) Transfer {
+	out := transfer
+	out.State = append([]uint8(nil), transfer.State...)
+	out.PathHash = append([]xxh3.Uint128(nil), transfer.PathHash...)
+	out.FileSize = append([]int64(nil), transfer.FileSize...)
+	out.AckedSize = append([]int64(nil), transfer.AckedSize...)
+	return out
+}
+
+func (s *transferStore) getManagedTransfer(txferID string) (*managedTransfer, bool) {
+	s.mu.RLock()
+	managed, ok := s.transfers[txferID]
+	s.mu.RUnlock()
+	return managed, ok
+}
+
 func (s *transferStore) create(transfer Transfer) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.transfers[transfer.ID]; exists {
 		return false
 	}
-	s.transfers[transfer.ID] = transfer
+	s.transfers[transfer.ID] = newManagedTransfer(transfer)
 	return true
 }
 
 func (s *transferStore) setState(txferID string, state uint8) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
 	}
-	for i := range transfer.State {
-		if shouldAdvanceState(transfer.State[i], state) {
-			transfer.State[i] = state
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+	for i := range managed.transfer.State {
+		if shouldAdvanceState(managed.transfer.State[i], state) {
+			managed.transfer.State[i] = state
 		}
 	}
-	s.transfers[txferID] = transfer
 	return true
 }
 
 func (s *transferStore) setTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
 	}
-	transfer.Mode = strings.ToLower(strings.TrimSpace(mode))
-	transfer.LinkMbps = linkMbps
-	transfer.Concurrency = concurrency
-	s.transfers[txferID] = transfer
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+	managed.transfer.Mode = strings.ToLower(strings.TrimSpace(mode))
+	managed.transfer.LinkMbps = linkMbps
+	managed.transfer.Concurrency = concurrency
 	return true
 }
 
@@ -191,26 +218,29 @@ func (s *transferStore) appendFileStates(txferID string, updates []TransferFileS
 	if len(updates) == 0 {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return
 	}
 
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return
+	}
+
 	ensureLen := func(n int) {
-		if n <= len(transfer.State) {
+		if n <= len(managed.transfer.State) {
 			return
 		}
-		oldLen := len(transfer.State)
+		oldLen := len(managed.transfer.State)
 		growBy := n - oldLen
-		transfer.State = append(transfer.State, make([]uint8, growBy)...)
-		transfer.PathHash = append(transfer.PathHash, make([]xxh3.Uint128, growBy)...)
-		transfer.FileSize = append(transfer.FileSize, make([]int64, growBy)...)
-		transfer.AckedSize = append(transfer.AckedSize, make([]int64, growBy)...)
+		managed.transfer.State = append(managed.transfer.State, make([]uint8, growBy)...)
+		managed.transfer.PathHash = append(managed.transfer.PathHash, make([]xxh3.Uint128, growBy)...)
+		managed.transfer.FileSize = append(managed.transfer.FileSize, make([]int64, growBy)...)
+		managed.transfer.AckedSize = append(managed.transfer.AckedSize, make([]int64, growBy)...)
 		for i := oldLen; i < n; i++ {
-			transfer.State[i] = TransferStateStarted
+			managed.transfer.State[i] = TransferStateStarted
 		}
 	}
 
@@ -218,33 +248,35 @@ func (s *transferStore) appendFileStates(txferID string, updates []TransferFileS
 		idx := int(update.FileID)
 		ensureLen(idx + 1)
 
-		if idx+1 > transfer.NumFiles {
-			transfer.NumFiles = idx + 1
+		if idx+1 > managed.transfer.NumFiles {
+			managed.transfer.NumFiles = idx + 1
 		}
 
-		transfer.TotalSize += update.FileSize - transfer.FileSize[idx]
-		transfer.FileSize[idx] = update.FileSize
-		transfer.PathHash[idx] = update.PathHash
-		if shouldAdvanceState(transfer.State[idx], state) {
-			transfer.State[idx] = state
+		managed.transfer.TotalSize += update.FileSize - managed.transfer.FileSize[idx]
+		managed.transfer.FileSize[idx] = update.FileSize
+		managed.transfer.PathHash[idx] = update.PathHash
+		if shouldAdvanceState(managed.transfer.State[idx], state) {
+			managed.transfer.State[idx] = state
 		}
 	}
-	s.transfers[txferID] = transfer
 }
 
 func (s *transferStore) appendFileHashChunk(txferID string, fileID uint64, offset int64, chunk []byte) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
 	}
-	if fileID >= uint64(len(transfer.State)) || offset < 0 {
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
 		return false
 	}
-	key := fileHashKey{txferID: txferID, fileID: fileID}
-	state, exists := s.fileHashes[key]
+	if fileID >= uint64(len(managed.transfer.State)) || offset < 0 {
+		return false
+	}
+
+	state, exists := managed.fileHashes[fileID]
 	if !exists || offset == 0 {
 		state = fileHashState{
 			hasher:    xxh3.New128(),
@@ -254,13 +286,13 @@ func (s *transferStore) appendFileHashChunk(txferID string, fileID uint64, offse
 	}
 	if !state.valid || state.finalized {
 		state.expiresAt = time.Now().Add(ttl)
-		s.fileHashes[key] = state
+		managed.fileHashes[fileID] = state
 		return true
 	}
 	if offset != state.hashedSize {
 		state.valid = false
 		state.expiresAt = time.Now().Add(ttl)
-		s.fileHashes[key] = state
+		managed.fileHashes[fileID] = state
 		return true
 	}
 
@@ -268,23 +300,29 @@ func (s *transferStore) appendFileHashChunk(txferID string, fileID uint64, offse
 		if _, err := state.hasher.Write(chunk); err != nil {
 			state.valid = false
 			state.expiresAt = time.Now().Add(ttl)
-			s.fileHashes[key] = state
+			managed.fileHashes[fileID] = state
 			return true
 		}
 	}
 	state.hashedSize += int64(len(chunk))
 	state.hashToken = ""
 	state.expiresAt = time.Now().Add(ttl)
-	s.fileHashes[key] = state
+	managed.fileHashes[fileID] = state
 	return true
 }
 
 func (s *transferStore) finalizeFileHash(txferID string, fileID uint64) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return "", false
+	}
 
-	key := fileHashKey{txferID: txferID, fileID: fileID}
-	state, ok := s.fileHashes[key]
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return "", false
+	}
+	state, ok := managed.fileHashes[fileID]
 	if !ok || !state.valid || state.hasher == nil {
 		return "", false
 	}
@@ -292,16 +330,22 @@ func (s *transferStore) finalizeFileHash(txferID string, fileID uint64) (string,
 	state.finalized = true
 	state.hasher = nil
 	state.expiresAt = time.Now().Add(ttl)
-	s.fileHashes[key] = state
+	managed.fileHashes[fileID] = state
 	return state.hashToken, true
 }
 
 func (s *transferStore) getFileCompressionMode(txferID string, fileID uint64) (CompressionMode, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return CompressionModeLz4, false
+	}
 
-	key := fileHashKey{txferID: txferID, fileID: fileID}
-	state, ok := s.fileHashes[key]
+	managed.mu.RLock()
+	defer managed.mu.RUnlock()
+	if managed.deleted {
+		return CompressionModeLz4, false
+	}
+	state, ok := managed.fileHashes[fileID]
 	if !ok || !state.hasLatestComp {
 		return CompressionModeLz4, false
 	}
@@ -309,11 +353,18 @@ func (s *transferStore) getFileCompressionMode(txferID string, fileID uint64) (C
 }
 
 func (s *transferStore) setFileCompressionMode(txferID string, fileID uint64, mode CompressionMode) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return false
+	}
 
-	key := fileHashKey{txferID: txferID, fileID: fileID}
-	state, ok := s.fileHashes[key]
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+
+	state, ok := managed.fileHashes[fileID]
 	if !ok {
 		state = fileHashState{
 			hasher:    xxh3.New128(),
@@ -324,16 +375,23 @@ func (s *transferStore) setFileCompressionMode(txferID string, fileID uint64, mo
 	state.latestComp = uint8(mode)
 	state.hasLatestComp = true
 	state.expiresAt = time.Now().Add(ttl)
-	s.fileHashes[key] = state
+	managed.fileHashes[fileID] = state
 	return true
 }
 
 func (s *transferStore) verifyFileHashToken(txferID string, fileID uint64, expectedBytes int64, token string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return false
+	}
 
-	key := fileHashKey{txferID: txferID, fileID: fileID}
-	state, ok := s.fileHashes[key]
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+
+	state, ok := managed.fileHashes[fileID]
 	if !ok || !state.valid || !state.finalized {
 		return false
 	}
@@ -345,57 +403,55 @@ func (s *transferStore) verifyFileHashToken(txferID string, fileID uint64, expec
 	if expectedToken == "" || expectedToken != actualToken {
 		return false
 	}
-	delete(s.fileHashes, key)
+	delete(managed.fileHashes, fileID)
 	return true
 }
 
 func (s *transferStore) delete(txferID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.transfers[txferID]; !ok {
+
+	managed, ok := s.transfers[txferID]
+	if !ok {
 		return false
 	}
+	managed.mu.Lock()
+	managed.deleted = true
+	managed.mu.Unlock()
 	delete(s.transfers, txferID)
-	for key := range s.fileHashes {
-		if key.txferID == txferID {
-			delete(s.fileHashes, key)
-		}
-	}
-	for key := range s.windowHashes {
-		if key.txferID == txferID {
-			delete(s.windowHashes, key)
-		}
-	}
 	return true
 }
 
 func (s *transferStore) get(txferID string) (Transfer, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return Transfer{}, false
 	}
-	out := transfer
-	out.State = append([]uint8(nil), transfer.State...)
-	out.PathHash = append([]xxh3.Uint128(nil), transfer.PathHash...)
-	out.FileSize = append([]int64(nil), transfer.FileSize...)
-	out.AckedSize = append([]int64(nil), transfer.AckedSize...)
-	return out, true
+
+	managed.mu.RLock()
+	defer managed.mu.RUnlock()
+	if managed.deleted {
+		return Transfer{}, false
+	}
+	return cloneTransfer(managed.transfer), true
 }
 
 func (s *transferStore) getFileStates(txferID string) ([]TransferFileState, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return nil, false
 	}
-	states := make([]TransferFileState, len(transfer.State))
-	for i := range transfer.State {
+
+	managed.mu.RLock()
+	defer managed.mu.RUnlock()
+	if managed.deleted {
+		return nil, false
+	}
+	states := make([]TransferFileState, len(managed.transfer.State))
+	for i := range managed.transfer.State {
 		states[i] = TransferFileState{
-			State:    transfer.State[i],
-			PathHash: transfer.PathHash[i],
+			State:    managed.transfer.State[i],
+			PathHash: managed.transfer.PathHash[i],
 		}
 	}
 	return states, true
@@ -407,20 +463,24 @@ func (s *transferStore) resolveFileRef(txferID string, fileID uint64, fullPathRa
 		return FileRef{}, &FileLookupError{Code: http.StatusBadRequest, Msg: "path must be absolute"}
 	}
 
-	s.mu.RLock()
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
-		s.mu.RUnlock()
 		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "transfer not found"}
 	}
-	if fileID >= uint64(len(transfer.State)) {
-		s.mu.RUnlock()
+
+	managed.mu.RLock()
+	if managed.deleted {
+		managed.mu.RUnlock()
+		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "transfer not found"}
+	}
+	if fileID >= uint64(len(managed.transfer.State)) {
+		managed.mu.RUnlock()
 		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file id out of range"}
 	}
-	directory := transfer.Directory
-	expectedDigest := transfer.PathHash[fileID]
-	fileSize := transfer.FileSize[fileID]
-	s.mu.RUnlock()
+	directory := managed.transfer.Directory
+	expectedDigest := managed.transfer.PathHash[fileID]
+	fileSize := managed.transfer.FileSize[fileID]
+	managed.mu.RUnlock()
 
 	if !pathWithinRoot(directory, fullPath) {
 		return FileRef{}, &FileLookupError{Code: http.StatusForbidden, Msg: "path must be within transfer root"}
@@ -442,9 +502,7 @@ func (s *transferStore) resolveFileRef(txferID string, fileID uint64, fullPathRa
 
 func (s *transferStore) resetForTest() {
 	s.mu.Lock()
-	s.transfers = make(map[string]Transfer)
-	s.fileHashes = make(map[fileHashKey]fileHashState)
-	s.windowHashes = make(map[windowHashKey]*windowHashState)
+	s.transfers = make(map[string]*managedTransfer)
 	s.mu.Unlock()
 }
 
@@ -456,75 +514,101 @@ func (s *transferStore) countForTest() int {
 
 func (s *transferStore) listForTest() []Transfer {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]Transfer, 0, len(s.transfers))
-	for _, transfer := range s.transfers {
-		copyTransfer := transfer
-		copyTransfer.State = append([]uint8(nil), transfer.State...)
-		copyTransfer.PathHash = append([]xxh3.Uint128(nil), transfer.PathHash...)
-		copyTransfer.FileSize = append([]int64(nil), transfer.FileSize...)
-		copyTransfer.AckedSize = append([]int64(nil), transfer.AckedSize...)
-		out = append(out, copyTransfer)
+	transfers := make([]*managedTransfer, 0, len(s.transfers))
+	for _, managed := range s.transfers {
+		transfers = append(transfers, managed)
+	}
+	s.mu.RUnlock()
+
+	out := make([]Transfer, 0, len(transfers))
+	for _, managed := range transfers {
+		managed.mu.RLock()
+		if !managed.deleted {
+			out = append(out, cloneTransfer(managed.transfer))
+		}
+		managed.mu.RUnlock()
 	}
 	return out
 }
 
 func (s *transferStore) setFileState(txferID string, fileID uint64, state uint8) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
 	}
-	if fileID >= uint64(len(transfer.State)) {
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+	if fileID >= uint64(len(managed.transfer.State)) {
 		return false
 	}
 	idx := int(fileID)
-	if shouldAdvanceState(transfer.State[idx], state) {
-		transfer.State[idx] = state
+	if !shouldAdvanceState(managed.transfer.State[idx], state) || managed.transfer.State[idx] == state {
+		return true
 	}
-	s.transfers[txferID] = transfer
+	managed.transfer.State[idx] = state
 	return true
 }
 
 func (s *transferStore) acknowledgeFiles(entries []AckEntry) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ok := true
-	for _, e := range entries {
-		if !s.acknowledgeFileLocked(e.TxferID, e.FileID, e.AckBytes) {
-			ok = false
+	grouped := make(map[string][]AckEntry)
+	order := make([]string, 0)
+	for _, entry := range entries {
+		if _, ok := grouped[entry.TxferID]; !ok {
+			order = append(order, entry.TxferID)
 		}
+		grouped[entry.TxferID] = append(grouped[entry.TxferID], entry)
+	}
+
+	ok := true
+	for _, txferID := range order {
+		managed, found := s.getManagedTransfer(txferID)
+		if !found {
+			ok = false
+			continue
+		}
+
+		managed.mu.Lock()
+		if managed.deleted {
+			managed.mu.Unlock()
+			ok = false
+			continue
+		}
+		for _, entry := range grouped[txferID] {
+			if !s.acknowledgeFileLocked(managed, entry.FileID, entry.AckBytes) {
+				ok = false
+			}
+		}
+		managed.mu.Unlock()
 	}
 	return ok
 }
 
-func (s *transferStore) acknowledgeFileLocked(txferID string, fileID uint64, ackBytes int64) bool {
-	transfer, ok := s.transfers[txferID]
-	if !ok {
+func (s *transferStore) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, ackBytes int64) bool {
+	if managed == nil || managed.deleted {
 		return false
 	}
-	if fileID >= uint64(len(transfer.State)) {
+	if fileID >= uint64(len(managed.transfer.State)) {
 		return false
 	}
 	idx := int(fileID)
-	currentState := transfer.State[idx]
+	currentState := managed.transfer.State[idx]
 
 	if currentState == TransferStateMissing {
-		s.transfers[txferID] = transfer
 		return true
 	}
 
 	if ackBytes == -1 {
 		if shouldAdvanceState(currentState, TransferStateMissing) {
 			wasTerminal := currentState == TransferStateDone || currentState == TransferStateMissing
-			transfer.State[idx] = TransferStateMissing
+			managed.transfer.State[idx] = TransferStateMissing
 			if !wasTerminal {
-				transfer.Done++
+				managed.transfer.Done++
 			}
 		}
-		s.transfers[txferID] = transfer
 		return true
 	}
 
@@ -532,7 +616,7 @@ func (s *transferStore) acknowledgeFileLocked(txferID string, fileID uint64, ack
 	if target < 0 {
 		target = 0
 	}
-	maxAck := transfer.FileSize[idx]
+	maxAck := managed.transfer.FileSize[idx]
 	if maxAck < 0 {
 		maxAck = 0
 	}
@@ -540,44 +624,41 @@ func (s *transferStore) acknowledgeFileLocked(txferID string, fileID uint64, ack
 		target = maxAck
 	}
 
-	prev := transfer.AckedSize[idx]
+	prev := managed.transfer.AckedSize[idx]
 	if target <= prev {
-		s.transfers[txferID] = transfer
 		return true
 	}
 
 	delta := target - prev
-	transfer.AckedSize[idx] = target
-	transfer.DoneSize += delta
+	managed.transfer.AckedSize[idx] = target
+	managed.transfer.DoneSize += delta
 
 	if prev < maxAck && target == maxAck {
-		transfer.Done++
-		if shouldAdvanceState(transfer.State[idx], TransferStateDone) {
-			transfer.State[idx] = TransferStateDone
+		managed.transfer.Done++
+		if shouldAdvanceState(managed.transfer.State[idx], TransferStateDone) {
+			managed.transfer.State[idx] = TransferStateDone
 		}
 	}
 
-	s.transfers[txferID] = transfer
-
-	wKey := windowHashKey{txferID: txferID, fileID: fileID, endBytes: target}
-	delete(s.windowHashes, wKey)
+	delete(managed.windowHashes, windowHashKey{fileID: fileID, endBytes: target})
 	return true
 }
 
 func (s *transferStore) clipTransfer(txferID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
 	}
 
-	transfer.State = slices.Clip(transfer.State)
-	transfer.PathHash = slices.Clip(transfer.PathHash)
-	transfer.FileSize = slices.Clip(transfer.FileSize)
-	transfer.AckedSize = slices.Clip(transfer.AckedSize)
-	s.transfers[txferID] = transfer
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+	managed.transfer.State = slices.Clip(managed.transfer.State)
+	managed.transfer.PathHash = slices.Clip(managed.transfer.PathHash)
+	managed.transfer.FileSize = slices.Clip(managed.transfer.FileSize)
+	managed.transfer.AckedSize = slices.Clip(managed.transfer.AckedSize)
 	return true
 }
 
@@ -591,30 +672,40 @@ func (s *transferStore) reapExpiredLoop() {
 
 	for now := range ticker.C {
 		s.mu.Lock()
-		for txferID, transfer := range s.transfers {
-			if !transfer.ExpiresAt.After(now) {
+		survivors := make([]*managedTransfer, 0, len(s.transfers))
+		for txferID, managed := range s.transfers {
+			managed.mu.RLock()
+			expired := !managed.deleted && !managed.transfer.ExpiresAt.After(now)
+			managed.mu.RUnlock()
+			if expired {
+				managed.mu.Lock()
+				managed.deleted = true
+				managed.mu.Unlock()
 				delete(s.transfers, txferID)
-			}
-		}
-		for key, state := range s.fileHashes {
-			if !state.expiresAt.After(now) {
-				delete(s.fileHashes, key)
 				continue
 			}
-			if _, ok := s.transfers[key.txferID]; !ok {
-				delete(s.fileHashes, key)
-			}
-		}
-		for key, ws := range s.windowHashes {
-			if !ws.expiresAt.After(now) {
-				delete(s.windowHashes, key)
-				continue
-			}
-			if _, ok := s.transfers[key.txferID]; !ok {
-				delete(s.windowHashes, key)
-			}
+			survivors = append(survivors, managed)
 		}
 		s.mu.Unlock()
+
+		for _, managed := range survivors {
+			managed.mu.Lock()
+			if managed.deleted {
+				managed.mu.Unlock()
+				continue
+			}
+			for fileID, state := range managed.fileHashes {
+				if !state.expiresAt.After(now) {
+					delete(managed.fileHashes, fileID)
+				}
+			}
+			for key, state := range managed.windowHashes {
+				if !state.expiresAt.After(now) {
+					delete(managed.windowHashes, key)
+				}
+			}
+			managed.mu.Unlock()
+		}
 	}
 }
 
@@ -632,41 +723,45 @@ func normalizeHashToken(raw string) string {
 }
 
 func (s *transferStore) setWindowHashToken(txferID string, fileID uint64, endBytes int64, token string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	transfer, ok := s.transfers[txferID]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
 	}
-	if fileID >= uint64(len(transfer.State)) || endBytes < 0 {
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+	if fileID >= uint64(len(managed.transfer.State)) || endBytes < 0 {
 		return false
 	}
 	if !validHashToken(token) {
 		return false
 	}
-	key := windowHashKey{txferID: txferID, fileID: fileID, endBytes: endBytes}
-	ws := &windowHashState{
+	managed.windowHashes[windowHashKey{fileID: fileID, endBytes: endBytes}] = &windowHashState{
 		hashToken: normalizeHashToken(token),
 		expiresAt: time.Now().Add(ttl),
 	}
-	s.windowHashes[key] = ws
 	return true
 }
 
 func (s *transferStore) verifyWindowHashToken(txferID string, fileID uint64, endBytes int64, token string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if endBytes < 0 {
-		return false
-	}
-	key := windowHashKey{txferID: txferID, fileID: fileID, endBytes: endBytes}
-	ws, ok := s.windowHashes[key]
+	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
 	}
-	return ws.hashToken == normalizeHashToken(token)
+
+	managed.mu.RLock()
+	defer managed.mu.RUnlock()
+	if managed.deleted || endBytes < 0 {
+		return false
+	}
+	state, ok := managed.windowHashes[windowHashKey{fileID: fileID, endBytes: endBytes}]
+	if !ok {
+		return false
+	}
+	return state.hashToken == normalizeHashToken(token)
 }
 
 func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
@@ -677,21 +772,21 @@ func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, err
 		}
 		now := time.Now()
 		transfer := Transfer{
-			ID:        txferID,
-			Directory: directory,
-			Mode:      "",
-			LinkMbps:  0,
+			ID:          txferID,
+			Directory:   directory,
+			Mode:        "",
+			LinkMbps:    0,
 			Concurrency: 0,
-			NumFiles:  numFiles,
-			TotalSize: totalSize,
-			Done:      0,
-			DoneSize:  0,
-			State:     make([]uint8, numFiles),
-			PathHash:  make([]xxh3.Uint128, numFiles),
-			FileSize:  make([]int64, numFiles),
-			AckedSize: make([]int64, numFiles),
-			CreatedAt: now,
-			ExpiresAt: now.Add(ttl),
+			NumFiles:    numFiles,
+			TotalSize:   totalSize,
+			Done:        0,
+			DoneSize:    0,
+			State:       make([]uint8, numFiles),
+			PathHash:    make([]xxh3.Uint128, numFiles),
+			FileSize:    make([]int64, numFiles),
+			AckedSize:   make([]int64, numFiles),
+			CreatedAt:   now,
+			ExpiresAt:   now.Add(ttl),
 		}
 		for i := range transfer.State {
 			transfer.State[i] = TransferStateStarted

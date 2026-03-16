@@ -16,6 +16,7 @@ const (
 	VerbCXSUM
 	VerbSTATUS
 	VerbPROBE
+	VerbSYNC
 )
 
 func ParseVerb(token string) (Verb, error) {
@@ -34,6 +35,8 @@ func ParseVerb(token string) (Verb, error) {
 		return VerbSTATUS, nil
 	case "PROBE":
 		return VerbPROBE, nil
+	case "SYNC":
+		return VerbSYNC, nil
 	default:
 		return VerbUnknown, fmt.Errorf("unknown verb: %s", token)
 	}

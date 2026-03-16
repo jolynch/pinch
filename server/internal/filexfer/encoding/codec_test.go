@@ -8,12 +8,12 @@ import (
 
 func TestMaxEncodedFrameSizeBytesZstdStableAcrossCalls(t *testing.T) {
 	const logicalSize = int64(8 * 1024 * 1024)
-	first, err := maxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
+	first, err := MaxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
 	if err != nil {
 		t.Fatalf("first call failed: %v", err)
 	}
 	for i := 0; i < 20; i++ {
-		next, err := maxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
+		next, err := MaxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
 		if err != nil {
 			t.Fatalf("repeat call %d failed: %v", i, err)
 		}
@@ -26,7 +26,7 @@ func TestMaxEncodedFrameSizeBytesZstdStableAcrossCalls(t *testing.T) {
 func TestMaxEncodedFrameSizeBytesMultipleModesUnaffected(t *testing.T) {
 	const logicalSize = int64(1024)
 
-	noneSize, err := maxEncodedFrameSizeBytes("none", logicalSize)
+	noneSize, err := MaxEncodedFrameSizeBytes("none", logicalSize)
 	if err != nil {
 		t.Fatalf("none sizing failed: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestMaxEncodedFrameSizeBytesMultipleModesUnaffected(t *testing.T) {
 		t.Fatalf("none sizing mismatch: got=%d want=%d", noneSize, logicalSize)
 	}
 
-	lz4Size, err := maxEncodedFrameSizeBytes(EncodingLz4, logicalSize)
+	lz4Size, err := MaxEncodedFrameSizeBytes(EncodingLz4, logicalSize)
 	if err != nil {
 		t.Fatalf("lz4 sizing failed: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestMaxEncodedFrameSizeBytesMultipleModesUnaffected(t *testing.T) {
 		t.Fatalf("lz4 sizing unexpectedly small: %d", lz4Size)
 	}
 
-	zstdSize, err := maxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
+	zstdSize, err := MaxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
 	if err != nil {
 		t.Fatalf("zstd sizing failed: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestMaxEncodedFrameSizeBytesZstdConcurrent(t *testing.T) {
 	const goroutines = 32
 	const logicalSize = int64(4 * 1024 * 1024)
 
-	want, err := maxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
+	want, err := MaxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
 	if err != nil {
 		t.Fatalf("baseline call failed: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestMaxEncodedFrameSizeBytesZstdConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			got, callErr := maxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
+			got, callErr := MaxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
 			if callErr != nil {
 				errCh <- callErr
 				return

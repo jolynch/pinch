@@ -13,7 +13,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/jolynch/pinch/utils"
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 )
 
@@ -214,10 +214,16 @@ func encodeManifest(
 		}
 		entryPath := filepath.ToSlash(rel)
 		entryMtime := strconv.FormatInt(info.ModTime().UnixNano(), 10)
-		entryMode := formatManifestMode(info.Mode())
+		entryMode := encoding.FormatManifestMode(info.Mode())
 
-		pathToken := frontToken(prevPath, entryPath, verbose)
-		mtimeToken := mtimeFrontToken(prevMtime, entryMtime, verbose)
+		prevP := prevPath
+		prevM := prevMtime
+		if verbose {
+			prevP = ""
+			prevM = ""
+		}
+		pathToken := encoding.EncodePathToken(prevP, entryPath)
+		mtimeToken, _ := encoding.EncodeMtimeToken(prevM, entryMtime)
 		line := fmt.Sprintf("%d %d %s %s %s\n", fileID, info.Size(), mtimeToken, entryMode, pathToken)
 
 		if maxChunkSize > 0 && chunkBytes+len(line) > maxChunkSize {
@@ -230,8 +236,8 @@ func encodeManifest(
 			if err := startChunk(); err != nil {
 				return err
 			}
-			pathToken = frontToken("", entryPath, verbose)
-			mtimeToken = mtimeFrontToken("", entryMtime, verbose)
+			pathToken = encoding.EncodePathToken("", entryPath)
+			mtimeToken, _ = encoding.EncodeMtimeToken("", entryMtime)
 			line = fmt.Sprintf("%d %d %s %s %s\n", fileID, info.Size(), mtimeToken, entryMode, pathToken)
 			if chunkBytes+len(line) > maxChunkSize {
 				return errors.New("max-manifest-chunk-size is too small for manifest entry")
@@ -270,25 +276,3 @@ func isBrokenPipe(err error) bool {
 		errors.Is(err, syscall.ECONNRESET)
 }
 
-func frontToken(prev string, curr string, verbose bool) string {
-	prefix := 0
-	if !verbose {
-		prefix = utils.CommonPrefixLen(prev, curr)
-	}
-	suffix := curr[prefix:]
-	return fmt.Sprintf("%d:%d:%s", prefix, len(suffix), suffix)
-}
-
-func mtimeFrontToken(prev string, curr string, verbose bool) string {
-	prefix := 0
-	if !verbose {
-		prefix = utils.CommonPrefixLen(prev, curr)
-	}
-	suffix := curr[prefix:]
-	return fmt.Sprintf("%d:%s", prefix, suffix)
-}
-
-func formatManifestMode(mode os.FileMode) string {
-	bits := mode.Perm() | (mode & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
-	return fmt.Sprintf("%04o", bits)
-}

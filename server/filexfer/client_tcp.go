@@ -22,9 +22,10 @@ import (
 const maxTCPLineBytes = 4 * 1024 * 1024
 
 type tcpAuthState struct {
-	publicKey       string
-	identity        string
-	hasAuth         bool
+	publicKey      string
+	identity       string
+	parsedIdentity age.Identity
+	hasAuth        bool
 	encryptCommands bool
 }
 
@@ -204,9 +205,11 @@ func (c *Client) resolveTCPAuthState(requestPub string, requestIdentity string) 
 		return tcpAuthState{}, errors.New("missing age identity for authenticated response")
 	}
 	if state.hasAuth {
-		if _, err := parseAgeIdentity(state.identity); err != nil {
+		parsed, err := parseAgeIdentity(state.identity)
+		if err != nil {
 			return tcpAuthState{}, err
 		}
+		state.parsedIdentity = parsed
 	}
 	if state.encryptCommands {
 		if _, err := age.ParseX25519Recipient(serverPub); err != nil {
@@ -265,10 +268,7 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 	if !state.hasAuth {
 		return conn, nil
 	}
-	identity, err := parseAgeIdentity(state.identity)
-	if err != nil {
-		return nil, err
-	}
+	identity := state.parsedIdentity
 	if identity == nil {
 		return nil, errors.New("missing age identity for encrypted response")
 	}
@@ -333,6 +333,96 @@ func (c *Client) fetchManifestTCP(ctx context.Context, request FetchManifestRequ
 		}
 		raw.WriteString(line)
 		raw.WriteByte('\n')
+	}
+}
+
+func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
+	state, err := c.resolveTCPAuthState(request.AgePublicKey, request.AgeIdentity)
+	if err != nil {
+		return SyncManifestResponse{}, err
+	}
+	conn, err := c.dialTCP(ctx)
+	if err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("dial file listener: %w", err)
+	}
+	defer conn.Close()
+
+	if err := c.sendTCPAuth(conn, state); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("send AUTH: %w", err)
+	}
+
+	// Send SYNC command line.
+	cmd := "SYNC " + makeLenToken(request.Directory) +
+		" mode=" + request.Mode +
+		" link-mbps=" + strconv.FormatInt(request.LinkMbps, 10) +
+		" concurrency=" + strconv.Itoa(request.Concurrency)
+	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("send SYNC: %w", err)
+	}
+
+	// Send old manifest body followed by blank line terminator.
+	oldManifestBytes, err := marshalManifest(request.OldManifest)
+	if err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("marshal old manifest: %w", err)
+	}
+	if _, err := conn.Write(oldManifestBytes); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("write old manifest: %w", err)
+	}
+	if _, err := io.WriteString(conn, "\r\n"); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("write manifest terminator: %w", err)
+	}
+
+	// Build ID→path index from the old manifest so we can resolve RM fileIDs.
+	oldByID := make(map[uint64]string, len(request.OldManifest.Entries))
+	for _, e := range request.OldManifest.Entries {
+		oldByID[e.ID] = e.Path
+	}
+
+	// Read response: FM/2 lines, then RM lines, then OK.
+	responseReader, err := c.responseReaderForTCP(conn, state)
+	if err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("initialize SYNC response stream: %w", err)
+	}
+	br := bufio.NewReader(responseReader)
+
+	manifestBuf := c.acquireScratchBuffer(maxTCPLineBytes)
+	defer c.releaseScratchBuffer(manifestBuf)
+	var rmPaths []string
+
+	for {
+		line, err := readTCPLine(br, maxTCPLineBytes)
+		if err != nil {
+			return SyncManifestResponse{}, fmt.Errorf("read SYNC response: %w", err)
+		}
+		if _, ok := parseOKStatusLine(line); ok {
+			manifest, parseErr := parseManifest(manifestBuf.Bytes())
+			if parseErr != nil {
+				return SyncManifestResponse{}, parseErr
+			}
+			return SyncManifestResponse{
+				Manifest:     manifest,
+				RemovedPaths: rmPaths,
+			}, nil
+		}
+		if err := parseErrControlFrame(line); err != nil {
+			return SyncManifestResponse{}, err
+		}
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "RM ") {
+			fileID, parseErr := strconv.ParseUint(trimmed[3:], 10, 64)
+			if parseErr != nil {
+				return SyncManifestResponse{}, fmt.Errorf("parse RM line: %w", parseErr)
+			}
+			path, ok := oldByID[fileID]
+			if !ok {
+				return SyncManifestResponse{}, fmt.Errorf("RM fileID %d not in old manifest", fileID)
+			}
+			rmPaths = append(rmPaths, path)
+			continue
+		}
+		// FM/2 header or manifest entry line.
+		manifestBuf.WriteString(line)
+		manifestBuf.WriteByte('\n')
 	}
 }
 

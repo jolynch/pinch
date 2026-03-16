@@ -160,6 +160,12 @@ type Client struct {
 	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
 	bufferPool sync.Map // map[int]*sync.Pool
 
+	// lineReaderPool caches reusable *bufio.Reader objects for protocol header reading.
+	// bufio.Reader is pooled (not its []byte) because Reset() reuses the internal allocation
+	// and its Read(p) passes directly to the socket when len(p) >= internal size, avoiding
+	// an extra copy that pooledLineReader would introduce for bulk payload reads.
+	lineReaderPool sync.Pool
+
 	// scratchBufferPool caches reusable temporary byte buffers.
 	scratchBufferPool sync.Pool
 }
@@ -306,6 +312,21 @@ type FetchManifestResponse struct {
 	Manifest *Manifest
 }
 
+type SyncManifestRequest struct {
+	Directory    string
+	OldManifest  *Manifest
+	Mode         string
+	LinkMbps     int64
+	Concurrency  int
+	AgePublicKey string
+	AgeIdentity  string
+}
+
+type SyncManifestResponse struct {
+	Manifest     *Manifest
+	RemovedPaths []string
+}
+
 type FetchFileRequest struct {
 	TransferID   string
 	Files        []FetchFileTarget
@@ -385,6 +406,9 @@ const (
 	defaultClientFrameBufferBytes int = 8 * 1024 * 1024
 	minClientFrameReadBufferBytes int = 32 * 1024
 
+	// Line reader buffers used for protocol header reading (matches minClientFrameReadBufferBytes).
+	defaultClientLineReaderBytes int = 32 * 1024
+
 	// Scratch buffers used for request/response payloads (headers, manifests, etc.).
 	defaultClientScratchBufferBytes int = 64 * 1024
 	maxClientScratchBufferPoolBytes int = 16 * 1024 * 1024
@@ -420,6 +444,11 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 		opt.apply(c)
 	}
 	c.bufferPool = sync.Map{}
+	c.lineReaderPool = sync.Pool{
+		New: func() any {
+			return bufio.NewReaderSize(nil, defaultClientLineReaderBytes)
+		},
+	}
 	c.scratchBufferPool = sync.Pool{
 		New: func() any {
 			return bytes.NewBuffer(make([]byte, 0, defaultClientScratchBufferBytes))
@@ -448,6 +477,31 @@ func (c *Client) FetchManifest(ctx context.Context, request FetchManifestRequest
 		return FetchManifestResponse{}, errors.New("concurrency must be > 0")
 	}
 	return c.fetchManifestTCP(ctx, request)
+}
+
+func (c *Client) SyncManifest(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
+	ctx, task := trace.NewTask(ctx, "sync-manifest")
+	defer task.End()
+	if c == nil {
+		return SyncManifestResponse{}, errors.New("nil client")
+	}
+	if request.Directory == "" {
+		return SyncManifestResponse{}, errors.New("missing directory")
+	}
+	if request.OldManifest == nil {
+		return SyncManifestResponse{}, errors.New("missing old manifest")
+	}
+	request.Mode = strings.ToLower(strings.TrimSpace(request.Mode))
+	if request.Mode != LoadStrategyFast && request.Mode != LoadStrategyGentle {
+		return SyncManifestResponse{}, errors.New("invalid mode")
+	}
+	if request.LinkMbps < 0 {
+		return SyncManifestResponse{}, errors.New("link mbps must be >= 0")
+	}
+	if request.Concurrency <= 0 {
+		return SyncManifestResponse{}, errors.New("concurrency must be > 0")
+	}
+	return c.syncManifestTCP(ctx, request)
 }
 
 func DefaultClientConcurrency() int {
@@ -752,7 +806,8 @@ func (c *Client) downloadManifestGroupSequential(
 		return nil, nil, nil, err
 	}
 	defer stream.Close()
-	br := bufio.NewReader(stream)
+	br := c.acquireLineReader(stream)
+	defer c.releaseLineReader(br)
 
 	results := make([]DownloadFileResponse, 0, len(plans))
 	pendingAcks := make([]AcknowledgeFileProgressRequest, 0, len(plans))
@@ -788,7 +843,6 @@ func (c *Client) downloadManifestGroupSequential(
 			return writer.Close()
 		}
 
-		fileHasher := xxh3.New128()
 		if plan.resumeFrom > 0 {
 			emitProgressUpdate(DownloadProgressUpdate{
 				TransferID:  req.Manifest.TransferID,
@@ -847,7 +901,7 @@ func (c *Client) downloadManifestGroupSequential(
 				return nil, nil, nil, fmt.Errorf("decode payload reader: %w", decodeErr)
 			}
 			frameStartOffset := offset
-			copyErr := copyStreamWithProgress(io.MultiWriter(writer, fileHasher, windowHasher), logicalReader, frameBuf, nil, func(written int64) error {
+			copyErr := copyStreamWithProgress(newParallelMultiWriter(writer, windowHasher), logicalReader, frameBuf, func(written int64) error {
 				emitProgressUpdate(DownloadProgressUpdate{
 					TransferID:  req.Manifest.TransferID,
 					FileID:      plan.entry.ID,
@@ -932,7 +986,7 @@ func (c *Client) downloadManifestGroupSequential(
 			return nil, nil, nil, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
 		}
 
-		localHash := intencoding.FormatXXH128HashToken(fileHasher.Sum128())
+		localHash := windowHash
 		recvMS := time.Since(fileStart).Milliseconds()
 		deltaBytes := offset - plan.resumeFrom
 		pendingAcks = append(pendingAcks, AcknowledgeFileProgressRequest{
@@ -1360,7 +1414,7 @@ func (c *Client) downloadSplitWindow(
 	defer releaseFrameBuf()
 
 	windowHasher := xxh3.New128()
-	copyErr := copyStreamWithProgress(io.MultiWriter(writer, windowHasher), reader, frameBuf, nil, func(written int64) error {
+	copyErr := copyStreamWithProgress(newParallelMultiWriter(writer, windowHasher), reader, frameBuf, func(written int64) error {
 		emitProgressUpdate(DownloadProgressUpdate{
 			TransferID:  req.Manifest.TransferID,
 			FileID:      plan.entry.ID,
@@ -1834,18 +1888,47 @@ func mergeCompCounts(dst map[string]uint64, src map[string]uint64) {
 	}
 }
 
-func copyStreamWithProgress(dst io.Writer, src io.Reader, buf []byte, hash *xxh3.Hasher128, onWrite func(written int64) error) error {
+// parallelMultiWriter writes to primary in the calling goroutine and to each
+// secondary concurrently, joining all before returning from Write.
+// The buffer passed to Write must not be modified until Write returns.
+type parallelMultiWriter struct {
+	primary     io.Writer
+	secondaries []io.Writer
+}
+
+func newParallelMultiWriter(primary io.Writer, secondaries ...io.Writer) io.Writer {
+	if len(secondaries) == 0 {
+		return primary
+	}
+	return &parallelMultiWriter{primary: primary, secondaries: secondaries}
+}
+
+func (w *parallelMultiWriter) Write(p []byte) (int, error) {
+	errs := make([]chan error, len(w.secondaries))
+	for i, s := range w.secondaries {
+		ch := make(chan error, 1)
+		errs[i] = ch
+		go func(s io.Writer) {
+			_, err := s.Write(p)
+			ch <- err
+		}(s)
+	}
+	n, err := w.primary.Write(p)
+	for _, ch := range errs {
+		if sErr := <-ch; sErr != nil && err == nil {
+			err = sErr
+		}
+	}
+	return n, err
+}
+
+func copyStreamWithProgress(dst io.Writer, src io.Reader, buf []byte, onWrite func(written int64) error) error {
 	var written int64
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			if _, err := dst.Write(buf[:n]); err != nil {
 				return err
-			}
-			if hash != nil {
-				if _, err := hash.Write(buf[:n]); err != nil {
-					return err
-				}
 			}
 			written += int64(n)
 			if onWrite != nil {
@@ -1959,11 +2042,28 @@ func (c *Client) releaseScratchBuffer(buf *bytes.Buffer) {
 	c.scratchBufferPool.Put(buf)
 }
 
+func (c *Client) acquireLineReader(r io.Reader) *bufio.Reader {
+	raw := c.lineReaderPool.Get()
+	br := raw.(*bufio.Reader)
+	br.Reset(r)
+	return br
+}
+
+func (c *Client) releaseLineReader(br *bufio.Reader) {
+	br.Reset(nil) // release reference to the underlying reader
+	c.lineReaderPool.Put(br)
+}
+
 func parseManifest(raw []byte) (*Manifest, error) {
 	reader := bufio.NewReader(bytes.NewReader(raw))
 	manifest := &Manifest{}
+	// Pre-allocate based on newline count — an upper bound on entry count that
+	// avoids repeated growslice doublings (and the GC pauses they trigger) for
+	// large manifests.
+	capacityHint := bytes.Count(raw, []byte{'\n'})
+	manifest.Entries = make([]ManifestEntry, 0, capacityHint)
 	seenHeader := false
-	seenIDs := make(map[uint64]struct{})
+	seenIDs := make(map[uint64]struct{}, capacityHint)
 	var prevPath string
 	var prevMtime string
 	var lastID uint64
@@ -1978,18 +2078,18 @@ func parseManifest(raw []byte) (*Manifest, error) {
 		trimmed := strings.TrimSpace(line)
 		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
 			if strings.HasPrefix(trimmed, "FM/2 ") {
-				txferID, root, mode, linkMbps, concurrency, parseErr := parseManifestHeader(trimmed)
+				hdr, parseErr := intencoding.ParseManifestHeader(trimmed)
 				if parseErr != nil {
 					return nil, parseErr
 				}
 				if !seenHeader {
-					manifest.TransferID = txferID
-					manifest.Root = root
-					manifest.Mode = mode
-					manifest.LinkMbps = linkMbps
-					manifest.Concurrency = concurrency
+					manifest.TransferID = hdr.TransferID
+					manifest.Root = hdr.Root
+					manifest.Mode = hdr.Mode
+					manifest.LinkMbps = hdr.LinkMbps
+					manifest.Concurrency = hdr.Concurrency
 					seenHeader = true
-				} else if manifest.TransferID != txferID || manifest.Root != root || manifest.Mode != mode || manifest.LinkMbps != linkMbps || manifest.Concurrency != concurrency {
+				} else if manifest.TransferID != hdr.TransferID || manifest.Root != hdr.Root || manifest.Mode != hdr.Mode || manifest.LinkMbps != hdr.LinkMbps || manifest.Concurrency != hdr.Concurrency {
 					return nil, errors.New("manifest chunk header mismatch")
 				}
 				prevPath = ""
@@ -1998,9 +2098,16 @@ func parseManifest(raw []byte) (*Manifest, error) {
 				if !seenHeader {
 					return nil, errors.New("manifest entry before header")
 				}
-				entry, nextPath, nextMtime, parseErr := parseManifestEntry(trimmed, prevPath, prevMtime)
+				raw, nextPath, nextMtime, parseErr := intencoding.ParseManifestEntry(trimmed, prevPath, prevMtime)
 				if parseErr != nil {
 					return nil, parseErr
+				}
+				entry := ManifestEntry{
+					ID:    raw.ID,
+					Size:  raw.Size,
+					Mtime: raw.Mtime,
+					Mode:  raw.Mode,
+					Path:  raw.Path,
 				}
 				if _, exists := seenIDs[entry.ID]; exists {
 					return nil, fmt.Errorf("duplicate manifest id: %d", entry.ID)
@@ -2041,7 +2148,6 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 	}
 	entries := append([]ManifestEntry(nil), manifest.Entries...)
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
-	var b strings.Builder
 	mode := strings.ToLower(strings.TrimSpace(manifest.Mode))
 	if mode != LoadStrategyFast && mode != LoadStrategyGentle {
 		return nil, errors.New("manifest mode must be fast or gentle")
@@ -2052,16 +2158,16 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 	if manifest.Concurrency <= 0 {
 		return nil, errors.New("manifest concurrency must be > 0")
 	}
-	fmt.Fprintf(
-		&b,
-		"FM/2 %s %d:%s mode=%s link-mbps=%d concurrency=%d\n",
-		manifest.TransferID,
-		len(manifest.Root),
-		manifest.Root,
-		mode,
-		manifest.LinkMbps,
-		manifest.Concurrency,
-	)
+	var b strings.Builder
+	hdr := intencoding.FormatManifestHeader(intencoding.ManifestHeader{
+		TransferID:  manifest.TransferID,
+		Root:        manifest.Root,
+		Mode:        mode,
+		LinkMbps:    manifest.LinkMbps,
+		Concurrency: manifest.Concurrency,
+	})
+	b.WriteString(hdr)
+	b.WriteByte('\n')
 	prevPath := ""
 	prevMtime := ""
 	seenIDs := make(map[uint64]struct{}, len(entries))
@@ -2073,69 +2179,24 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 		if i > 0 && entry.ID <= entries[i-1].ID {
 			return nil, fmt.Errorf("manifest ids must be increasing: prev=%d curr=%d", entries[i-1].ID, entry.ID)
 		}
-		if entry.Size < 0 {
-			return nil, fmt.Errorf("manifest size must be >= 0 for id=%d", entry.ID)
-		}
-		if strings.Contains(entry.Path, `\`) {
-			return nil, fmt.Errorf("manifest path contains backslash: %q", entry.Path)
-		}
-		if strings.HasPrefix(entry.Path, "/") {
-			return nil, fmt.Errorf("manifest path must be relative: %q", entry.Path)
-		}
-		cleanPath := filepath.Clean(filepath.FromSlash(entry.Path))
-		if cleanPath == "." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == ".." {
-			return nil, fmt.Errorf("manifest path traversal is not allowed: %q", entry.Path)
-		}
-		modeToken := fmt.Sprintf("%04o", uint32(entry.Mode&0o7777))
-		mtimeRaw := strconv.FormatInt(entry.Mtime, 10)
-		mtimeToken, err := encodeMtimeToken(prevMtime, mtimeRaw)
+		line, nextPath, nextMtime, err := intencoding.MarshalManifestEntry(intencoding.ManifestEntry{
+			ID:    entry.ID,
+			Size:  entry.Size,
+			Mtime: entry.Mtime,
+			Mode:  entry.Mode,
+			Path:  entry.Path,
+		}, prevPath, prevMtime)
 		if err != nil {
-			return nil, fmt.Errorf("encode manifest mtime id=%d: %w", entry.ID, err)
+			return nil, err
 		}
-		pathToken := encodePathToken(prevPath, entry.Path)
-		fmt.Fprintf(&b, "%d %d %s %s %s\n", entry.ID, entry.Size, mtimeToken, modeToken, pathToken)
-		prevPath = entry.Path
-		prevMtime = mtimeRaw
+		b.WriteString(line)
+		b.WriteByte('\n')
+		prevPath = nextPath
+		prevMtime = nextMtime
 	}
 	return []byte(b.String()), nil
 }
 
-func encodeMtimeToken(prev string, current string) (string, error) {
-	if current == "" {
-		return "", errors.New("empty mtime")
-	}
-	for _, ch := range current {
-		if ch < '0' || ch > '9' {
-			return "", errors.New("mtime must be decimal digits")
-		}
-	}
-	prefixLen := commonPrefixLen(prev, current)
-	suffix := current[prefixLen:]
-	if suffix == "" {
-		if len(current) == 0 {
-			return "", errors.New("mtime cannot be empty")
-		}
-		prefixLen = len(current) - 1
-		suffix = current[prefixLen:]
-	}
-	return strconv.Itoa(prefixLen) + ":" + suffix, nil
-}
-
-func encodePathToken(prev string, current string) string {
-	prefixLen := commonPrefixLen(prev, current)
-	suffix := current[prefixLen:]
-	return strconv.Itoa(prefixLen) + ":" + strconv.Itoa(len(suffix)) + ":" + suffix
-}
-
-func commonPrefixLen(a string, b string) int {
-	n := min(len(a), len(b))
-	for i := range n {
-		if a[i] != b[i] {
-			return i
-		}
-	}
-	return n
-}
 
 func resolveManifestEntryPath(manifest *Manifest, fileID uint64) (ManifestEntry, string, error) {
 	entry, ok := manifest.EntryByID(fileID)
@@ -2157,239 +2218,6 @@ func cloneTrailerMetadata(meta *FileTrailerMetadata) *FileTrailerMetadata {
 	return &cloned
 }
 
-func parseManifestHeader(line string) (string, string, string, int64, int, error) {
-	rest := strings.TrimPrefix(line, "FM/2 ")
-	sep := strings.IndexByte(rest, ' ')
-	if sep <= 0 || sep == len(rest)-1 {
-		return "", "", "", 0, 0, errors.New("invalid manifest header")
-	}
-	txferID := rest[:sep]
-	rootRaw := rest[sep+1:]
-	root, consumed, err := parseLenPrefixedPrefix(rootRaw)
-	if err != nil {
-		return "", "", "", 0, 0, fmt.Errorf("invalid manifest root token: %w", err)
-	}
-	optionsRaw := strings.TrimSpace(rootRaw[consumed:])
-	if optionsRaw == "" {
-		return "", "", "", 0, 0, errors.New("manifest header missing metadata options")
-	}
-	options := strings.Fields(optionsRaw)
-	var (
-		mode        string
-		linkMbps    int64
-		concurrency int
-		seenMode    bool
-		seenLink    bool
-		seenConc    bool
-	)
-	for _, option := range options {
-		key, value, ok := strings.Cut(option, "=")
-		if !ok {
-			return "", "", "", 0, 0, errors.New("invalid manifest header option")
-		}
-		switch key {
-		case "mode":
-			value = strings.ToLower(strings.TrimSpace(value))
-			if value != LoadStrategyFast && value != LoadStrategyGentle {
-				return "", "", "", 0, 0, errors.New("invalid manifest mode")
-			}
-			mode = value
-			seenMode = true
-		case "link-mbps":
-			linkMbps, err = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-			if err != nil || linkMbps < 0 {
-				return "", "", "", 0, 0, errors.New("invalid manifest link-mbps")
-			}
-			seenLink = true
-		case "concurrency":
-			concurrency, err = strconv.Atoi(strings.TrimSpace(value))
-			if err != nil || concurrency <= 0 {
-				return "", "", "", 0, 0, errors.New("invalid manifest concurrency")
-			}
-			seenConc = true
-		default:
-			return "", "", "", 0, 0, errors.New("unknown manifest header option")
-		}
-	}
-	if !seenMode || !seenLink || !seenConc {
-		return "", "", "", 0, 0, errors.New("manifest header missing required metadata")
-	}
-	return txferID, root, mode, linkMbps, concurrency, nil
-}
-
-func parseManifestEntry(line string, prevPath string, prevMtime string) (ManifestEntry, string, string, error) {
-	first := strings.IndexByte(line, ' ')
-	if first <= 0 {
-		return ManifestEntry{}, "", "", errors.New("invalid manifest entry")
-	}
-	second := strings.IndexByte(line[first+1:], ' ')
-	if second < 0 {
-		return ManifestEntry{}, "", "", errors.New("invalid manifest entry")
-	}
-	second += first + 1
-	third := strings.IndexByte(line[second+1:], ' ')
-	if third < 0 {
-		return ManifestEntry{}, "", "", errors.New("invalid manifest entry")
-	}
-	third += second + 1
-	fourth := strings.IndexByte(line[third+1:], ' ')
-	if fourth < 0 {
-		return ManifestEntry{}, "", "", errors.New("invalid manifest entry")
-	}
-	fourth += third + 1
-
-	idRaw := line[:first]
-	sizeRaw := line[first+1 : second]
-	mtimeToken := line[second+1 : third]
-	modeRaw := line[third+1 : fourth]
-	pathToken := line[fourth+1:]
-
-	id, err := strconv.ParseUint(idRaw, 10, 64)
-	if err != nil {
-		return ManifestEntry{}, "", "", fmt.Errorf("invalid manifest id: %w", err)
-	}
-	sizeU, err := strconv.ParseUint(sizeRaw, 10, 64)
-	if err != nil {
-		return ManifestEntry{}, "", "", fmt.Errorf("invalid manifest size: %w", err)
-	}
-	if sizeU > uint64(^uint64(0)>>1) {
-		return ManifestEntry{}, "", "", errors.New("manifest size overflows int64")
-	}
-
-	mtimeResolved, err := decodeMtimeToken(prevMtime, mtimeToken)
-	if err != nil {
-		return ManifestEntry{}, "", "", err
-	}
-	mtimeNanos, err := strconv.ParseUint(mtimeResolved, 10, 64)
-	if err != nil {
-		return ManifestEntry{}, "", "", fmt.Errorf("invalid manifest mtime value: %w", err)
-	}
-	if mtimeNanos > uint64(^uint64(0)>>1) {
-		return ManifestEntry{}, "", "", errors.New("manifest mtime overflows int64")
-	}
-	mode, err := parseManifestModeToken(modeRaw)
-	if err != nil {
-		return ManifestEntry{}, "", "", err
-	}
-
-	pathResolved, err := decodePathToken(prevPath, pathToken)
-	if err != nil {
-		return ManifestEntry{}, "", "", err
-	}
-	if strings.Contains(pathResolved, `\`) {
-		return ManifestEntry{}, "", "", errors.New("manifest path contains backslash")
-	}
-	if strings.HasPrefix(pathResolved, "/") {
-		return ManifestEntry{}, "", "", errors.New("manifest path must be relative")
-	}
-	cleanPath := filepath.Clean(filepath.FromSlash(pathResolved))
-	if cleanPath == "." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == ".." {
-		return ManifestEntry{}, "", "", errors.New("manifest path traversal is not allowed")
-	}
-
-	entry := ManifestEntry{
-		ID:    id,
-		Size:  int64(sizeU),
-		Mtime: int64(mtimeNanos),
-		Mode:  mode,
-		Path:  pathResolved,
-	}
-	return entry, pathResolved, mtimeResolved, nil
-}
-
-func parseManifestModeToken(raw string) (os.FileMode, error) {
-	if raw == "" {
-		return 0, errors.New("manifest mode is required")
-	}
-	for _, ch := range raw {
-		if ch < '0' || ch > '7' {
-			return 0, errors.New("manifest mode must be octal")
-		}
-	}
-	v, err := strconv.ParseUint(raw, 8, 32)
-	if err != nil {
-		return 0, fmt.Errorf("invalid manifest mode: %w", err)
-	}
-	if v > 0o7777 {
-		return 0, errors.New("manifest mode must be <= 07777")
-	}
-	return os.FileMode(v), nil
-}
-
-
-func parseLenPrefixedPrefix(raw string) (string, int, error) {
-	sep := strings.IndexByte(raw, ':')
-	if sep <= 0 {
-		return "", 0, errors.New("invalid len-prefixed token")
-	}
-	n, err := strconv.Atoi(raw[:sep])
-	if err != nil || n < 0 {
-		return "", 0, errors.New("invalid len prefix")
-	}
-	start := sep + 1
-	end := start + n
-	if end > len(raw) {
-		return "", 0, errors.New("len prefix mismatch")
-	}
-	return raw[start:end], end, nil
-}
-
-func decodeMtimeToken(prev string, token string) (string, error) {
-	head, suffix, ok := strings.Cut(token, ":")
-	if !ok {
-		return "", errors.New("invalid mtime token")
-	}
-	prefixLen, err := strconv.Atoi(head)
-	if err != nil || prefixLen < 0 {
-		return "", errors.New("invalid mtime prefix length")
-	}
-	if prefixLen > len(prev) {
-		return "", errors.New("mtime prefix length exceeds previous value")
-	}
-	if suffix == "" {
-		return "", errors.New("empty mtime suffix")
-	}
-	for _, ch := range suffix {
-		if ch < '0' || ch > '9' {
-			return "", errors.New("mtime suffix must be decimal digits")
-		}
-	}
-	if prev == "" && prefixLen != 0 {
-		return "", errors.New("first mtime prefix length must be zero")
-	}
-	return prev[:prefixLen] + suffix, nil
-}
-
-func decodePathToken(prev string, token string) (string, error) {
-	first := strings.IndexByte(token, ':')
-	if first < 0 {
-		return "", errors.New("invalid path token")
-	}
-	second := strings.IndexByte(token[first+1:], ':')
-	if second < 0 {
-		return "", errors.New("invalid path token")
-	}
-	second += first + 1
-	prefixLen, err := strconv.Atoi(token[:first])
-	if err != nil || prefixLen < 0 {
-		return "", errors.New("invalid path prefix length")
-	}
-	if prefixLen > len(prev) {
-		return "", errors.New("path prefix length exceeds previous value")
-	}
-	suffixLen, err := strconv.Atoi(token[first+1 : second])
-	if err != nil || suffixLen < 0 {
-		return "", errors.New("invalid path suffix length")
-	}
-	suffix := token[second+1:]
-	if len(suffix) != suffixLen {
-		return "", errors.New("path suffix length mismatch")
-	}
-	if prev == "" && prefixLen != 0 {
-		return "", errors.New("first path prefix length must be zero")
-	}
-	return prev[:prefixLen] + suffix, nil
-}
 
 type fileStream struct {
 	respBody io.Closer

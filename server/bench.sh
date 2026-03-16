@@ -9,6 +9,7 @@ Arguments:
   SOURCE_DIRECTORY           Source directory for transfer (required).
 
 Options:
+  --rsync                    Run an rsync baseline instead of a pinch transfer.
   --flamegraph               Run start benchmark under perf and emit flamegraph SVG.
   --trace                    Capture runtime/trace for client and server (view with go tool trace).
   --build                    Build ./pinch before benchmarking (default: true).
@@ -53,6 +54,7 @@ require_value() {
 BUILD=true
 FLAMEGRAPH=false
 TRACE=false
+RSYNC=false
 SERVER_URL="127.0.0.1:3453"
 SERVER_STARTUP_TIMEOUT_SEC=30
 SOURCE_DIRECTORY=""
@@ -86,6 +88,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --flamegraph)
       FLAMEGRAPH=true
+      shift
+      ;;
+    --rsync)
+      RSYNC=true
       shift
       ;;
     --trace)
@@ -198,6 +204,29 @@ if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "age" ]]; then
   echo "unsupported --encrypt value: ${ENCRYPT_MODE} (only 'age' is supported)" >&2
   exit 2
 fi
+
+# ── rsync baseline mode ──────────────────────────────────────────────────
+if [[ "${RSYNC}" == "true" ]]; then
+  require_cmd rsync
+  echo "bench (rsync baseline): source=${SOURCE_DIRECTORY} target=${OUT_ROOT}"
+  if [[ "${OUT_ROOT%/}" != "/dev/null" ]]; then
+    rm -rf "${OUT_ROOT}/"
+    mkdir -p "${OUT_ROOT}"
+  fi
+
+  RSYNC_CMD=(rsync -aW --no-compress --info=progress2)
+  if [[ "${NO_SYNC}" != "true" ]]; then
+    RSYNC_CMD+=(--fsync)
+  fi
+  # Trailing slash on source so rsync copies contents, not the directory itself.
+  RSYNC_CMD+=("${SOURCE_DIRECTORY%/}/" "${OUT_ROOT%/}/")
+
+  echo "Running: ${RSYNC_CMD[*]}"
+  { time "${RSYNC_CMD[@]}"; } 2>&1
+  exit 0
+fi
+
+# ── pinch mode ────────────────────────────────────────────────────────────
 if [[ "$BUILD" == "true" ]]; then
   echo "Building pinch..."
   go build -o pinch

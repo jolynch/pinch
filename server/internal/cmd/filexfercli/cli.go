@@ -85,6 +85,8 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		return runStatusCLI(serverURL, cmdArgs, stdout, stderr)
 	case "get":
 		return runGetCLI(serverURL, cmdArgs, stdout, stderr)
+	case "sync":
+		return runSyncCLI(serverURL, cmdArgs, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown cli command: %s\n", cmd)
 		printCLIUsage(stderr)
@@ -111,6 +113,7 @@ func printCLIUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  pinch cli <file-listener> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--encrypt age] [--load-strategy fast|gentle] [--probe-bytes <size>] [-v|--verbose] [--max-manifest-chunk-size N]")
 	fmt.Fprintln(w, "  pinch cli <file-listener> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--encrypt age] [--concurrency N] [-a|--ack-every <size>] [--batch-size <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintln(w, "  pinch cli <file-listener> sync -s <abs> --manifest <path> [--out-root <dir>] [-o <manifest-out>] [-y|--yes] [--encrypt age] [--comp adapt|none|lz4|zstd] [--concurrency N] [-a|--ack-every <size>] [--batch-size <size>] [--no-sync] [-v|--verbose]")
 	fmt.Fprintln(w, "  pinch cli <file-listener> status --tid <id>")
 	fmt.Fprintln(w, "  pinch cli <file-listener> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--encrypt age] [--load-strategy fast|gentle] [-a|--ack-every <size>] [--batch-size <size>] [--no-sync] [-v|--verbose]")
 }
@@ -154,8 +157,12 @@ func resolveComp(raw string) (string, error) {
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	fs := flag.NewFlagSet("transfer", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	cf := newCLIFlags("transfer")
+	cf.SetOutput(stderr)
+	cf.fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> transfer -s <dir> [-o <manifest>] [--encrypt age] [--load-strategy fast|gentle] [-v]")
+		cf.PrintDefaults(stderr)
+	}
 	var sourceDir string
 	var manifestOut string
 	var encryptMode string
@@ -163,17 +170,15 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	var probeBytesRaw string
 	var verbose bool
 	var maxChunk int
-	fs.StringVar(&sourceDir, "s", "", "absolute source directory to transfer")
-	fs.StringVar(&sourceDir, "source-directory", "", "absolute source directory to transfer")
-	fs.StringVar(&manifestOut, "o", "", "output path for saved manifest")
-	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
-	fs.StringVar(&loadStrategyRaw, "load-strategy", LoadStrategyFast, "server load strategy (fast|gentle)")
+	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory to transfer")
+	cf.StringVar(&manifestOut, "o", "", "", "output path for saved manifest")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
+	cf.StringVar(&loadStrategyRaw, "", "load-strategy", LoadStrategyFast, "server load strategy (fast|gentle)")
 	probeBytesRaw = encoding.HumanBytes(defaultCLIProbeBytes)
-	fs.StringVar(&probeBytesRaw, "probe-bytes", probeBytesRaw, "probe payload size for transfer metadata")
-	fs.BoolVar(&verbose, "v", false, "disable front-coding")
-	fs.BoolVar(&verbose, "verbose", false, "disable front-coding")
-	fs.IntVar(&maxChunk, "max-manifest-chunk-size", 0, "max chunk bytes for manifest stream")
-	if err := fs.Parse(args); err != nil {
+	cf.StringVar(&probeBytesRaw, "", "probe-bytes", probeBytesRaw, "probe payload size for transfer metadata")
+	cf.BoolVar(&verbose, "v", "verbose", false, "disable front-coding")
+	cf.IntVar(&maxChunk, "", "max-manifest-chunk-size", 0, "max chunk bytes for manifest stream")
+	if err := cf.Parse(args); err != nil {
 		return 2
 	}
 	if sourceDir == "" {
@@ -285,11 +290,15 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 }
 
 func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	fs := flag.NewFlagSet("status", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	cf := newCLIFlags("status")
+	cf.SetOutput(stderr)
+	cf.fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> status --tid <id>")
+		cf.PrintDefaults(stderr)
+	}
 	var txferID string
-	fs.StringVar(&txferID, "tid", "", "transfer id")
-	if err := fs.Parse(args); err != nil {
+	cf.StringVar(&txferID, "", "tid", "", "transfer id")
+	if err := cf.Parse(args); err != nil {
 		return 2
 	}
 	if txferID == "" {
@@ -321,8 +330,12 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 }
 
 func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	fs := flag.NewFlagSet("get", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	cf := newCLIFlags("get")
+	cf.SetOutput(stderr)
+	cf.fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--encrypt age] [-a <size>] [-b <size>] [-v]")
+		cf.PrintDefaults(stderr)
+	}
 	var txferID string
 	var manifestPath string
 	var fileIDRaw string
@@ -336,24 +349,21 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var noSync bool
 	var verbose bool
 	var traceFile string
-	fs.StringVar(&txferID, "tid", "", "transfer id")
-	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm2)")
-	fs.StringVar(&fileIDRaw, "fd", "", "file id to download")
-	fs.StringVar(&outRoot, "out-root", ".", "output root")
-	fs.StringVar(&outFile, "o", "", "output file path, or '-' for stdout")
-	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
-	fs.StringVar(&loadStrategyRaw, "load-strategy", LoadStrategyFast, "server load strategy (fast|gentle)")
-	fs.StringVar(&compRaw, "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
-	fs.BoolVar(&verbose, "v", false, "verbose progress output")
-	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
+	cf.StringVar(&txferID, "", "tid", "", "transfer id")
+	cf.StringVar(&manifestPath, "", "manifest", "", "path to manifest file (default: <tid>.fm2)")
+	cf.StringVar(&fileIDRaw, "", "fd", "", "file id to download")
+	cf.StringVar(&outRoot, "", "out-root", ".", "output root")
+	cf.StringVar(&outFile, "o", "", "", "output file path, or '-' for stdout")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
+	cf.StringVar(&loadStrategyRaw, "", "load-strategy", LoadStrategyFast, "server load strategy (fast|gentle)")
+	cf.StringVar(&compRaw, "", "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
+	cf.BoolVar(&verbose, "v", "verbose", false, "verbose progress output")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
-	fs.StringVar(&ackEveryRaw, "a", ackEveryRaw, "bytes between progress acks")
-	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
-	fs.StringVar(&batchSizeRaw, "b", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
-	fs.StringVar(&batchSizeRaw, "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
-	fs.BoolVar(&noSync, "no-sync", false, "ack without disk sync")
-	fs.StringVar(&traceFile, "trace", "", "write runtime/trace output to this file")
-	if err := fs.Parse(args); err != nil {
+	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks")
+	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
+	cf.BoolVar(&noSync, "", "no-sync", false, "ack without disk sync")
+	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
+	if err := cf.Parse(args); err != nil {
 		return 2
 	}
 	stopTracing := startTracing(traceFile, stderr)
@@ -485,13 +495,378 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	return 0
 }
 
+func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
+	outputMu := &sync.Mutex{}
+	stdout = &synchronizedWriter{mu: outputMu, w: stdout}
+	stderr = &synchronizedWriter{mu: outputMu, w: stderr}
+
+	cf := newCLIFlags("sync")
+	cf.SetOutput(stderr)
+	cf.fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> sync -s <dir> --manifest <path> [--out-root <dir>] [-o <manifest-out>] [-y] [--encrypt age] [--comp adapt|none|lz4|zstd] [--concurrency N] [-a <size>] [-b <size>] [-v]")
+		cf.PrintDefaults(stderr)
+	}
+	var sourceDir string
+	var manifestPath string
+	var manifestOut string
+	var outRoot string
+	var encryptMode string
+	var concurrency int
+	var ackEveryRaw string
+	var batchSizeRaw string
+	var compRaw string
+	var noSync bool
+	var verbose bool
+	var yes bool
+	var probeBytesRaw string
+	var traceFile string
+	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory on server")
+	cf.StringVar(&manifestPath, "", "manifest", "", "path to existing manifest file (required)")
+	cf.StringVar(&manifestOut, "o", "", "", "output path for updated manifest (default: overwrite --manifest)")
+	cf.StringVar(&outRoot, "", "out-root", ".", "local output root directory")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
+	cf.StringVar(&compRaw, "", "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
+	cf.IntVar(&concurrency, "", "concurrency", 0, "parallel download workers (0=manifest default)")
+	cf.BoolVar(&verbose, "v", "verbose", false, "verbose progress output")
+	cf.BoolVar(&yes, "y", "yes", false, "skip confirmation prompt")
+	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
+	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks")
+	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size")
+	cf.BoolVar(&noSync, "", "no-sync", false, "ack without fdatasync")
+	probeBytesRaw = encoding.HumanBytes(defaultCLIProbeBytes)
+	cf.StringVar(&probeBytesRaw, "", "probe-bytes", probeBytesRaw, "probe payload size")
+	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
+	if err := cf.Parse(args); err != nil {
+		return 2
+	}
+	stopTracing := startTracing(traceFile, stderr)
+	defer stopTracing()
+	if sourceDir == "" {
+		fmt.Fprintln(stderr, "sync requires --source-directory (or -s)")
+		return 2
+	}
+	if manifestPath == "" {
+		fmt.Fprintln(stderr, "sync requires --manifest")
+		return 2
+	}
+	if manifestOut == "" {
+		manifestOut = manifestPath
+	}
+	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
+	if err != nil || ackEvery <= 0 {
+		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
+		return 2
+	}
+	batchSize, err := encoding.ParseByteSize(batchSizeRaw)
+	if err != nil || batchSize <= 0 {
+		fmt.Fprintf(stderr, "invalid --batch-size: %v\n", err)
+		return 2
+	}
+	probeBytes, err := encoding.ParseByteSize(probeBytesRaw)
+	if err != nil || probeBytes <= 0 {
+		fmt.Fprintf(stderr, "invalid --probe-bytes: %v\n", err)
+		return 2
+	}
+	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
+		return 2
+	}
+	comp, err := resolveComp(compRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --comp: %v\n", err)
+		return 2
+	}
+	concurrencyExplicit := false
+	cf.Visit(func(f *flag.Flag) {
+		if f.Name == "concurrency" {
+			concurrencyExplicit = true
+		}
+	})
+	if concurrencyExplicit && concurrency <= 0 {
+		fmt.Fprintln(stderr, "--concurrency must be > 0")
+		return 2
+	}
+
+	// Load old manifest and progress.
+	oldManifest, err := LoadManifest(manifestPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
+		return 1
+	}
+	loadStrategy, err := resolveLoadStrategy(oldManifest.Mode)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid manifest mode: %v\n", err)
+		return 1
+	}
+	progressPath := manifestPath + ".progress"
+	progressState, err := loadProgressState(progressPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
+		return 1
+	}
+	applyProgressStateToManifest(oldManifest, progressState)
+
+	// Probe link bandwidth.
+	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(comp))
+	probeResult, err := client.ProbeLink(context.Background(), ProbeRequest{
+		Samples:      3,
+		ProbeBytes:   probeBytes,
+		LoadStrategy: loadStrategy,
+		AgePublicKey: agePublicKey,
+		AgeIdentity:  ageIdentity,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "probe failed: %v\n", err)
+		return 1
+	}
+
+	// SYNC: send old manifest, receive new manifest + removed paths.
+	syncResp, err := client.SyncManifest(context.Background(), SyncManifestRequest{
+		Directory:    sourceDir,
+		OldManifest:  oldManifest,
+		Mode:         loadStrategy,
+		LinkMbps:     probeResult.LinkMbps,
+		Concurrency:  probeResult.SuggestedConcurrency,
+		AgePublicKey: agePublicKey,
+		AgeIdentity:  ageIdentity,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "sync failed: %v\n", err)
+		return 1
+	}
+	newManifest := syncResp.Manifest
+
+	// Compute delta: new, stale, unchanged, removed.
+	oldByPath := make(map[string]ManifestEntry, len(oldManifest.Entries))
+	for _, e := range oldManifest.Entries {
+		oldByPath[e.Path] = e
+	}
+	var newFiles, staleFiles, unchangedFiles []ManifestEntry
+	var newBytes, staleBytes int64
+	for _, entry := range newManifest.Entries {
+		if old, ok := oldByPath[entry.Path]; ok {
+			if old.Size == entry.Size && old.Mtime == entry.Mtime && old.Mode == entry.Mode {
+				// Unchanged — carry over progress.
+				entry.Progress = old.Progress
+				unchangedFiles = append(unchangedFiles, entry)
+			} else {
+				// Stale — reset progress.
+				staleFiles = append(staleFiles, entry)
+				staleBytes += entry.Size
+			}
+		} else {
+			newFiles = append(newFiles, entry)
+			newBytes += entry.Size
+		}
+	}
+	rmPaths := syncResp.RemovedPaths
+
+	fmt.Fprintf(stdout,
+		"sync-delta: new=%d (%s) stale=%d (%s) unchanged=%d rm=%d link=%dMbps concurrency=%d\n",
+		len(newFiles), encoding.HumanBytes(newBytes),
+		len(staleFiles), encoding.HumanBytes(staleBytes),
+		len(unchangedFiles),
+		len(rmPaths),
+		probeResult.LinkMbps,
+		probeResult.SuggestedConcurrency,
+	)
+
+	if len(newFiles) == 0 && len(staleFiles) == 0 && len(rmPaths) == 0 {
+		fmt.Fprintln(stdout, "sync: nothing to do")
+		return 0
+	}
+
+	// Prompt for confirmation if interactive.
+	if !yes {
+		stat, _ := os.Stdin.Stat()
+		isTerminal := stat != nil && (stat.Mode()&os.ModeCharDevice) != 0
+		if isTerminal {
+			fmt.Fprintf(stderr, "proceed? [y/N]: ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if !scanner.Scan() || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(scanner.Text())), "y") {
+				fmt.Fprintln(stderr, "aborted")
+				return 0
+			}
+		}
+	}
+
+	// Build merged manifest with new entries, carry progress for unchanged.
+	mergedManifest := &Manifest{
+		TransferID:  newManifest.TransferID,
+		Root:        newManifest.Root,
+		Mode:        newManifest.Mode,
+		LinkMbps:    newManifest.LinkMbps,
+		Concurrency: newManifest.Concurrency,
+		Entries:     newManifest.Entries,
+	}
+	// Apply carried progress to merged manifest entries.
+	for _, uf := range unchangedFiles {
+		for i := range mergedManifest.Entries {
+			if mergedManifest.Entries[i].ID == uf.ID {
+				mergedManifest.Entries[i].Progress = uf.Progress
+				break
+			}
+		}
+	}
+
+	// Save merged manifest.
+	if err := SaveManifest(manifestOut, mergedManifest); err != nil {
+		fmt.Fprintf(stderr, "save manifest failed: %v\n", err)
+		return 1
+	}
+
+	// Delete local files for removed paths.
+	for _, rmPath := range rmPaths {
+		localPath := filepath.Join(outRoot, filepath.FromSlash(rmPath))
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "sync: rm %s: %v\n", localPath, err)
+		}
+	}
+	// Truncate local files for stale entries.
+	for _, entry := range staleFiles {
+		localPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
+		if err := os.Truncate(localPath, 0); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "sync: truncate %s: %v\n", localPath, err)
+		}
+	}
+
+	// Build progress state for merged manifest.
+	mergedProgress := make(map[uint64]ManifestProgress, len(mergedManifest.Entries))
+	for _, e := range mergedManifest.Entries {
+		if e.Progress.AckBytes > 0 || e.Progress.MetadataDone {
+			mergedProgress[e.ID] = e.Progress
+		}
+	}
+
+	// Download pending entries (new + stale).
+	pendingEntries := make([]ManifestEntry, 0, len(newFiles)+len(staleFiles))
+	for _, entry := range mergedManifest.Entries {
+		if entry.Progress.AckBytes >= entry.Size && entry.Progress.MetadataDone {
+			continue
+		}
+		pendingEntries = append(pendingEntries, entry)
+	}
+
+	if len(pendingEntries) == 0 {
+		fmt.Fprintln(stdout, "sync: no downloads needed")
+		return 0
+	}
+
+	effectiveConcurrency := mergedManifest.Concurrency
+	if concurrencyExplicit {
+		effectiveConcurrency = concurrency
+	}
+
+	progressUpdates := make(chan DownloadProgressUpdate, 1024)
+	var onProgressUpdate func(DownloadProgressUpdate)
+	if verbose {
+		progressReporter := newVerboseProgressReporter(stderr)
+		onProgressUpdate = progressReporter.ReportUpdate
+	}
+	mergedProgressPath := manifestOut + ".progress"
+	forwardProgress := func(update DownloadProgressUpdate) {
+		applyProgressUpdateToManifest(mergedManifest, update)
+		if onProgressUpdate != nil {
+			onProgressUpdate(update)
+		}
+	}
+	stopProgress, markMetadataDonePersisted := startProgressWriter(mergedProgressPath, mergedProgress, progressUpdates, forwardProgress, stderr)
+	markMetadataDone := func(fileID uint64) {
+		markManifestEntryMetadataDone(mergedManifest, fileID)
+		markMetadataDonePersisted(fileID)
+	}
+	defer stopProgress()
+
+	startAll := time.Now()
+	var completed int64
+	var totalTransferred int64
+	var failures []error
+	var failuresMu sync.Mutex
+	recordFailure := func(err error) {
+		if err == nil {
+			return
+		}
+		failuresMu.Lock()
+		failures = append(failures, err)
+		failuresMu.Unlock()
+	}
+
+	startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
+		Manifest: mergedManifest,
+		Entries:  pendingEntries,
+		OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
+			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+			return openDownloadOutput(entry, offset, destPath, nil, noSync)
+		},
+		AgePublicKey:    agePublicKey,
+		AgeIdentity:     ageIdentity,
+		Concurrency:     effectiveConcurrency,
+		BatchMaxBytes:   batchSize,
+		ProgressUpdates: progressUpdates,
+		OnFileDone: func(evt StartFileDoneEvent) {
+			entry, ok := mergedManifest.EntryByID(evt.File.Meta.FileID)
+			if !ok {
+				recordFailure(fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID))
+				return
+			}
+			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+			if err := applyDownloadedTrailerMetadata(destPath, evt.File.Meta.TrailerMetadata); err != nil {
+				recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
+				return
+			}
+			markMetadataDone(evt.File.Meta.FileID)
+			printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "sync download failed: %v\n", err)
+		return 1
+	}
+	completed += int64(startResp.Downloaded)
+	totalTransferred += startResp.TransferredBytes
+	for _, startErr := range startResp.Errors {
+		recordFailure(startErr)
+	}
+
+	failuresMu.Lock()
+	finalFailures := append([]error(nil), failures...)
+	failuresMu.Unlock()
+	for _, err := range finalFailures {
+		fmt.Fprintf(stderr, "sync error: %v\n", err)
+	}
+
+	elapsedAll := time.Since(startAll)
+	overallSpeed := 0.0
+	if elapsedAll > 0 {
+		overallSpeed = float64(totalTransferred) / elapsedAll.Seconds()
+	}
+	fmt.Fprintf(stdout,
+		"sync complete: tid=%s downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
+		mergedManifest.TransferID,
+		completed,
+		len(finalFailures),
+		encoding.HumanBytes(totalTransferred),
+		encoding.HumanRate(overallSpeed),
+		elapsedAll.Round(time.Millisecond),
+	)
+	if len(finalFailures) > 0 {
+		return 1
+	}
+	return 0
+}
+
 func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
 	outputMu := &sync.Mutex{}
 	stdout = &synchronizedWriter{mu: outputMu, w: stdout}
 	stderr = &synchronizedWriter{mu: outputMu, w: stderr}
 
-	fs := flag.NewFlagSet("start", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	cf := newCLIFlags("start")
+	cf.SetOutput(stderr)
+	cf.fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--encrypt age] [--concurrency N] [-a <size>] [-b <size>] [--no-sync] [-v]")
+		cf.PrintDefaults(stderr)
+	}
 	var txferID string
 	var manifestPath string
 	var outRoot string
@@ -502,29 +877,26 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var compRaw string
 	var noSync bool
 	var verbose bool
-	fs.StringVar(&txferID, "tid", "", "transfer id")
-	fs.StringVar(&manifestPath, "manifest", "", "path to manifest file (default: <tid>.fm2)")
-	fs.StringVar(&outRoot, "out-root", ".", "output root")
-	fs.StringVar(&encryptMode, "encrypt", "", "response encryption mode (supported: age)")
-	fs.BoolVar(&verbose, "v", false, "verbose progress output")
-	fs.BoolVar(&verbose, "verbose", false, "verbose progress output")
-	fs.IntVar(&concurrency, "concurrency", 0, "parallel download workers (0=manifest default)")
+	cf.StringVar(&txferID, "", "tid", "", "transfer id")
+	cf.StringVar(&manifestPath, "", "manifest", "", "path to manifest file (default: <tid>.fm2)")
+	cf.StringVar(&outRoot, "", "out-root", ".", "output root")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
+	cf.BoolVar(&verbose, "v", "verbose", false, "verbose progress output")
+	cf.IntVar(&concurrency, "", "concurrency", 0, "parallel download workers (0=manifest default)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
-	fs.StringVar(&ackEveryRaw, "a", ackEveryRaw, "bytes between progress acks")
-	fs.StringVar(&ackEveryRaw, "ack-every", ackEveryRaw, "bytes between progress acks")
-	fs.StringVar(&batchSizeRaw, "b", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
-	fs.StringVar(&batchSizeRaw, "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
-	fs.StringVar(&compRaw, "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
-	fs.BoolVar(&noSync, "no-sync", false, "ack without fdatasync")
+	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks")
+	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
+	cf.StringVar(&compRaw, "", "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
+	cf.BoolVar(&noSync, "", "no-sync", false, "ack without fdatasync")
 	var traceFile string
-	fs.StringVar(&traceFile, "trace", "", "write runtime/trace output to this file")
-	if err := fs.Parse(args); err != nil {
+	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
+	if err := cf.Parse(args); err != nil {
 		return 2
 	}
 	stopTracing := startTracing(traceFile, stderr)
 	defer stopTracing()
 	concurrencyExplicit := false
-	fs.Visit(func(f *flag.Flag) {
+	cf.Visit(func(f *flag.Flag) {
 		if f.Name == "concurrency" {
 			concurrencyExplicit = true
 		}
@@ -741,15 +1113,22 @@ func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta Fi
 	default:
 		checksum = "checksum=[-]"
 	}
-	fmt.Fprintf(
-		stdout,
-		"start-file: fd=%d path=%s %s comp=%s rate=%s\n",
-		fileID,
-		path,
-		checksum,
-		compSummary,
-		encoding.HumanRate(speed),
-	)
+	// Build the full line before writing to avoid multiple Write calls (and lock
+	// acquisitions) on the synchronized stdout writer.
+	var sb strings.Builder
+	sb.Grow(128)
+	sb.WriteString("start-file: fd=")
+	sb.WriteString(strconv.FormatUint(fileID, 10))
+	sb.WriteString(" path=")
+	sb.WriteString(path)
+	sb.WriteByte(' ')
+	sb.WriteString(checksum)
+	sb.WriteString(" comp=")
+	sb.WriteString(compSummary)
+	sb.WriteString(" rate=")
+	sb.WriteString(encoding.HumanRate(speed))
+	sb.WriteByte('\n')
+	io.WriteString(stdout, sb.String())
 }
 
 func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer) func() {
