@@ -596,7 +596,7 @@ func TestFetchFileWindowHonorsSizeHint(t *testing.T) {
 
 func TestParseManifestSingleChunk(t *testing.T) {
 	raw := strings.Join([]string{
-		"FM/2 tx123 5:/root mode=fast link-mbps=1000 concurrency=8",
+		"FM/1 tx123 5:/root mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"1 7 2:1 0600 0:9:dir/b.txt",
 		"",
@@ -625,10 +625,10 @@ func TestParseManifestSingleChunk(t *testing.T) {
 
 func TestParseManifestMultiChunk(t *testing.T) {
 	raw := strings.Join([]string{
-		"FM/2 tx456 6:/root2 mode=gentle link-mbps=500 concurrency=4",
+		"FM/1 tx456 6:/root2 mode=gentle link-mbps=500 concurrency=4",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
-		"FM/2 tx456 6:/root2 mode=gentle link-mbps=500 concurrency=4",
+		"FM/1 tx456 6:/root2 mode=gentle link-mbps=500 concurrency=4",
 		"1 3 0:200 0600 0:5:b.txt",
 		"",
 	}, "\n")
@@ -689,7 +689,7 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 
 func TestParseManifestMalformed(t *testing.T) {
 	raw := strings.Join([]string{
-		"FM/2 tx789 5:/root mode=fast link-mbps=1000 concurrency=8",
+		"FM/1 tx789 5:/root mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:abc 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -700,7 +700,7 @@ func TestParseManifestMalformed(t *testing.T) {
 
 func TestParseManifestLegacyEntryRejected(t *testing.T) {
 	raw := strings.Join([]string{
-		"FM/2 tx789 5:/root mode=fast link-mbps=1000 concurrency=8",
+		"FM/1 tx789 5:/root mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0:5:a.txt",
 		"",
 	}, "\n")
@@ -716,7 +716,7 @@ func TestFetchManifestEncryptedWithAge(t *testing.T) {
 	}
 	recipient := identity.Recipient().String()
 	manifestRaw := strings.Join([]string{
-		"FM/2 txenc 5:/root mode=fast link-mbps=1000 concurrency=8",
+		"FM/1 txenc 5:/root mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")

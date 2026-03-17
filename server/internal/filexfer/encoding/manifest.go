@@ -11,7 +11,7 @@ import (
 	"github.com/jolynch/pinch/utils"
 )
 
-// ManifestEntry is the internal representation of one FM/2 manifest line.
+// ManifestEntry is the internal representation of one FM/1 manifest line.
 type ManifestEntry struct {
 	ID    uint64
 	Size  int64
@@ -20,13 +20,14 @@ type ManifestEntry struct {
 	Path  string
 }
 
-// ManifestHeader is the parsed FM/2 header line.
+// ManifestHeader is the parsed FM/1 header line.
 type ManifestHeader struct {
 	TransferID  string
 	Root        string
 	Mode        string
 	LinkMbps    int64
 	Concurrency int
+	DeadlineMS  int64 // optional; 0 = no deadline
 }
 
 // EncodePathToken front-codes current against prev and returns a "prefix:suffixLen:suffix" token.
@@ -143,7 +144,7 @@ func ParseManifestModeToken(raw string) (os.FileMode, error) {
 	return os.FileMode(v), nil
 }
 
-// ParseManifestEntry parses a single FM/2 manifest entry line.
+// ParseManifestEntry parses a single FM/1 manifest entry line.
 // Returns the parsed entry, the resolved path, and the resolved mtime string.
 func ParseManifestEntry(line string, prevPath string, prevMtime string) (ManifestEntry, string, string, error) {
 	first := strings.IndexByte(line, ' ')
@@ -253,9 +254,9 @@ func MarshalManifestEntry(entry ManifestEntry, prevPath string, prevMtime string
 	return line, entry.Path, mtimeRaw, nil
 }
 
-// ParseManifestHeader parses an FM/2 header line and returns the header fields.
+// ParseManifestHeader parses an FM/1 header line and returns the header fields.
 func ParseManifestHeader(line string) (ManifestHeader, error) {
-	rest := strings.TrimPrefix(line, "FM/2 ")
+	rest := strings.TrimPrefix(line, "FM/1 ")
 	sep := strings.IndexByte(rest, ' ')
 	if sep <= 0 || sep == len(rest)-1 {
 		return ManifestHeader{}, errors.New("invalid manifest header")
@@ -304,6 +305,11 @@ func ParseManifestHeader(line string) (ManifestHeader, error) {
 				return ManifestHeader{}, errors.New("invalid manifest concurrency")
 			}
 			seenConc = true
+		case "deadline-ms":
+			hdr.DeadlineMS, err = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if err != nil || hdr.DeadlineMS < 0 {
+				return ManifestHeader{}, errors.New("invalid manifest deadline-ms")
+			}
 		default:
 			return ManifestHeader{}, errors.New("unknown manifest header option")
 		}
@@ -314,10 +320,10 @@ func ParseManifestHeader(line string) (ManifestHeader, error) {
 	return hdr, nil
 }
 
-// FormatManifestHeader formats an FM/2 header line (without trailing newline).
+// FormatManifestHeader formats an FM/1 header line (without trailing newline).
 func FormatManifestHeader(hdr ManifestHeader) string {
-	return fmt.Sprintf(
-		"FM/2 %s %d:%s mode=%s link-mbps=%d concurrency=%d",
+	s := fmt.Sprintf(
+		"FM/1 %s %d:%s mode=%s link-mbps=%d concurrency=%d",
 		hdr.TransferID,
 		len(hdr.Root),
 		hdr.Root,
@@ -325,6 +331,10 @@ func FormatManifestHeader(hdr ManifestHeader) string {
 		hdr.LinkMbps,
 		hdr.Concurrency,
 	)
+	if hdr.DeadlineMS > 0 {
+		s += fmt.Sprintf(" deadline-ms=%d", hdr.DeadlineMS)
+	}
+	return s
 }
 
 // ParseLenPrefixedPrefix parses a "len:value" token at the start of raw.

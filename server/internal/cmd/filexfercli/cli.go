@@ -62,19 +62,53 @@ func (sw *synchronizedWriter) Write(p []byte) (int, error) {
 	return sw.w.Write(p)
 }
 
+const defaultFileListener = "127.0.0.1:3453"
+
+func isKnownCommand(s string) bool {
+	switch s {
+	case "transfer", "start", "status", "get", "sync":
+		return true
+	}
+	return false
+}
+
 func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
-	if len(args) < 2 {
+	if len(args) < 1 {
 		printCLIUsage(stderr)
 		return 2
 	}
+
+	// Handle top-level help.
+	if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		printCLIUsage(stderr)
+		return 0
+	}
+
+	// If first arg is a known command, default the server address.
 	serverURL := args[0]
-	if err := validateServerURL(serverURL); err != nil {
-		fmt.Fprintf(stderr, "invalid server-url: %v\n", err)
+	cmdStart := 1
+	if isKnownCommand(args[0]) {
+		serverURL = defaultFileListener
+		cmdStart = 0
+		// Only log the default address when not requesting help.
+		if !slices.Contains(args, "--help") && !slices.Contains(args, "-h") {
+			fmt.Fprintf(stderr, "connecting to %s\n", serverURL)
+		}
+	} else {
+		if err := validateServerURL(serverURL); err != nil {
+			fmt.Fprintf(stderr, "invalid server-url: %v\n", err)
+			printCLIUsage(stderr)
+			return 2
+		}
+	}
+
+	if cmdStart >= len(args) {
 		printCLIUsage(stderr)
 		return 2
 	}
-	cmd := args[1]
-	cmdArgs := args[2:]
+
+	cmd := args[cmdStart]
+	cmdArgs := args[cmdStart+1:]
 
 	switch cmd {
 	case "transfer":
@@ -87,8 +121,11 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		return runGetCLI(serverURL, cmdArgs, stdout, stderr)
 	case "sync":
 		return runSyncCLI(serverURL, cmdArgs, stdout, stderr)
+	case "--help", "-h", "help":
+		printCLIUsage(stderr)
+		return 0
 	default:
-		fmt.Fprintf(stderr, "unknown cli command: %s\n", cmd)
+		fmt.Fprintf(stderr, "unknown command: %s\n", cmd)
 		printCLIUsage(stderr)
 		return 2
 	}
@@ -110,12 +147,18 @@ func validateServerURL(raw string) error {
 }
 
 func printCLIUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  pinch cli <file-listener> transfer -s <abs> [--source-directory <abs>] [-o <manifest-path>] [--encrypt age] [--load-strategy fast|gentle] [--probe-bytes <size>] [-v|--verbose] [--max-manifest-chunk-size N]")
-	fmt.Fprintln(w, "  pinch cli <file-listener> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--encrypt age] [--concurrency N] [-a|--ack-every <size>] [--batch-size <size>] [--no-sync] [-v|--verbose]")
-	fmt.Fprintln(w, "  pinch cli <file-listener> sync -s <abs> --manifest <path> [--out-root <dir>] [-o <manifest-out>] [-y|--yes] [--encrypt age] [--comp adapt|none|lz4|zstd] [--concurrency N] [-a|--ack-every <size>] [--batch-size <size>] [--no-sync] [-v|--verbose]")
-	fmt.Fprintln(w, "  pinch cli <file-listener> status --tid <id>")
-	fmt.Fprintln(w, "  pinch cli <file-listener> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--encrypt age] [--load-strategy fast|gentle] [-a|--ack-every <size>] [--batch-size <size>] [--no-sync] [-v|--verbose]")
+	fmt.Fprintf(w, `usage: pinch filecli [<addr>] <command> [options]
+
+Commands:
+  transfer   Create a file transfer and emit manifest
+  start      Download files from an existing transfer
+  sync       Incremental sync using an existing manifest
+  status     Query transfer status
+  get        Download a single file from a transfer
+
+Default server address: %s
+Run 'pinch filecli <command> --help' for command-specific options.
+`, defaultFileListener)
 }
 
 func resolveEncryptionOptions(mode string) (string, string, error) {
@@ -160,7 +203,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	cf := newCLIFlags("transfer")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> transfer -s <dir> [-o <manifest>] [--encrypt age] [--load-strategy fast|gentle] [-v]")
+		fmt.Fprintln(stderr, "usage: pinch filecli transfer -s <dir> [-o <manifest>] [--encrypt age] [--load-strategy fast|gentle] [-v]")
 		cf.PrintDefaults(stderr)
 	}
 	var sourceDir string
@@ -170,6 +213,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	var probeBytesRaw string
 	var verbose bool
 	var maxChunk int
+	var deadlineRaw string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory to transfer")
 	cf.StringVar(&manifestOut, "o", "", "", "output path for saved manifest")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
@@ -178,7 +222,11 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	cf.StringVar(&probeBytesRaw, "", "probe-bytes", probeBytesRaw, "probe payload size for transfer metadata")
 	cf.BoolVar(&verbose, "v", "verbose", false, "disable front-coding")
 	cf.IntVar(&maxChunk, "", "max-manifest-chunk-size", 0, "max chunk bytes for manifest stream")
+	cf.StringVar(&deadlineRaw, "", "deadline", "", "transfer deadline (e.g. 60s, 5m)")
 	if err := cf.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
 		return 2
 	}
 	if sourceDir == "" {
@@ -207,6 +255,19 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
+	}
+	var deadlineMS int64
+	if deadlineRaw != "" {
+		d, err := time.ParseDuration(deadlineRaw)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --deadline: %v\n", err)
+			return 2
+		}
+		if d <= 0 {
+			fmt.Fprintln(stderr, "--deadline must be > 0")
+			return 2
+		}
+		deadlineMS = d.Milliseconds()
 	}
 
 	client := NewClient(serverURL, WithLoadStrategy(loadStrategy))
@@ -238,6 +299,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		Mode:         loadStrategy,
 		LinkMbps:     probeResult.LinkMbps,
 		Concurrency:  probeResult.SuggestedConcurrency,
+		DeadlineMS:   deadlineMS,
 		AgePublicKey: agePublicKey,
 		AgeIdentity:  ageIdentity,
 	})
@@ -293,12 +355,15 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 	cf := newCLIFlags("status")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> status --tid <id>")
+		fmt.Fprintln(stderr, "usage: pinch filecli status --tid <id>")
 		cf.PrintDefaults(stderr)
 	}
 	var txferID string
 	cf.StringVar(&txferID, "", "tid", "", "transfer id")
 	if err := cf.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
 		return 2
 	}
 	if txferID == "" {
@@ -333,7 +398,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf := newCLIFlags("get")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--encrypt age] [-a <size>] [-b <size>] [-v]")
+		fmt.Fprintln(stderr, "usage: pinch filecli get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--encrypt age] [-a <size>] [-b <size>] [-v]")
 		cf.PrintDefaults(stderr)
 	}
 	var txferID string
@@ -364,6 +429,9 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf.BoolVar(&noSync, "", "no-sync", false, "ack without disk sync")
 	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
 		return 2
 	}
 	stopTracing := startTracing(traceFile, stderr)
@@ -503,7 +571,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf := newCLIFlags("sync")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> sync -s <dir> --manifest <path> [--out-root <dir>] [-o <manifest-out>] [-y] [--encrypt age] [--comp adapt|none|lz4|zstd] [--concurrency N] [-a <size>] [-b <size>] [-v]")
+		fmt.Fprintln(stderr, "usage: pinch filecli sync -s <dir> --manifest <path> [--out-root <dir>] [-o <manifest-out>] [-y] [--delete] [--encrypt age] [--comp adapt|none|lz4|zstd] [--concurrency N] [-a <size>] [-b <size>] [-v]")
 		cf.PrintDefaults(stderr)
 	}
 	var sourceDir string
@@ -518,6 +586,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var noSync bool
 	var verbose bool
 	var yes bool
+	var deleteRemoved bool
 	var probeBytesRaw string
 	var traceFile string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory on server")
@@ -533,10 +602,14 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks")
 	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size")
 	cf.BoolVar(&noSync, "", "no-sync", false, "ack without fdatasync")
+	cf.BoolVar(&deleteRemoved, "", "delete", false, "delete local files removed on server")
 	probeBytesRaw = encoding.HumanBytes(defaultCLIProbeBytes)
 	cf.StringVar(&probeBytesRaw, "", "probe-bytes", probeBytesRaw, "probe payload size")
 	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
 		return 2
 	}
 	stopTracing := startTracing(traceFile, stderr)
@@ -716,11 +789,13 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		return 1
 	}
 
-	// Delete local files for removed paths.
-	for _, rmPath := range rmPaths {
-		localPath := filepath.Join(outRoot, filepath.FromSlash(rmPath))
-		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(stderr, "sync: rm %s: %v\n", localPath, err)
+	// Delete local files for removed paths (only when --delete is specified).
+	if deleteRemoved {
+		for _, rmPath := range rmPaths {
+			localPath := filepath.Join(outRoot, filepath.FromSlash(rmPath))
+			if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+				fmt.Fprintf(stderr, "sync: rm %s: %v\n", localPath, err)
+			}
 		}
 	}
 	// Truncate local files for stale entries.
@@ -864,7 +939,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf := newCLIFlags("start")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch cli <file-listener> start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--encrypt age] [--concurrency N] [-a <size>] [-b <size>] [--no-sync] [-v]")
+		fmt.Fprintln(stderr, "usage: pinch filecli start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--encrypt age] [--concurrency N] [-a <size>] [-b <size>] [--no-sync] [-v]")
 		cf.PrintDefaults(stderr)
 	}
 	var txferID string
@@ -877,24 +952,54 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var compRaw string
 	var noSync bool
 	var verbose bool
+	var progress bool
+	var perFile bool
+	var deadlineRaw string
 	cf.StringVar(&txferID, "", "tid", "", "transfer id")
 	cf.StringVar(&manifestPath, "", "manifest", "", "path to manifest file (default: <tid>.fm2)")
 	cf.StringVar(&outRoot, "", "out-root", ".", "output root")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
 	cf.BoolVar(&verbose, "v", "verbose", false, "verbose progress output")
+	cf.BoolVar(&progress, "", "progress", false, "show transfer progress every 2s")
+	cf.BoolVar(&perFile, "", "per-file", false, "per-file progress (implies --progress)")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "parallel download workers (0=manifest default)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks")
 	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	cf.StringVar(&compRaw, "", "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.BoolVar(&noSync, "", "no-sync", false, "ack without fdatasync")
+	cf.StringVar(&deadlineRaw, "", "deadline", "", "transfer deadline (e.g. 60s, 5m)")
 	var traceFile string
 	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
 		return 2
 	}
 	stopTracing := startTracing(traceFile, stderr)
 	defer stopTracing()
+	// Compute verbosity level: 0=quiet, 1=progress, 2=per-file.
+	verbosity := 0
+	if progress || verbose {
+		verbosity = 1
+	}
+	if perFile {
+		verbosity = 2
+	}
+	var deadlineMS int64
+	if deadlineRaw != "" {
+		d, err := time.ParseDuration(deadlineRaw)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --deadline: %v\n", err)
+			return 2
+		}
+		if d <= 0 {
+			fmt.Fprintln(stderr, "--deadline must be > 0")
+			return 2
+		}
+		deadlineMS = d.Milliseconds()
+	}
 	concurrencyExplicit := false
 	cf.Visit(func(f *flag.Flag) {
 		if f.Name == "concurrency" {
@@ -960,9 +1065,13 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		return 1
 	}
 	applyProgressStateToManifest(manifest, progressState)
+	// Override manifest deadline if CLI flag is set.
+	if deadlineMS > 0 {
+		manifest.DeadlineMS = deadlineMS
+	}
 	progressUpdates := make(chan DownloadProgressUpdate, 1024)
 	var onStartProgressUpdate func(DownloadProgressUpdate)
-	if verbose {
+	if verbosity >= 2 {
 		progressReporter := newVerboseProgressReporter(stderr)
 		onStartProgressUpdate = progressReporter.ReportUpdate
 	}
@@ -1008,7 +1117,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		failuresMu.Unlock()
 	}
 	var stopStatusPolling func()
-	if verbose {
+	if verbosity >= 1 {
 		stopStatusPolling = startVerboseStatusPolling(txferID, client, stderr)
 		defer stopStatusPolling()
 	}
@@ -1054,7 +1163,9 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 				return
 			}
 			markMetadataDone(evt.File.Meta.FileID)
-			printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
+			if verbosity >= 2 {
+				printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
+			}
 		},
 	})
 	if err != nil {
@@ -1136,8 +1247,10 @@ func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(defaultVerboseStatusInterval)
+		ticker := time.NewTicker(defaultVerboseProgressInterval)
 		defer ticker.Stop()
+		var prevDoneSize int64
+		prevTime := time.Now()
 		for {
 			statusResp, statusErr := client.GetTransferStatus(ctx, GetTransferStatusRequest{
 				TransferID: txferID,
@@ -1148,11 +1261,29 @@ func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer)
 				}
 				fmt.Fprintf(stderr, "status refresh failed: %v\n", statusErr)
 			} else {
+				s := statusResp.Status
+				now := time.Now()
+				dt := now.Sub(prevTime).Seconds()
+				var rateBps float64
+				if dt > 0 {
+					rateBps = float64(s.DoneSize-prevDoneSize) / dt
+				}
+				prevDoneSize = s.DoneSize
+				prevTime = now
+
+				etaPart := ""
+				if rateBps > 0 && s.TotalSize > s.DoneSize {
+					remaining := float64(s.TotalSize - s.DoneSize)
+					etaSec := remaining / rateBps
+					etaPart = fmt.Sprintf(" eta=%s", (time.Duration(etaSec*float64(time.Second))).Round(time.Second))
+				}
 				fmt.Fprintf(
 					stderr,
-					"transfer-progress: files=%.2f%% bytes=%.2f%%\n",
-					statusResp.Status.PercentFiles,
-					statusResp.Status.PercentBytes,
+					"transfer-progress: files=%d/%d (%.1f%%) bytes=%s/%s (%.1f%%) rate=%s%s\n",
+					s.Done, s.NumFiles, s.PercentFiles,
+					encoding.HumanBytes(s.DoneSize), encoding.HumanBytes(s.TotalSize), s.PercentBytes,
+					encoding.HumanRate(rateBps),
+					etaPart,
 				)
 			}
 			select {

@@ -294,9 +294,9 @@ start_server() {
   read -r host port < <(split_host_port "${SERVER_URL}")
   mkdir -p "${SERVER_IN}" "${SERVER_OUT}" "${SERVER_KEYS}"
   echo "Starting server in background..."
-  local server_args=(-in "${SERVER_IN}" -out "${SERVER_OUT}" -keys "${SERVER_KEYS}")
+  local server_args=(filesrv -l "${SERVER_URL}" -k "${SERVER_KEYS}")
   if [[ "${TRACE}" == "true" ]]; then
-    server_args+=(-fs-trace "${SERVER_TRACE}")
+    server_args+=(--trace "${SERVER_TRACE}")
   fi
   ./pinch "${server_args[@]}" >"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
@@ -332,13 +332,13 @@ fi
 rm -rf "${MANIFEST_PATH}"*
 
 echo "Preparing manifest..."
-TRANSFER_CMD=(./pinch cli "${SERVER_URL}" transfer -o "${MANIFEST_PATH}" -s "${SOURCE_DIRECTORY}")
+TRANSFER_CMD=(./pinch filecli "${SERVER_URL}" transfer -o "${MANIFEST_PATH}" -s "${SOURCE_DIRECTORY}")
 if [[ -n "${ENCRYPT_MODE}" ]]; then
   TRANSFER_CMD+=(--encrypt "${ENCRYPT_MODE}")
 fi
 "${TRANSFER_CMD[@]}"
 
-START_CMD=(./pinch cli "${SERVER_URL}" start --manifest "${MANIFEST_PATH}" --out-root "${OUT_ROOT}" --concurrency "${CONCURRENCY}")
+START_CMD=(./pinch filecli "${SERVER_URL}" start --manifest "${MANIFEST_PATH}" --out-root "${OUT_ROOT}" --concurrency "${CONCURRENCY}")
 if [[ -n "${ENCRYPT_MODE}" ]]; then
   START_CMD+=(--encrypt "${ENCRYPT_MODE}")
 fi

@@ -20,6 +20,7 @@ type syncRequest struct {
 	Mode        string
 	LinkMbps    int64
 	Concurrency int
+	DeadlineMS  int64
 }
 
 type oldEntry struct {
@@ -40,7 +41,7 @@ func parseSYNCRequest(req Request) (syncRequest, error) {
 	p := req.Params[0]
 	for key := range p {
 		switch key {
-		case "directory", "mode", "link-mbps", "concurrency":
+		case "directory", "mode", "link-mbps", "concurrency", "deadline-ms":
 		default:
 			return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "unknown SYNC option"}
 		}
@@ -61,11 +62,19 @@ func parseSYNCRequest(req Request) (syncRequest, error) {
 	if err != nil || concurrency <= 0 {
 		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "concurrency must be > 0"}
 	}
+	var deadlineMS int64
+	if raw := strings.TrimSpace(p["deadline-ms"]); raw != "" {
+		deadlineMS, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || deadlineMS < 0 {
+			return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "deadline-ms must be >= 0"}
+		}
+	}
 	return syncRequest{
 		Directory:   directory,
 		Mode:        mode,
 		LinkMbps:    linkMbps,
 		Concurrency: concurrency,
+		DeadlineMS:  deadlineMS,
 	}, nil
 }
 
@@ -80,6 +89,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	if err != nil {
 		return err
 	}
+	parsed.Directory = filepath.Join(deps.Root(), parsed.Directory)
 	if err := validateDirectory(parsed.Directory); err != nil {
 		return protocolErr{code: "UNPROCESSABLE", message: err.Error()}
 	}
@@ -99,6 +109,9 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	}
 	if ok := deps.SetTransferHints(transfer.ID, parsed.Mode, parsed.LinkMbps, parsed.Concurrency); !ok {
 		return protocolErr{code: "INTERNAL", message: "failed to persist transfer hints"}
+	}
+	if parsed.DeadlineMS > 0 {
+		deps.SetTransferDeadline(transfer.ID, parsed.DeadlineMS)
 	}
 	manifestMode := parsed.Mode
 	manifestLinkMbps := parsed.LinkMbps
@@ -121,13 +134,14 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		}
 	}()
 
-	// Write FM/2 header.
+	// Write FM/1 header.
 	hdr := encoding.FormatManifestHeader(encoding.ManifestHeader{
 		TransferID:  transfer.ID,
 		Root:        root,
 		Mode:        manifestMode,
 		LinkMbps:    manifestLinkMbps,
 		Concurrency: manifestConcurrency,
+		DeadlineMS:  parsed.DeadlineMS,
 	})
 	if _, err := io.WriteString(out, hdr+"\n"); err != nil {
 		if isBrokenPipe(err) {
@@ -221,7 +235,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	return nil
 }
 
-// readOldManifest reads FM/2 manifest lines from in until a blank line.
+// readOldManifest reads FM/1 manifest lines from in until a blank line.
 // Returns a map keyed by xxh3-128 path hash — no path strings are retained.
 func readOldManifest(in io.Reader) (map[xxh3.Uint128]*oldEntry, error) {
 	br := bufio.NewReader(in)
@@ -243,7 +257,7 @@ func readOldManifest(in io.Reader) (map[xxh3.Uint128]*oldEntry, error) {
 			break
 		}
 
-		if strings.HasPrefix(trimmed, "FM/2 ") {
+		if strings.HasPrefix(trimmed, "FM/1 ") {
 			// Parse header but we only need to validate it; we don't use its fields.
 			if _, headerErr := encoding.ParseManifestHeader(trimmed); headerErr != nil {
 				return nil, headerErr

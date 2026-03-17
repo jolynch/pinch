@@ -51,6 +51,9 @@ type Transfer struct {
 	AckedSize   []int64
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
+	DeadlineMS  int64     // 0 = no deadline
+	FirstSendAt time.Time // set on first gentle SEND
+	TooSlow     bool      // sticky flag set when deadline is exceeded
 }
 
 type TransferFileState struct {
@@ -211,6 +214,53 @@ func (s *transferStore) setTransferHints(txferID string, mode string, linkMbps i
 	managed.transfer.Mode = strings.ToLower(strings.TrimSpace(mode))
 	managed.transfer.LinkMbps = linkMbps
 	managed.transfer.Concurrency = concurrency
+	return true
+}
+
+func (s *transferStore) setTransferDeadline(txferID string, deadlineMS int64) bool {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return false
+	}
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+	managed.transfer.DeadlineMS = deadlineMS
+	return true
+}
+
+func (s *transferStore) recordFirstSend(txferID string) (time.Time, bool) {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return time.Time{}, false
+	}
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return time.Time{}, false
+	}
+	if managed.transfer.FirstSendAt.IsZero() {
+		managed.transfer.FirstSendAt = time.Now()
+	}
+	return managed.transfer.FirstSendAt, true
+}
+
+func (s *transferStore) markTooSlow(txferID string) bool {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return false
+	}
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+	managed.transfer.TooSlow = true
 	return true
 }
 
@@ -846,6 +896,18 @@ func GetTransfer(txferID string) (Transfer, bool) {
 
 func SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
 	return manager.setTransferHints(txferID, mode, linkMbps, concurrency)
+}
+
+func SetTransferDeadline(txferID string, deadlineMS int64) bool {
+	return manager.setTransferDeadline(txferID, deadlineMS)
+}
+
+func RecordTransferFirstSend(txferID string) (time.Time, bool) {
+	return manager.recordFirstSend(txferID)
+}
+
+func MarkTransferTooSlow(txferID string) bool {
+	return manager.markTooSlow(txferID)
 }
 
 func GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {

@@ -163,7 +163,7 @@ func writeTestFile(t *testing.T, root, rel, content string) {
 	}
 }
 
-// runTXFERTest runs TXFER and returns the raw FM/2 manifest output.
+// runTXFERTest runs TXFER and returns the raw FM/1 manifest output.
 func runTXFERTest(t *testing.T, root string) string {
 	t.Helper()
 	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8`, root)
@@ -211,7 +211,7 @@ func runSYNCTest(t *testing.T, root string, oldManifest string) ([]encoding.Mani
 	return parseSYNCResponse(t, out.String(), oldByID)
 }
 
-// buildOldByID parses a raw FM/2 manifest and returns a fileID→path map.
+// buildOldByID parses a raw FM/1 manifest and returns a fileID→path map.
 func buildOldByID(rawManifest string) map[uint64]string {
 	entries, _ := parseSYNCResponseEntries(rawManifest, nil)
 	m := make(map[uint64]string, len(entries))
@@ -453,7 +453,7 @@ func parseSYNCResponseEntries(raw string, _ map[uint64]string) ([]encoding.Manif
 		if trimmed == "" {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "FM/2 ") {
+		if strings.HasPrefix(trimmed, "FM/1 ") {
 			seenHeader = true
 			prevPath = ""
 			prevMtime = ""
@@ -480,7 +480,7 @@ func parseSYNCResponseEntries(raw string, _ map[uint64]string) ([]encoding.Manif
 	return entries, rmIDs
 }
 
-// fuzzBuildManifestFromEntries creates a raw FM/2 manifest string from entries.
+// fuzzBuildManifestFromEntries creates a raw FM/1 manifest string from entries.
 func fuzzBuildManifestFromEntries(t *testing.T, root string, entries []encoding.ManifestEntry) string {
 	t.Helper()
 	var b strings.Builder

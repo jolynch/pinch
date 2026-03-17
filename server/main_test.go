@@ -10,8 +10,9 @@ func TestShouldRunCLI(t *testing.T) {
 	}{
 		{name: "empty", args: nil, want: false},
 		{name: "binary only", args: []string{"pinch"}, want: false},
-		{name: "cli mode", args: []string{"pinch", "cli"}, want: true},
+		{name: "filecli mode", args: []string{"pinch", "filecli"}, want: true},
 		{name: "server mode", args: []string{"pinch", "-listen", ":9090"}, want: false},
+		{name: "old cli mode", args: []string{"pinch", "cli"}, want: false},
 	}
 
 	for _, tc := range tests {

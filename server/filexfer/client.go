@@ -176,6 +176,7 @@ type Manifest struct {
 	Mode        string
 	LinkMbps    int64
 	Concurrency int
+	DeadlineMS  int64
 	Entries     []ManifestEntry
 }
 
@@ -288,6 +289,7 @@ type FetchManifestRequest struct {
 	Mode         string
 	LinkMbps     int64
 	Concurrency  int
+	DeadlineMS   int64
 	AgePublicKey string
 	AgeIdentity  string
 }
@@ -318,6 +320,7 @@ type SyncManifestRequest struct {
 	Mode         string
 	LinkMbps     int64
 	Concurrency  int
+	DeadlineMS   int64
 	AgePublicKey string
 	AgeIdentity  string
 }
@@ -2077,7 +2080,7 @@ func parseManifest(raw []byte) (*Manifest, error) {
 		line = strings.TrimRight(line, "\r\n")
 		trimmed := strings.TrimSpace(line)
 		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-			if strings.HasPrefix(trimmed, "FM/2 ") {
+			if strings.HasPrefix(trimmed, "FM/1 ") {
 				hdr, parseErr := intencoding.ParseManifestHeader(trimmed)
 				if parseErr != nil {
 					return nil, parseErr
@@ -2088,6 +2091,7 @@ func parseManifest(raw []byte) (*Manifest, error) {
 					manifest.Mode = hdr.Mode
 					manifest.LinkMbps = hdr.LinkMbps
 					manifest.Concurrency = hdr.Concurrency
+					manifest.DeadlineMS = hdr.DeadlineMS
 					seenHeader = true
 				} else if manifest.TransferID != hdr.TransferID || manifest.Root != hdr.Root || manifest.Mode != hdr.Mode || manifest.LinkMbps != hdr.LinkMbps || manifest.Concurrency != hdr.Concurrency {
 					return nil, errors.New("manifest chunk header mismatch")
@@ -2165,6 +2169,7 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 		Mode:        mode,
 		LinkMbps:    manifest.LinkMbps,
 		Concurrency: manifest.Concurrency,
+		DeadlineMS:  manifest.DeadlineMS,
 	})
 	b.WriteString(hdr)
 	b.WriteByte('\n')

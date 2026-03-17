@@ -42,6 +42,24 @@ type Limiter struct {
 	state fileStreamLimitState
 }
 
+const defaultBurstBytes int64 = 1 * 1024 * 1024 // 1 MiB
+
+// NewLimiterFromBps creates a Limiter from a numeric bytes-per-second rate.
+// If burstBytes <= 0, a 1 MiB default burst is used.
+func NewLimiterFromBps(rateBps int64, burstBytes int64) (*Limiter, error) {
+	if burstBytes <= 0 {
+		burstBytes = defaultBurstBytes
+	}
+	state, err := newFileStreamLimitState(fileStreamLimitConfig{
+		RateBps:    rateBps,
+		BurstBytes: burstBytes,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Limiter{state: state}, nil
+}
+
 func NewLimiter(cfg Config) (*Limiter, error) {
 	parsedRateBps, err := parseRateBytesPerSecond(cfg.Rate)
 	if err != nil {
