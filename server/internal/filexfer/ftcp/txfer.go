@@ -24,6 +24,7 @@ type txferRequest struct {
 	Mode         string
 	LinkMbps     int64
 	Concurrency  int
+	DeadlineMS   int64
 }
 
 func parseTXFERRequest(req Request) (txferRequest, error) {
@@ -36,7 +37,7 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 	p := req.Params[0]
 	for key := range p {
 		switch key {
-		case "directory", "verbose", "max-manifest-chunk-size", "mode", "link-mbps", "concurrency":
+		case "directory", "verbose", "max-manifest-chunk-size", "mode", "link-mbps", "concurrency", "deadline-ms":
 		default:
 			return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "unknown TXFER option"}
 		}
@@ -71,6 +72,13 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 	if err != nil || concurrency <= 0 {
 		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "concurrency must be > 0"}
 	}
+	var deadlineMS int64
+	if raw := strings.TrimSpace(p["deadline-ms"]); raw != "" {
+		deadlineMS, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || deadlineMS < 0 {
+			return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "deadline-ms must be >= 0"}
+		}
+	}
 	return txferRequest{
 		Directory:    directory,
 		Verbose:      verbose,
@@ -78,6 +86,7 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 		Mode:         mode,
 		LinkMbps:     linkMbps,
 		Concurrency:  concurrency,
+		DeadlineMS:   deadlineMS,
 	}, nil
 }
 
@@ -86,6 +95,7 @@ func handleTXFER(_ context.Context, req Request, out io.Writer, deps Deps) error
 	if err != nil {
 		return err
 	}
+	parsed.Directory = filepath.Join(deps.Root(), parsed.Directory)
 	if err := validateDirectory(parsed.Directory); err != nil {
 		return protocolErr{code: "UNPROCESSABLE", message: err.Error()}
 	}
@@ -97,6 +107,9 @@ func handleTXFER(_ context.Context, req Request, out io.Writer, deps Deps) error
 	}
 	if ok := deps.SetTransferHints(transfer.ID, parsed.Mode, parsed.LinkMbps, parsed.Concurrency); !ok {
 		return protocolErr{code: "INTERNAL", message: "failed to persist transfer hints"}
+	}
+	if parsed.DeadlineMS > 0 {
+		deps.SetTransferDeadline(transfer.ID, parsed.DeadlineMS)
 	}
 	manifestMode := parsed.Mode
 	manifestLinkMbps := parsed.LinkMbps
@@ -119,7 +132,7 @@ func handleTXFER(_ context.Context, req Request, out io.Writer, deps Deps) error
 		}
 	}()
 
-	if err := encodeManifest(out, transfer.ID, root, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.MaxChunkSize, parsed.Verbose, deps); err != nil {
+	if err := encodeManifest(out, transfer.ID, root, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, parsed.MaxChunkSize, parsed.Verbose, deps); err != nil {
 		if isBrokenPipe(err) {
 			return nil
 		}
@@ -156,19 +169,24 @@ func encodeManifest(
 	mode string,
 	linkMbps int64,
 	concurrency int,
+	deadlineMS int64,
 	maxChunkSize int,
 	verbose bool,
 	deps Deps,
 ) error {
 	rootToken := fmt.Sprintf("%d:%s", len(root), root)
 	header := fmt.Sprintf(
-		"FM/2 %s %s mode=%s link-mbps=%d concurrency=%d\n",
+		"FM/1 %s %s mode=%s link-mbps=%d concurrency=%d",
 		transferID,
 		rootToken,
 		mode,
 		linkMbps,
 		concurrency,
 	)
+	if deadlineMS > 0 {
+		header += fmt.Sprintf(" deadline-ms=%d", deadlineMS)
+	}
+	header += "\n"
 	if maxChunkSize > 0 && len(header) > maxChunkSize {
 		return errors.New("max-manifest-chunk-size is too small for header")
 	}

@@ -1,4 +1,4 @@
-# Filexfer Manifest Specification (FM/2)
+# Filexfer Manifest Specification (FM/1)
 
 This document defines the strict manifest format emitted by `TXFER` and consumed by `start`/`get`.
 
@@ -9,7 +9,7 @@ If `AUTH` provides a client recipient, the manifest stream is age-encrypted for 
 
 Manifest is line-oriented UTF-8 text:
 
-1. Header line (`FM/2`)
+1. Header line (`FM/1`)
 2. Entry lines (one file per line)
 
 Empty lines and `#` comments are ignored.
@@ -19,12 +19,12 @@ Empty lines and `#` comments are ignored.
 Format:
 
 ```text
-FM/2 <transfer_id> <root-len:root> mode=<fast|gentle> link-mbps=<int> concurrency=<int>
+FM/1 <transfer_id> <root-len:root> mode=<fast|gentle> link-mbps=<int> concurrency=<int>
 ```
 
 Header fields are required.
 
-- `FM/2`: manifest version token.
+- `FM/1`: manifest version token.
 - `<transfer_id>`: transfer identifier.
 - `<root-len:root>`: length-prefixed root path token (`<n>:<data>`).
 - `mode`: transfer mode (`fast` or `gentle`).
@@ -94,7 +94,7 @@ Path constraints:
 
 ## Validation Rules
 
-- Header must be `FM/2` and include required metadata fields.
+- Header must be `FM/1` and include required metadata fields.
 - Header root token must parse and length-match.
 - Unknown header options are rejected.
 - Entry IDs must be unique and strictly increasing.
@@ -107,7 +107,7 @@ Path constraints:
 ## Example
 
 ```text
-FM/2 9f83ab12 8:repo-root mode=fast link-mbps=1200 concurrency=16
+FM/1 9f83ab12 8:repo-root mode=fast link-mbps=1200 concurrency=16
 0 4096 0:1735771234567890123 0644 0:14:data/chunk-000
 1 4096 14:90123 0644 11:3:001
 2 1024 15:1350 0644 11:3:002

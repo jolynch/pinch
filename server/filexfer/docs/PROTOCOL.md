@@ -20,7 +20,7 @@ All commands are single lines terminated by `\r\n`.
   - `ERR <code> <message>\r\n`
 
 For `TXFER`, `SEND`, and `CXSUM`, the payload interval is a streaming body
-(`FM/2` for `TXFER`, `FX/1` for `SEND`/`CXSUM`) between the request line and
+(`FM/1` for `TXFER`, `FX/1` for `SEND`/`CXSUM`) between the request line and
 the terminal response status line. `PROBE` also has a request payload and
 response payload body.
 
@@ -91,7 +91,7 @@ Creates a transfer and streams a manifest.
 
 ### Response
 
-- Stream bytes in `FM/2` format (see [MANIFEST.md](./MANIFEST.md)).
+- Stream bytes in `FM/1` format (see [MANIFEST.md](./MANIFEST.md)).
 - Terminal status line after manifest stream: `OK` or `ERR ...`.
 
 ## SEND

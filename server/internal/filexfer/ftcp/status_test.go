@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeDeps struct {
@@ -39,6 +40,11 @@ func (f fakeDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bo
 	return true
 }
 func (f fakeDeps) AcknowledgeTransferFile(string, uint64, int64) bool { return true }
+
+func (f fakeDeps) SetTransferDeadline(string, int64) bool        { return false }
+func (f fakeDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
+func (f fakeDeps) MarkTransferTooSlow(string) bool               { return false }
+func (f fakeDeps) Root() string                                  { return "/" }
 
 func TestHandleSTATUSWritesStatusLine(t *testing.T) {
 	req := Request{Verb: VerbSTATUS, Params: []map[string]string{{"txferid": "tx1"}}}

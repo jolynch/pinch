@@ -150,13 +150,60 @@ func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps
 	if err != nil {
 		return err
 	}
+
+	// Derive per-transfer gentle limiter from probed link bandwidth (25%).
+	var gentleLimiter *limit.Limiter
+	transfer, hasTransfer := deps.GetTransfer(parsed.TransferID)
+	if hasTransfer && transfer.LinkMbps > 0 {
+		derivedBps := (transfer.LinkMbps * 1_000_000 / 8) / 4
+		gentleLimiter, _ = limit.NewLimiterFromBps(derivedBps, 1*1024*1024)
+	}
+
 	for _, item := range parsed.Items {
 		itemOut := out
-		if limiter != nil && item.Mode == loadStrategyGentle {
-			itemOut = limiter.WrapRateLimitedWriter(out, ctx)
+		if item.Mode == loadStrategyGentle {
+			if hasTransfer && transfer.DeadlineMS > 0 {
+				if err := checkTransferDeadline(deps, parsed.TransferID, transfer); err != nil {
+					return err
+				}
+			}
+			if gentleLimiter != nil {
+				itemOut = gentleLimiter.WrapRateLimitedWriter(itemOut, ctx)
+			}
+			if limiter != nil {
+				itemOut = limiter.WrapRateLimitedWriter(itemOut, ctx)
+			}
 		}
 		if err := streamSendItem(ctx, itemOut, deps, parsed.TransferID, item); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+const deadlineGracePeriod = 30 * time.Second
+
+func checkTransferDeadline(deps Deps, txferID string, transfer Transfer) error {
+	if transfer.TooSlow {
+		return protocolErr{code: "TOO_SLOW", message: "transfer deadline exceeded"}
+	}
+	firstSend, ok := deps.RecordTransferFirstSend(txferID)
+	if !ok || firstSend.IsZero() {
+		return nil
+	}
+	elapsed := time.Since(firstSend)
+	deadline := time.Duration(transfer.DeadlineMS) * time.Millisecond
+	if elapsed > deadline {
+		deps.MarkTransferTooSlow(txferID)
+		return protocolErr{code: "TOO_SLOW", message: "transfer deadline exceeded"}
+	}
+	if elapsed > deadlineGracePeriod && transfer.DoneSize > 0 {
+		rate := float64(transfer.DoneSize) / elapsed.Seconds()
+		remaining := float64(transfer.TotalSize - transfer.DoneSize)
+		timeLeft := (deadline - elapsed).Seconds()
+		if rate > 0 && timeLeft > 0 && remaining/rate > timeLeft {
+			deps.MarkTransferTooSlow(txferID)
+			return protocolErr{code: "TOO_SLOW", message: "transfer will not finish within deadline"}
 		}
 	}
 	return nil

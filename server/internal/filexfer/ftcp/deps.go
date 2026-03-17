@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"path/filepath"
+	"time"
 
 	intstore "github.com/jolynch/pinch/internal/filexfer/store"
 )
@@ -36,13 +38,30 @@ type Deps interface {
 	SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
 	VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
 	AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool
+
+	SetTransferDeadline(txferID string, deadlineMS int64) bool
+	RecordTransferFirstSend(txferID string) (time.Time, bool)
+	MarkTransferTooSlow(txferID string) bool
+
+	Root() string
 }
 
-type runtimeDeps struct{}
+type runtimeDeps struct {
+	rootDir string
+}
 
 func NewRuntimeDeps() Deps {
-	return runtimeDeps{}
+	return runtimeDeps{rootDir: "/"}
 }
+
+func NewRuntimeDepsWithRoot(root string) Deps {
+	if root == "" {
+		root = "/"
+	}
+	return runtimeDeps{rootDir: filepath.Clean(root)}
+}
+
+func (d runtimeDeps) Root() string { return d.rootDir }
 
 func (runtimeDeps) NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
 	return intstore.NewTransfer(directory, numFiles, totalSize)
@@ -90,6 +109,18 @@ func (runtimeDeps) VerifyTransferFileWindowHash(txferID string, fileID uint64, e
 
 func (runtimeDeps) AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool {
 	return intstore.AcknowledgeTransferFile(txferID, fileID, ackBytes)
+}
+
+func (runtimeDeps) SetTransferDeadline(txferID string, deadlineMS int64) bool {
+	return intstore.SetTransferDeadline(txferID, deadlineMS)
+}
+
+func (runtimeDeps) RecordTransferFirstSend(txferID string) (time.Time, bool) {
+	return intstore.RecordTransferFirstSend(txferID)
+}
+
+func (runtimeDeps) MarkTransferTooSlow(txferID string) bool {
+	return intstore.MarkTransferTooSlow(txferID)
 }
 
 func mapLookupError(err error) error {

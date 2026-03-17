@@ -685,56 +685,79 @@ func cleanupDir(dirPath string) error {
 }
 
 func shouldRunCLI(args []string) bool {
-	return len(args) > 1 && args[1] == "cli"
+	return len(args) > 1 && args[1] == "filecli"
+}
+
+func printUsage() {
+	fmt.Fprint(os.Stderr, `usage: pinch <command> [options]
+
+Commands:
+  pipesrv    Start the HTTP pipe server
+  filesrv    Start the file transfer TCP server
+  filecli    File transfer CLI client
+
+Run 'pinch <command> --help' for command-specific options.
+`)
 }
 
 func main() {
-	if shouldRunCLI(os.Args) {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "filecli":
 		os.Exit(filexfercli.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
+	case "pipesrv":
+		os.Exit(runPipeSrv(os.Args[2:]))
+	case "filesrv":
+		os.Exit(runFileSrv(os.Args[2:]))
+	case "--help", "-h", "help":
+		printUsage()
+		os.Exit(0)
+	default:
+		printUsage()
+		os.Exit(2)
 	}
+}
 
-	flag.StringVar(&listen, "listen", listen, "The address to listen on")
-	flag.StringVar(&fileListener, "file-listen", fileListener, "The file transfer TCP listen address")
-	flag.StringVar(&inputDir, "in", inputDir, "The directory to create input pipes in")
-	flag.StringVar(&outputDir, "out", outputDir, "The directory to create output pipes in")
-	flag.StringVar(&keysDir, "keys", keysDir, "The directory to create output pipes in")
-	flag.IntVar(&tokenLength, "tlen", tokenLength, "How long of paths to generate")
-	flag.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "How many bytes should pipe buffers be")
-	flag.StringVar(&fsFileRate, "fs-file-rate", fsFileRate, "Global file-listener response rate limit (examples: 100MiB, 1000mbps). Empty/0 disables limiting")
-	flag.StringVar(&fsFileBurst, "fs-file-rate-burst", fsFileBurst, "Token-bucket burst for file-listener response rate limit (examples: 1MiB, 4MB)")
-	fsFileTimeLimit := flag.Duration("fs-file-time-limit", 0, "Per-request wall-clock limit for file-listener responses (0 disables)")
-	fsRequireAuth := flag.Bool("fs-require-auth", false, "Require AUTH before using file-listen commands")
-	fsTraceFile := flag.String("fs-trace", "", "Write runtime/trace output to this file")
-	dieAfter := flag.Duration("die-after", 0, "Die after this duration. Zero seconds indicates live forever")
+func runPipeSrv(args []string) int {
+	fs := flag.NewFlagSet("pipesrv", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `usage: pinch pipesrv [options]
 
-	flag.Parse()
+Start the HTTP pipe compression/decompression server.
 
-	if *fsTraceFile != "" {
-		tf, err := os.Create(*fsTraceFile)
-		if err != nil {
-			log.Fatalf("Failed to create trace file %s: %v", *fsTraceFile, err)
-		}
-		defer tf.Close()
-		if err := trace.Start(tf); err != nil {
-			log.Fatalf("Failed to start trace: %v", err)
-		}
-		defer trace.Stop()
+Options:
+      --listen string      listen address (default "127.0.0.1:8080")
+      --in string          input pipe directory (default "/var/lib/pinch/in")
+      --out string         output pipe directory (default "/var/lib/pinch/out")
+      --keys string        age keys directory (default "/var/lib/pinch/keys")
+      --tlen int           handle token length in bytes (default 8)
+      --blen int           pipe buffer size in bytes (default 131072)
+      --die-after duration exit after duration (0 = run forever)
+`)
 	}
-
-	fileStreamLimiter, limiterErr := limit.NewLimiter(limit.Config{
-		Rate:      fsFileRate,
-		Burst:     fsFileBurst,
-		TimeLimit: *fsFileTimeLimit,
-	})
-	if limiterErr != nil {
-		log.Fatalf("Invalid file stream limiter configuration: %v", limiterErr)
+	fs.StringVar(&listen, "listen", listen, "")
+	fs.StringVar(&inputDir, "in", inputDir, "")
+	fs.StringVar(&outputDir, "out", outputDir, "")
+	fs.StringVar(&keysDir, "keys", keysDir, "")
+	fs.IntVar(&tokenLength, "tlen", tokenLength, "")
+	fs.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "")
+	dieAfter := fs.Duration("die-after", 0, "")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
 	}
 
 	if !makeDirs(inputDir) {
 		log.Fatalf("Could not setup input directory, dying")
 	}
 	if !makeDirs(outputDir) {
-		log.Fatalf("Could not setup output direcotry, dying")
+		log.Fatalf("Could not setup output directory, dying")
 	}
 	if !makeDirs(keysDir) {
 		log.Fatalf("Could not setup key directory, dying")
@@ -755,7 +778,6 @@ func main() {
 		log.Fatalf("failed cleaning output directory %s: %v", outputDir, err)
 	}
 
-	// Pinch API
 	mux := http.NewServeMux()
 	mux.HandleFunc("/pinch", pinch)
 	mux.HandleFunc("/unpinch", unpinch)
@@ -763,23 +785,6 @@ func main() {
 	mux.HandleFunc("/status/", getStatus)
 	socketWriteBufBytes := utils.MaxSocketWriteBufferBytes()
 	log.Printf("Detected ideal socket write buffer of size %d", socketWriteBufBytes)
-
-	fileLn, err := net.Listen("tcp", fileListener)
-	if err != nil {
-		log.Fatalf("Failed to bind file listener at %s: %v", fileListener, err)
-	}
-	defer fileLn.Close()
-	go func() {
-		log.Printf("File transfer listener at %s", fileListener)
-		if serveErr := ftcp.Serve(fileLn, ftcp.ServerOptions{
-			RequireAuth:            *fsRequireAuth,
-			ServerIdentity:         serverKey,
-			Limiter:                fileStreamLimiter,
-			SocketWriteBufferBytes: socketWriteBufBytes,
-		}); serveErr != nil {
-			log.Fatalf("File transfer listener stopped: %v", serveErr)
-		}
-	}()
 
 	if *dieAfter > 0 {
 		go die(*dieAfter)
@@ -801,7 +806,95 @@ func main() {
 	}
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Failed to bind, is another server listening at this address? error=%v", err)
-	} else {
-		log.Printf("Success!")
 	}
+	return 0
+}
+
+func runFileSrv(args []string) int {
+	fs := flag.NewFlagSet("filesrv", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `usage: pinch filesrv [options]
+
+Start the file transfer TCP server.
+
+Options:
+  -l, --listen string         listen address (default "127.0.0.1:3453")
+  -b, --bwlimit string        response rate limit (e.g. 100MiB, 1000mbps)
+      --bwlimit-burst string  rate limit burst size (default "1MiB")
+  -c, --chroot string         server root directory (default "/")
+  -k, --keys string           age keys directory (default "/var/lib/pinch/keys")
+      --require-auth          require AUTH before commands
+      --trace string          write runtime/trace to this file
+`)
+	}
+	fs.StringVar(&fileListener, "listen", fileListener, "")
+	fs.StringVar(&fileListener, "l", fileListener, "")
+	fs.StringVar(&fsFileRate, "bwlimit", fsFileRate, "")
+	fs.StringVar(&fsFileRate, "b", fsFileRate, "")
+	fs.StringVar(&fsFileBurst, "bwlimit-burst", fsFileBurst, "")
+	var chroot string
+	fs.StringVar(&chroot, "chroot", "/", "")
+	fs.StringVar(&chroot, "c", "/", "")
+	fs.StringVar(&keysDir, "keys", keysDir, "")
+	fs.StringVar(&keysDir, "k", keysDir, "")
+	requireAuth := fs.Bool("require-auth", false, "")
+	traceFile := fs.String("trace", "", "")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+
+	if *traceFile != "" {
+		tf, err := os.Create(*traceFile)
+		if err != nil {
+			log.Fatalf("Failed to create trace file %s: %v", *traceFile, err)
+		}
+		defer tf.Close()
+		if err := trace.Start(tf); err != nil {
+			log.Fatalf("Failed to start trace: %v", err)
+		}
+		defer trace.Stop()
+	}
+
+	if !makeDirs(keysDir) {
+		log.Fatalf("Could not setup key directory, dying")
+	}
+	var err error
+	serverKey, err = loadServerAgeIdentity(keysDir)
+	if err != nil {
+		log.Fatalf("AGE key setup failed: %v", err)
+	}
+	log.Printf("Public key %s", serverKey.Recipient().String())
+
+	fileStreamLimiter, limiterErr := limit.NewLimiter(limit.Config{
+		Rate:  fsFileRate,
+		Burst: fsFileBurst,
+	})
+	if limiterErr != nil {
+		log.Fatalf("Invalid rate limiter configuration: %v", limiterErr)
+	}
+
+	socketWriteBufBytes := utils.MaxSocketWriteBufferBytes()
+	log.Printf("Detected ideal socket write buffer of size %d", socketWriteBufBytes)
+
+	fileLn, err := net.Listen("tcp", fileListener)
+	if err != nil {
+		log.Fatalf("Failed to bind file listener at %s: %v", fileListener, err)
+	}
+	defer fileLn.Close()
+
+	log.Printf("File transfer listener at %s (root=%s)", fileListener, chroot)
+	if serveErr := ftcp.Serve(fileLn, ftcp.ServerOptions{
+		RequireAuth:            *requireAuth,
+		ServerIdentity:         serverKey,
+		Limiter:                fileStreamLimiter,
+		SocketWriteBufferBytes: socketWriteBufBytes,
+		RootDir:                chroot,
+	}); serveErr != nil {
+		log.Fatalf("File transfer listener stopped: %v", serveErr)
+	}
+	return 0
 }

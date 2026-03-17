@@ -161,7 +161,7 @@ func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 func TestRunCLITransferAndGet(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/2 txcli 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"FM/1 txcli 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -248,7 +248,7 @@ func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
 	tmp := t.TempDir()
 	manifestPath := filepath.Join(tmp, "txresume.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/2 txresume 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"FM/1 txresume 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -317,7 +317,7 @@ func TestRunCLIGetRejectsResumeToStdout(t *testing.T) {
 	tmp := t.TempDir()
 	manifestPath := filepath.Join(tmp, "txstdout.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/2 txstdout 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"FM/1 txstdout 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -356,7 +356,7 @@ func TestRunCLIGetOutRootDevNullDiscardsOutput(t *testing.T) {
 	tmp := t.TempDir()
 	manifestPath := filepath.Join(tmp, "txdevnull.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/2 txdevnull 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"FM/1 txdevnull 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -398,7 +398,7 @@ func TestRunCLIGetOutRootDevNullDiscardsOutput(t *testing.T) {
 func TestRunCLITransferWithEncryptAge(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/2 txenccli 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"FM/1 txenccli 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -453,7 +453,7 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	tmp := t.TempDir()
 	manifestPath := filepath.Join(tmp, "txstart.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/2 txstart 7:/remote mode=gentle link-mbps=700 concurrency=3",
+		"FM/1 txstart 7:/remote mode=gentle link-mbps=700 concurrency=3",
 		"0 5 0:100 0644 0:5:a.txt",
 		"1 4 0:101 0644 0:5:b.txt",
 		"",
@@ -516,7 +516,7 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	tmp := t.TempDir()
 	manifestPath := filepath.Join(tmp, "txstartdefault.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/2 txstartdefault 7:/remote mode=fast link-mbps=1200 concurrency=5",
+		"FM/1 txstartdefault 7:/remote mode=fast link-mbps=1200 concurrency=5",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -560,7 +560,7 @@ func TestRunCLIStartOutRootDevNullDiscardsOutput(t *testing.T) {
 	tmp := t.TempDir()
 	manifestPath := filepath.Join(tmp, "txstartdevnull.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/2 txstartdevnull 7:/remote mode=fast link-mbps=1200 concurrency=2",
+		"FM/1 txstartdevnull 7:/remote mode=fast link-mbps=1200 concurrency=2",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
@@ -585,7 +585,7 @@ func TestRunCLIStartOutRootDevNullDiscardsOutput(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "start", "--tid", "txstartdevnull", "--manifest", manifestPath, "--out-root", os.DevNull, "--ack-every", "1KiB"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "start", "--tid", "txstartdevnull", "--manifest", manifestPath, "--out-root", os.DevNull, "--ack-every", "1KiB", "--per-file"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start devnull: expected 0, got %d stderr=%s", code, stderr.String())
 	}

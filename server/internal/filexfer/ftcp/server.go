@@ -24,6 +24,7 @@ type ServerOptions struct {
 	Limiter                *limit.Limiter
 	SocketWriteBufferBytes int
 	SyncTimeout            time.Duration // 0 = no timeout; bounds SYNC response write time
+	RootDir                string        // "/" or "" means unrestricted
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -45,7 +46,7 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 	}
 	deps := opts.Deps
 	if deps == nil {
-		deps = NewRuntimeDeps()
+		deps = NewRuntimeDepsWithRoot(opts.RootDir)
 	}
 	for {
 		conn, err := listener.Accept()

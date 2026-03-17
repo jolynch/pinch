@@ -303,6 +303,9 @@ func (c *Client) fetchManifestTCP(ctx context.Context, request FetchManifestRequ
 	cmd += " mode=" + request.Mode
 	cmd += " link-mbps=" + strconv.FormatInt(request.LinkMbps, 10)
 	cmd += " concurrency=" + strconv.Itoa(request.Concurrency)
+	if request.DeadlineMS > 0 {
+		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
+	}
 	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
 		return FetchManifestResponse{}, fmt.Errorf("send TXFER: %w", err)
 	}
@@ -356,6 +359,9 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		" mode=" + request.Mode +
 		" link-mbps=" + strconv.FormatInt(request.LinkMbps, 10) +
 		" concurrency=" + strconv.Itoa(request.Concurrency)
+	if request.DeadlineMS > 0 {
+		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
+	}
 	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
 		return SyncManifestResponse{}, fmt.Errorf("send SYNC: %w", err)
 	}
@@ -378,7 +384,7 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		oldByID[e.ID] = e.Path
 	}
 
-	// Read response: FM/2 lines, then RM lines, then OK.
+	// Read response: FM/1 lines, then RM lines, then OK.
 	responseReader, err := c.responseReaderForTCP(conn, state)
 	if err != nil {
 		return SyncManifestResponse{}, fmt.Errorf("initialize SYNC response stream: %w", err)
@@ -420,7 +426,7 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 			rmPaths = append(rmPaths, path)
 			continue
 		}
-		// FM/2 header or manifest entry line.
+		// FM/1 header or manifest entry line.
 		manifestBuf.WriteString(line)
 		manifestBuf.WriteByte('\n')
 	}

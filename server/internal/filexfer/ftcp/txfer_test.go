@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type txferTestDeps struct {
@@ -59,6 +60,11 @@ func (d *txferTestDeps) SetTransferFileWindowHash(string, uint64, int64, string)
 func (d *txferTestDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bool { return true }
 
 func (d *txferTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { return true }
+
+func (d *txferTestDeps) SetTransferDeadline(string, int64) bool        { return false }
+func (d *txferTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
+func (d *txferTestDeps) MarkTransferTooSlow(string) bool               { return false }
+func (d *txferTestDeps) Root() string                                  { return "/" }
 
 func TestParseTXFERRequestRequiresHints(t *testing.T) {
 	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=12`))
@@ -116,8 +122,8 @@ func TestHandleTXFERStoresHintsAndEmitsFM2(t *testing.T) {
 		t.Fatalf("unexpected SetTransferHints values: tx=%s mode=%s mbps=%d conc=%d", deps.setHintsTxID, deps.setHintsMode, deps.setHintsMbps, deps.setHintsConc)
 	}
 	manifest := out.String()
-	if !strings.HasPrefix(manifest, "FM/2 tx123 ") {
-		t.Fatalf("expected FM/2 header, got: %q", manifest)
+	if !strings.HasPrefix(manifest, "FM/1 tx123 ") {
+		t.Fatalf("expected FM/1 header, got: %q", manifest)
 	}
 	if !strings.Contains(manifest, "mode=gentle") || !strings.Contains(manifest, "link-mbps=700") || !strings.Contains(manifest, "concurrency=6") {
 		t.Fatalf("manifest missing required metadata: %q", manifest)
