@@ -2,7 +2,7 @@
 # Based off of https://github.com/facebook/zstd/issues/880
 
 # Step 1. Image used to build the binary
-FROM alpine:3.21 as builder
+FROM alpine:3.21 AS builder
 
 RUN apk --no-cache add make gcc libc-dev git
 
@@ -60,7 +60,7 @@ COPY --from=builder /zstd_src/LICENSE /usr/local/share/licenses/zstd/
 COPY --from=builder /xxh_src/LICENSE /usr/local/share/licenses/xxhash/
 COPY --from=builder /age/LICENSE /usr/local/share/licenses/age/
 
-ENV PAGER less
+ENV PAGER=less
 
 # Zstd is probably the right default choice
 CMD ["/usr/local/bin/zstd"]

@@ -22,20 +22,20 @@ import (
 const maxTCPLineBytes = 4 * 1024 * 1024
 
 type tcpAuthState struct {
-	publicKey      string
-	identity       string
-	parsedIdentity age.Identity
-	hasAuth        bool
+	publicKey       string
+	identity        string
+	parsedIdentity  age.Identity
+	hasAuth         bool
 	encryptCommands bool
 }
 
 type probeResponse struct {
-	ServerCPU      int
-	CTS0           int64
-	CTS1           int64
-	STS0           int64
-	STS1           int64
-	ProbeBytes     int64
+	ServerCPU       int
+	CTS0            int64
+	CTS1            int64
+	STS0            int64
+	STS1            int64
+	ProbeBytes      int64
 	ServerWmemBytes int64
 }
 

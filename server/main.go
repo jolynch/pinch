@@ -826,6 +826,8 @@ Options:
   -k, --keys string           age keys directory (default "/var/lib/pinch/keys")
       --require-auth          require AUTH before commands
       --trace string          write runtime/trace to this file
+      --progress-path string           write transfer % to this file/pipe
+      --progress-path-interval string  progress write interval (default "1s")
 `)
 	}
 	fs.StringVar(&fileListener, "listen", fileListener, "")
@@ -840,11 +842,20 @@ Options:
 	fs.StringVar(&keysDir, "k", keysDir, "")
 	requireAuth := fs.Bool("require-auth", false, "")
 	traceFile := fs.String("trace", "", "")
+	var progressFilePath string
+	var progressIntervalRaw string
+	fs.StringVar(&progressFilePath, "progress-path", "", "")
+	fs.StringVar(&progressIntervalRaw, "progress-path-interval", "1s", "")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
+	}
+
+	progressInterval, err := time.ParseDuration(progressIntervalRaw)
+	if err != nil {
+		log.Fatalf("Invalid --progress-path-interval: %v", err)
 	}
 
 	if *traceFile != "" {
@@ -862,7 +873,6 @@ Options:
 	if !makeDirs(keysDir) {
 		log.Fatalf("Could not setup key directory, dying")
 	}
-	var err error
 	serverKey, err = loadServerAgeIdentity(keysDir)
 	if err != nil {
 		log.Fatalf("AGE key setup failed: %v", err)
@@ -893,6 +903,8 @@ Options:
 		Limiter:                fileStreamLimiter,
 		SocketWriteBufferBytes: socketWriteBufBytes,
 		RootDir:                chroot,
+		ProgressPath:           progressFilePath,
+		ProgressInterval:       progressInterval,
 	}); serveErr != nil {
 		log.Fatalf("File transfer listener stopped: %v", serveErr)
 	}

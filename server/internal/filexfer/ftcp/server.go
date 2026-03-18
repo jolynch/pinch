@@ -7,9 +7,11 @@ import (
 	"io"
 	"net"
 	"runtime/trace"
+	"sync/atomic"
 	"time"
 
 	"filippo.io/age"
+	"github.com/jolynch/pinch/internal/filexfer"
 	"github.com/jolynch/pinch/internal/filexfer/limit"
 )
 
@@ -25,6 +27,8 @@ type ServerOptions struct {
 	SocketWriteBufferBytes int
 	SyncTimeout            time.Duration // 0 = no timeout; bounds SYNC response write time
 	RootDir                string        // "/" or "" means unrestricted
+	ProgressPath           string        // write transfer % to this file/pipe
+	ProgressInterval       time.Duration // tick interval for progress writes (default 1s)
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -48,6 +52,34 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 	if deps == nil {
 		deps = NewRuntimeDepsWithRoot(opts.RootDir)
 	}
+
+	var onTransferCreated func(string)
+	if opts.ProgressPath != "" {
+		interval := opts.ProgressInterval
+		if interval <= 0 {
+			interval = time.Second
+		}
+		var activeTransferID atomic.Value
+		onTransferCreated = func(id string) { activeTransferID.Store(id) }
+		stopProgress := filexfer.StartProgressFileWriter(
+			context.Background(), opts.ProgressPath, interval, func() int {
+				id, _ := activeTransferID.Load().(string)
+				if id == "" {
+					return 0
+				}
+				t, ok := deps.GetTransfer(id)
+				if !ok || t.TotalSize <= 0 {
+					return 0
+				}
+				pct := int(t.DoneSize * 100 / t.TotalSize)
+				if pct > 100 {
+					pct = 100
+				}
+				return pct
+			})
+		defer stopProgress(true)
+	}
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -57,7 +89,7 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 			}
 			return err
 		}
-		go handleConn(conn, opts, deps)
+		go handleConn(conn, opts, deps, onTransferCreated)
 	}
 }
 
@@ -72,9 +104,10 @@ type connSession struct {
 	respOut                io.Writer
 	closeResp              func() error
 	wroteBytes             bool
+	onTransferCreated      func(string)
 }
 
-func handleConn(conn net.Conn, opts ServerOptions, deps Deps) {
+func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated func(string)) {
 	defer conn.Close()
 	s := &connSession{
 		conn:                   conn,
@@ -86,6 +119,7 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps) {
 		syncTimeout:            opts.SyncTimeout,
 		respOut:                conn,
 		closeResp:              func() error { return nil },
+		onTransferCreated:      onTransferCreated,
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
@@ -179,7 +213,10 @@ func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Read
 		if s.syncTimeout > 0 {
 			_ = s.conn.SetWriteDeadline(time.Now().Add(s.syncTimeout))
 		}
-		return handleSYNCWithInput(ctx, req, in, out, s.deps)
+		return handleSYNCWithInput(ctx, req, in, out, s.deps, s.onTransferCreated)
+	}
+	if req.Verb == VerbTXFER {
+		return handleTXFERWithCallback(ctx, req, out, s.deps, s.onTransferCreated)
 	}
 	handler, ok := handlers[req.Verb]
 	if !ok || req.Verb == VerbUnknown {

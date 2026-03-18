@@ -949,7 +949,6 @@ func streamBufferedRead(
 	return prepareLatency, nil
 }
 
-
 func acquireCompressedFrameBuffer(logicalSize int64, comp string) *bytes.Buffer {
 	maxEncoded, err := encoding.MaxEncodedFrameSizeBytes(comp, logicalSize)
 	if err != nil || maxEncoded <= 0 {
@@ -1012,16 +1011,16 @@ func logicalBufferPool(size int) *sync.Pool {
 
 func logicalBufferBucketSize(maxChunk int64) int {
 	const (
-		KiB   = 1024
-		MiB   = 1024 * KiB
-		bucket4KiB = 4 * KiB
-		bucket16KiB = 16 * KiB
-		bucket64KiB = 64 * KiB
+		KiB          = 1024
+		MiB          = 1024 * KiB
+		bucket4KiB   = 4 * KiB
+		bucket16KiB  = 16 * KiB
+		bucket64KiB  = 64 * KiB
 		bucket256KiB = 256 * KiB
-		bucket1MiB = 1 * MiB
-		bucket2MiB = 2 * MiB
-		bucket4MiB = 4 * MiB
-		bucket8MiB = 8 * MiB
+		bucket1MiB   = 1 * MiB
+		bucket2MiB   = 2 * MiB
+		bucket4MiB   = 4 * MiB
+		bucket8MiB   = 8 * MiB
 	)
 	if maxChunk <= int64(bucket4KiB) {
 		return bucket4KiB

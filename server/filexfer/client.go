@@ -237,8 +237,8 @@ type DownloadFileResponse struct {
 }
 
 type DownloadBatchRequest struct {
-	Manifest *Manifest
-	FileIDs  []uint64
+	Manifest     *Manifest
+	FileIDs      []uint64
 	OutputWriter func(ManifestEntry, int64) (io.WriteCloser, func() error, error)
 	// BatchMaxBytes is the unit of parallel work for a single large file: when a file
 	// exceeds BatchMaxBytes, it is split into windows of this size and downloaded
@@ -1096,8 +1096,8 @@ func (c *Client) downloadManifestBatchSequential(
 	} else {
 		planGroups, targetGroups := splitSequentialGroups(plans, targets, k)
 		type groupResult struct {
-			files     []DownloadFileResponse
-			acks      []AcknowledgeFileProgressRequest
+			files      []DownloadFileResponse
+			acks       []AcknowledgeFileProgressRequest
 			progresses []seqAckProgress
 		}
 		results := make([]groupResult, len(planGroups))
@@ -1869,7 +1869,6 @@ func retryAck(ctx context.Context, fn func(context.Context) error) error {
 	return lastErr
 }
 
-
 func copyCompCounts(src map[string]uint64) map[string]uint64 {
 	if len(src) == 0 {
 		return nil
@@ -2202,7 +2201,6 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 	return []byte(b.String()), nil
 }
 
-
 func resolveManifestEntryPath(manifest *Manifest, fileID uint64) (ManifestEntry, string, error) {
 	entry, ok := manifest.EntryByID(fileID)
 	if !ok {
@@ -2222,7 +2220,6 @@ func cloneTrailerMetadata(meta *FileTrailerMetadata) *FileTrailerMetadata {
 	cloned := *meta
 	return &cloned
 }
-
 
 type fileStream struct {
 	respBody io.Closer
@@ -2369,11 +2366,11 @@ func (c *Client) newFileStream(respBody io.ReadCloser, ageIdentity string, fileS
 	bufferHint := c.fileStreamBufferHint(fileSizeHint, firstMeta.Size)
 	readBuf, release := c.acquireFrameReadBuffer(bufferHint)
 	stream := &fileStream{
-		respBody: respBody,
-		br:       newPooledLineReader(probe, readBuf),
-		identity: identity,
-		meta:     &FileFrameMeta{},
-		pending:  &firstMeta,
+		respBody:  respBody,
+		br:        newPooledLineReader(probe, readBuf),
+		identity:  identity,
+		meta:      &FileFrameMeta{},
+		pending:   &firstMeta,
 		releaseBr: release,
 	}
 	if err := stream.openNextFrame(); err != nil {

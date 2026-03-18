@@ -27,12 +27,12 @@ func newCLIFlags(name string) *cliFlags {
 	return &cliFlags{fs: flag.NewFlagSet(name, flag.ContinueOnError)}
 }
 
-func (c *cliFlags) SetOutput(w io.Writer)                       { c.fs.SetOutput(w) }
-func (c *cliFlags) Parse(args []string) error                   { return c.fs.Parse(args) }
-func (c *cliFlags) Arg(i int) string                            { return c.fs.Arg(i) }
-func (c *cliFlags) Args() []string                              { return c.fs.Args() }
-func (c *cliFlags) NArg() int                                   { return c.fs.NArg() }
-func (c *cliFlags) Visit(fn func(*flag.Flag))                   { c.fs.Visit(fn) }
+func (c *cliFlags) SetOutput(w io.Writer)     { c.fs.SetOutput(w) }
+func (c *cliFlags) Parse(args []string) error { return c.fs.Parse(args) }
+func (c *cliFlags) Arg(i int) string          { return c.fs.Arg(i) }
+func (c *cliFlags) Args() []string            { return c.fs.Args() }
+func (c *cliFlags) NArg() int                 { return c.fs.NArg() }
+func (c *cliFlags) Visit(fn func(*flag.Flag)) { c.fs.Visit(fn) }
 
 // StringVar registers a string flag. Pass short="" for long-only, long="" for short-only.
 func (c *cliFlags) StringVar(p *string, short, long, defVal, usage string) {
