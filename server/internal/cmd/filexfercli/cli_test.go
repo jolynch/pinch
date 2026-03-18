@@ -17,6 +17,7 @@ import (
 
 	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 	"github.com/zeebo/xxh3"
 )
@@ -120,6 +121,19 @@ func serveFTCPConn(conn net.Conn, handler func(intftcp.Request, io.Writer) error
 			}
 		}
 	}
+	if cmdReq.Verb == intftcp.VerbSYNC {
+		for {
+			line, readErr := readFTCPLine(br)
+			if readErr != nil {
+				_, _ = io.WriteString(out, "ERR BAD_REQUEST invalid sync manifest\r\n")
+				_ = closeOut()
+				return
+			}
+			if strings.TrimSpace(line) == "" {
+				break
+			}
+		}
+	}
 
 	if err := handler(cmdReq, out); err != nil {
 		_, _ = io.WriteString(out, "ERR INTERNAL "+err.Error()+"\r\n")
@@ -141,6 +155,10 @@ func xxh128HexCLI(data []byte) string {
 }
 
 func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
+	return buildCLIFrameWithMetadata(fileID, body, offset, nil)
+}
+
+func buildCLIFrameWithMetadata(fileID uint64, body []byte, offset int64, meta *FileTrailerMetadata) string {
 	xsum := xxh128HexCLI(body)
 	header := fmt.Sprintf(
 		"FX/1 %d offset=%d size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n",
@@ -150,7 +168,31 @@ func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 		len(body),
 		xsum,
 	)
-	trailerPrefix := fmt.Sprintf("FXT/1 %d status=ok ts=1001 next=0 file-hash=xxh128:%s", fileID, xsum)
+	trailerParts := []string{
+		fmt.Sprintf("FXT/1 %d", fileID),
+		"status=ok",
+		"ts=1001",
+		"next=0",
+		fmt.Sprintf("file-hash=xxh128:%s", xsum),
+	}
+	if meta != nil {
+		if meta.Size > 0 {
+			trailerParts = append(trailerParts, fmt.Sprintf("meta:size=%d", meta.Size))
+		}
+		if meta.MtimeNS > 0 {
+			trailerParts = append(trailerParts, fmt.Sprintf("meta:mtime_ns=%d", meta.MtimeNS))
+		}
+		if meta.Mode != "" {
+			trailerParts = append(trailerParts, "meta:mode="+meta.Mode)
+		}
+		if meta.UID != "" {
+			trailerParts = append(trailerParts, "meta:uid="+meta.UID)
+		}
+		if meta.GID != "" {
+			trailerParts = append(trailerParts, "meta:gid="+meta.GID)
+		}
+	}
+	trailerPrefix := strings.Join(trailerParts, " ")
 	h := xxh3.New()
 	_, _ = h.Write([]byte(header))
 	_, _ = h.Write(body)
@@ -158,8 +200,98 @@ func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 	return fmt.Sprintf("%s%s%s hash=xxh64:%016x\n", header, string(body), trailerPrefix, h.Sum64())
 }
 
+// setupPinchState creates the .pinch directory structure for tests and writes
+// a manifest (and optional progress) file. Returns the target directory path.
+func setupPinchState(t *testing.T, tmp string, manifestRaw string, progressRaw string) string {
+	t.Helper()
+	targetDir := filepath.Join(tmp, "dst")
+	pinchDir := filepath.Join(tmp, ".pinch")
+	if err := os.MkdirAll(pinchDir, 0o755); err != nil {
+		t.Fatalf("mkdir .pinch: %v", err)
+	}
+	if manifestRaw != "" {
+		// Write to manifest.server (the server-state file) so that start/get can use it.
+		if err := os.WriteFile(filepath.Join(pinchDir, "manifest.server"), []byte(manifestRaw), 0o644); err != nil {
+			t.Fatalf("write manifest.server: %v", err)
+		}
+	}
+	if progressRaw != "" {
+		if err := os.WriteFile(filepath.Join(pinchDir, "manifest.progress"), []byte(progressRaw), 0o644); err != nil {
+			t.Fatalf("write progress: %v", err)
+		}
+	}
+	return targetDir
+}
+
+func withSyncPromptTestInput(t *testing.T, input string, isTerminal bool) {
+	t.Helper()
+	prevInput := syncPromptInput
+	prevIsTerminal := syncPromptIsTerminal
+	syncPromptInput = strings.NewReader(input)
+	syncPromptIsTerminal = func() bool { return isTerminal }
+	t.Cleanup(func() {
+		syncPromptInput = prevInput
+		syncPromptIsTerminal = prevIsTerminal
+	})
+}
+
+func writeCLIProbeResponse(req intftcp.Request, out io.Writer) error {
+	cts0 := req.Params[0]["cts0"]
+	n, err := strconv.Atoi(req.Params[0]["probe-bytes"])
+	if err != nil || n < 0 {
+		return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
+	}
+	if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+		return err
+	}
+	if n > 0 {
+		if _, err := out.Write(make([]byte, n)); err != nil {
+			return err
+		}
+	}
+	_, err = io.WriteString(out, "OK\r\n")
+	return err
+}
+
+func buildTestManifestRaw(transferID string, entries []string) string {
+	root := "/remote"
+	lines := []string{
+		fmt.Sprintf("FM/1 %s %d:%s mode=fast link-mbps=1000 concurrency=1", transferID, len(root), root),
+	}
+	lines = append(lines, entries...)
+	lines = append(lines, "")
+	return strings.Join(lines, "\n")
+}
+
+func buildTestManifestEntry(id uint64, size int64, mtime int64, mode os.FileMode, path string) string {
+	return fmt.Sprintf("%d %d 0:%d %s 0:%d:%s", id, size, mtime, encoding.FormatManifestMode(mode), len(path), path)
+}
+
+func buildTestManifestEntryFromDisk(t *testing.T, fullPath string, relPath string, id uint64) string {
+	t.Helper()
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		t.Fatalf("stat %s: %v", fullPath, err)
+	}
+	return buildTestManifestEntry(id, info.Size(), info.ModTime().UnixNano(), info.Mode(), relPath)
+}
+
+func writeSyncResponse(out io.Writer, transferID string, entries []string, removedIDs []uint64) error {
+	if _, err := io.WriteString(out, buildTestManifestRaw(transferID, entries)); err != nil {
+		return err
+	}
+	for _, id := range removedIDs {
+		if _, err := io.WriteString(out, fmt.Sprintf("RM %d\n", id)); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(out, "OK\r\n")
+	return err
+}
+
 func TestRunCLITransferAndGet(t *testing.T) {
 	tmp := t.TempDir()
+	targetDir := filepath.Join(tmp, "dst")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txcli 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
@@ -219,23 +351,22 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	manifestPath := filepath.Join(tmp, "txcli.fm2")
-	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", "-o", manifestPath}, &stdout, &stderr)
+	serverManifestPath := filepath.Join(tmp, ".pinch", "manifest.server")
+	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if _, err := os.Stat(manifestPath); err != nil {
-		t.Fatalf("manifest not written: %v", err)
+	if _, err := os.Stat(serverManifestPath); err != nil {
+		t.Fatalf("manifest.server not written: %v", err)
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	outRoot := filepath.Join(tmp, "out")
-	code = RunCLI([]string{srv.URL, "get", "--tid", "txcli", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-a", "1KiB"}, &stdout, &stderr)
+	code = RunCLI([]string{srv.URL, "get", "--fd", "0", "-a", "1KiB", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	got, err := os.ReadFile(filepath.Join(outRoot, "a.txt"))
+	got, err := os.ReadFile(filepath.Join(targetDir, "a.txt"))
 	if err != nil {
 		t.Fatalf("read output: %v", err)
 	}
@@ -246,24 +377,18 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
 	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txresume.fm2")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txresume 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
-	if err := os.WriteFile(manifestPath+".progress", []byte("0 5 0\n"), 0o644); err != nil {
-		t.Fatalf("write progress: %v", err)
-	}
+	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
 
-	outRoot := filepath.Join(tmp, "out")
-	if err := os.MkdirAll(outRoot, 0o755); err != nil {
-		t.Fatalf("mkdir out root: %v", err)
+	// Create the target directory with a partial file to resume from.
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
 	}
-	destPath := filepath.Join(outRoot, "a.txt")
+	destPath := filepath.Join(targetDir, "a.txt")
 	if err := os.WriteFile(destPath, []byte("helloSTALETAIL"), 0o644); err != nil {
 		t.Fatalf("write stale destination: %v", err)
 	}
@@ -297,7 +422,7 @@ func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--tid", "txresume", "--fd", "0", "--manifest", manifestPath, "--out-root", outRoot, "-a", "1KiB"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "get", "--fd", "0", "-a", "1KiB", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get resume: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -315,18 +440,12 @@ func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
 
 func TestRunCLIGetRejectsResumeToStdout(t *testing.T) {
 	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txstdout.fm2")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txstdout 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
-	if err := os.WriteFile(manifestPath+".progress", []byte("0 5 0\n"), 0o644); err != nil {
-		t.Fatalf("write progress: %v", err)
-	}
+	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -343,7 +462,7 @@ func TestRunCLIGetRejectsResumeToStdout(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--tid", "txstdout", "--fd", "0", "--manifest", manifestPath, "-o", "-", "-a", "1KiB"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "get", "--fd", "0", "-o", "-", "-a", "1KiB", targetDir}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("get stdout resume: expected 1, got %d stderr=%s", code, stderr.String())
 	}
@@ -352,17 +471,14 @@ func TestRunCLIGetRejectsResumeToStdout(t *testing.T) {
 	}
 }
 
-func TestRunCLIGetOutRootDevNullDiscardsOutput(t *testing.T) {
+func TestRunCLIGetOutFileDevNullDiscardsOutput(t *testing.T) {
 	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txdevnull.fm2")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txdevnull 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
+	targetDir := setupPinchState(t, tmp, manifestRaw, "")
 	payload := []byte("hello")
 	var sawAck bool
 
@@ -383,7 +499,7 @@ func TestRunCLIGetOutRootDevNullDiscardsOutput(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--tid", "txdevnull", "--fd", "0", "--manifest", manifestPath, "--out-root", os.DevNull, "-a", "1KiB"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "get", "--fd", "0", "-o", os.DevNull, "-a", "1KiB", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get devnull: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -397,6 +513,7 @@ func TestRunCLIGetOutRootDevNullDiscardsOutput(t *testing.T) {
 
 func TestRunCLITransferWithEncryptAge(t *testing.T) {
 	tmp := t.TempDir()
+	targetDir := filepath.Join(tmp, "dst")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txenccli 7:/remote mode=fast link-mbps=1000 concurrency=8",
 		"0 5 0:100 0644 0:5:a.txt",
@@ -435,14 +552,14 @@ func TestRunCLITransferWithEncryptAge(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	manifestPath := filepath.Join(tmp, "txenccli.fm2")
-	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", "--encrypt", "age", "-o", manifestPath}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", "--encrypt", "age", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	raw, err := os.ReadFile(manifestPath)
+	serverManifestPath := filepath.Join(tmp, ".pinch", "manifest.server")
+	raw, err := os.ReadFile(serverManifestPath)
 	if err != nil {
-		t.Fatalf("read manifest: %v", err)
+		t.Fatalf("read manifest.server: %v", err)
 	}
 	if string(raw) != manifestRaw {
 		t.Fatalf("unexpected decrypted manifest: %q", string(raw))
@@ -451,16 +568,13 @@ func TestRunCLITransferWithEncryptAge(t *testing.T) {
 
 func TestRunCLIStartDownloadsAll(t *testing.T) {
 	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txstart.fm2")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txstart 7:/remote mode=gentle link-mbps=700 concurrency=3",
 		"0 5 0:100 0644 0:5:a.txt",
 		"1 4 0:101 0644 0:5:b.txt",
 		"",
 	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
+	targetDir := setupPinchState(t, tmp, manifestRaw, "")
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -495,18 +609,18 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	})
 	defer srv.Close()
 
-	outRoot := filepath.Join(tmp, "out")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "start", "--tid", "txstart", "--manifest", manifestPath, "--out-root", outRoot, "--concurrency", "2", "--ack-every", "1KiB"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "start", "--concurrency", "2", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "start-plan: strategy=gentle link=700Mbps concurrency=2 (manifest=3)") {
 		t.Fatalf("missing start plan line: %s", stdout.String())
 	}
+	// After start, staging dir is renamed to target dir.
 	for _, p := range []string{"a.txt", "b.txt"} {
-		if _, err := os.Stat(filepath.Join(outRoot, p)); err != nil {
+		if _, err := os.Stat(filepath.Join(targetDir, p)); err != nil {
 			t.Fatalf("missing output %s: %v", p, err)
 		}
 	}
@@ -514,15 +628,12 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 
 func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txstartdefault.fm2")
 	manifestRaw := strings.Join([]string{
 		"FM/1 txstartdefault 7:/remote mode=fast link-mbps=1200 concurrency=5",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
+	targetDir := setupPinchState(t, tmp, manifestRaw, "")
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -544,10 +655,9 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	})
 	defer srv.Close()
 
-	outRoot := filepath.Join(tmp, "out")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "start", "--tid", "txstartdefault", "--manifest", manifestPath, "--out-root", outRoot, "--ack-every", "1KiB"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "start", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -556,23 +666,248 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	}
 }
 
-func TestRunCLIStartOutRootDevNullDiscardsOutput(t *testing.T) {
+func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 	tmp := t.TempDir()
-	manifestPath := filepath.Join(tmp, "txstartdevnull.fm2")
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstartdevnull 7:/remote mode=fast link-mbps=1200 concurrency=2",
+		"FM/1 txdiscard 7:/remote mode=fast link-mbps=700 concurrency=1",
 		"0 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	if err := os.WriteFile(manifestPath, []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
+	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
 	}
-	payload := []byte("hello")
+	keepPath := filepath.Join(targetDir, "keep.txt")
+	if err := os.WriteFile(keepPath, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write keep file: %v", err)
+	}
+	var sawAck bool
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbSEND:
-			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
+			if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			sawAck = true
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return nil
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "start", "--discard", "--progress=false", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start --discard: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !sawAck {
+		t.Fatalf("expected ACK request")
+	}
+	gotKeep, err := os.ReadFile(keepPath)
+	if err != nil {
+		t.Fatalf("read keep file: %v", err)
+	}
+	if string(gotKeep) != "keep" {
+		t.Fatalf("unexpected keep file contents: %q", gotKeep)
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "a.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected discarded output to be absent, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "manifest")); !os.IsNotExist(err) {
+		t.Fatalf("expected local manifest to be absent, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "manifest.progress")); !os.IsNotExist(err) {
+		t.Fatalf("expected progress state to be removed, stat err=%v", err)
+	}
+}
+
+func TestRunCLIStartDiscardKeepsProgressOnFailure(t *testing.T) {
+	tmp := t.TempDir()
+	manifestRaw := strings.Join([]string{
+		"FM/1 txdiscardfail 7:/remote mode=fast link-mbps=700 concurrency=1",
+		"0 5 0:100 0644 0:5:a.txt",
+		"1 4 0:101 0644 0:5:b.txt",
+		"",
+	}, "\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	ackCount := 0
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			for _, p := range req.Params[1:] {
+				switch p["fid"] {
+				case "0":
+					if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+						return err
+					}
+				case "1":
+					if _, err := io.WriteString(out, buildCLIFrame(1, []byte("test"), 0)); err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf("unexpected fid: %q", p["fid"])
+				}
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			ackCount++
+			if ackCount == 1 {
+				_, err := io.WriteString(out, "OK\r\n")
+				return err
+			}
+			return fmt.Errorf("forced ack failure")
+		default:
+			return nil
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{
+		srv.URL, "start",
+		"--discard",
+		"--progress=false",
+		"--concurrency", "1",
+		"--ack-every", "1KiB",
+		"--batch-size", "5B",
+		targetDir,
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("start --discard failure: expected 1, got %d stderr=%s", code, stderr.String())
+	}
+	progressRaw, err := os.ReadFile(filepath.Join(tmp, ".pinch", "manifest.progress"))
+	if err != nil {
+		t.Fatalf("read progress state: %v", err)
+	}
+	progressText := string(progressRaw)
+	if !strings.Contains(progressText, "0 5 ") && !strings.Contains(progressText, "1 4 ") {
+		t.Fatalf("expected retained progress for completed file, got %q", string(progressRaw))
+	}
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "manifest")); !os.IsNotExist(err) {
+		t.Fatalf("expected local manifest to be absent, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "a.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected discarded output to be absent, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "b.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected discarded output to be absent, stat err=%v", err)
+	}
+}
+
+func TestRunCLIStartDiscardSkipsCompletedMetadataRefresh(t *testing.T) {
+	tmp := t.TempDir()
+	manifestRaw := strings.Join([]string{
+		"FM/1 txdiscardrefresh 7:/remote mode=fast link-mbps=700 concurrency=1",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		return fmt.Errorf("unexpected verb: %v", req.Verb)
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{
+		srv.URL, "start",
+		"--discard",
+		"--progress=false",
+		"--ack-every", "1KiB",
+		targetDir,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start --discard completed refresh: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "manifest.progress")); !os.IsNotExist(err) {
+		t.Fatalf("expected progress state to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "a.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected discarded output to be absent, stat err=%v", err)
+	}
+}
+
+func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := setupPinchState(t, tmp, "", "")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	destPath := filepath.Join(targetDir, "same.txt")
+	if err := os.WriteFile(destPath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write target file: %v", err)
+	}
+	info, err := os.Stat(destPath)
+	if err != nil {
+		t.Fatalf("stat target file: %v", err)
+	}
+	entry := buildTestManifestEntry(0, info.Size(), info.ModTime().UnixNano(), info.Mode(), "same.txt")
+	manifestRaw := buildTestManifestRaw("txsyncnoop", []string{entry})
+	if err := os.WriteFile(filepath.Join(tmp, ".pinch", "manifest.server"), []byte(manifestRaw), 0o644); err != nil {
+		t.Fatalf("write manifest.server: %v", err)
+	}
+	withSyncPromptTestInput(t, "\n", true)
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txsyncnoop", []string{entry}, nil)
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("sync no-op: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "sync: converged, nothing to do") {
+		t.Fatalf("expected converged output, got: %s", stdout.String())
+	}
+	if strings.Contains(stderr.String(), "proceed?") {
+		t.Fatalf("did not expect prompt for no-op sync, got stderr=%s", stderr.String())
+	}
+}
+
+func TestRunCLISyncDownloadPromptDefaultsYes(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncdownload", nil), "")
+	withSyncPromptTestInput(t, "\n", true)
+
+	payload := []byte("hello")
+	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+	meta := &FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txsyncdownload", []string{entry}, nil)
+		case intftcp.VerbSEND:
+			if got := req.Params[0]["txferid"]; got != "txsyncdownload" {
+				return fmt.Errorf("unexpected transfer id: %q", got)
+			}
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -585,13 +920,335 @@ func TestRunCLIStartOutRootDevNullDiscardsOutput(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "start", "--tid", "txstartdevnull", "--manifest", manifestPath, "--out-root", os.DevNull, "--ack-every", "1KiB", "--per-file"}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("start devnull: expected 0, got %d stderr=%s", code, stderr.String())
+		t.Fatalf("sync download: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "start-file: fd=0 path="+os.DevNull) {
-		t.Fatalf("missing start-file devnull path line: %s", stdout.String())
+	got, err := os.ReadFile(filepath.Join(targetDir, "new.txt"))
+	if err != nil {
+		t.Fatalf("read synced file: %v", err)
 	}
+	if string(got) != string(payload) {
+		t.Fatalf("unexpected synced file: %q", string(got))
+	}
+	if !strings.Contains(stderr.String(), "proceed? [Y/n]: ") {
+		t.Fatalf("expected [Y/n] prompt, got stderr=%s", stderr.String())
+	}
+}
+
+func TestRunCLISyncDeletePromptDefaultsNo(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncdelete", nil), "")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	destPath := filepath.Join(targetDir, "old.txt")
+	if err := os.WriteFile(destPath, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write old file: %v", err)
+	}
+	withSyncPromptTestInput(t, "\n", true)
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txsyncdelete", nil, []uint64{0})
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("sync delete abort: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if _, err := os.Stat(destPath); err != nil {
+		t.Fatalf("expected delete-only sync to abort before removing file: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "proceed? [y/N]: ") {
+		t.Fatalf("expected [y/N] prompt, got stderr=%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "aborted") {
+		t.Fatalf("expected abort message, got stderr=%s", stderr.String())
+	}
+}
+
+func TestRunCLISyncMixedPromptDefaultsNo(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncmixed", nil), "")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	oldPath := filepath.Join(targetDir, "old.txt")
+	if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write old file: %v", err)
+	}
+	withSyncPromptTestInput(t, "\n", true)
+
+	entry := buildTestManifestEntry(0, 5, 100, 0o644, "new.txt")
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txsyncmixed", []string{entry}, []uint64{0})
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("sync mixed abort: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("expected mixed sync to abort before removing old file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "new.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected mixed sync to abort before downloading new file, err=%v", err)
+	}
+	if !strings.Contains(stderr.String(), "proceed? [y/N]: ") {
+		t.Fatalf("expected [y/N] prompt, got stderr=%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "aborted") {
+		t.Fatalf("expected abort message, got stderr=%s", stderr.String())
+	}
+}
+
+func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
+	t.Run("download-default-yes", func(t *testing.T) {
+		tmp := t.TempDir()
+		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesdownload", nil), "")
+		withSyncPromptTestInput(t, "Y\n", true)
+
+		payload := []byte("hello")
+		entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+		meta := &FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+			switch req.Verb {
+			case intftcp.VerbPROBE:
+				return writeCLIProbeResponse(req, out)
+			case intftcp.VerbSYNC:
+				return writeSyncResponse(out, "txsyncyesdownload", []string{entry}, nil)
+			case intftcp.VerbSEND:
+				_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+				return err
+			case intftcp.VerbACK:
+				_, err := io.WriteString(out, "OK\r\n")
+				return err
+			default:
+				return fmt.Errorf("unexpected verb: %v", req.Verb)
+			}
+		})
+		defer srv.Close()
+
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("sync explicit yes download: expected 0, got %d stderr=%s", code, stderr.String())
+		}
+		if _, err := os.Stat(filepath.Join(targetDir, "new.txt")); err != nil {
+			t.Fatalf("expected new file to download: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "proceed? [Y/n]: ") {
+			t.Fatalf("expected [Y/n] prompt, got stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("delete-default-no", func(t *testing.T) {
+		tmp := t.TempDir()
+		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesdelete", nil), "")
+		if err := os.MkdirAll(targetDir, 0o755); err != nil {
+			t.Fatalf("mkdir target: %v", err)
+		}
+		oldPath := filepath.Join(targetDir, "old.txt")
+		if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
+			t.Fatalf("write old file: %v", err)
+		}
+		withSyncPromptTestInput(t, "y\n", true)
+
+		syncCalls := 0
+		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+			switch req.Verb {
+			case intftcp.VerbPROBE:
+				return writeCLIProbeResponse(req, out)
+			case intftcp.VerbSYNC:
+				syncCalls++
+				if syncCalls == 1 {
+					return writeSyncResponse(out, "txsyncyesdelete", nil, []uint64{0})
+				}
+				return writeSyncResponse(out, "txsyncyesdelete", nil, nil)
+			default:
+				return fmt.Errorf("unexpected verb: %v", req.Verb)
+			}
+		})
+		defer srv.Close()
+
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("sync explicit yes delete: expected 0, got %d stderr=%s", code, stderr.String())
+		}
+		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+			t.Fatalf("expected old file to be removed, err=%v", err)
+		}
+		if !strings.Contains(stderr.String(), "proceed? [y/N]: ") {
+			t.Fatalf("expected [y/N] prompt, got stderr=%s", stderr.String())
+		}
+	})
+}
+
+func TestRunCLISyncNonTerminalSkipsPrompt(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncnonterm", nil), "")
+	withSyncPromptTestInput(t, "", false)
+
+	payload := []byte("hello")
+	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+	meta := &FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txsyncnonterm", []string{entry}, nil)
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("sync non-terminal: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "new.txt")); err != nil {
+		t.Fatalf("expected new file to download: %v", err)
+	}
+	if strings.Contains(stderr.String(), "proceed?") {
+		t.Fatalf("did not expect prompt for non-terminal stdin, got stderr=%s", stderr.String())
+	}
+}
+
+func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
+	t.Run("delete-only", func(t *testing.T) {
+		tmp := t.TempDir()
+		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesflagdelete", nil), "")
+		if err := os.MkdirAll(targetDir, 0o755); err != nil {
+			t.Fatalf("mkdir target: %v", err)
+		}
+		oldPath := filepath.Join(targetDir, "old.txt")
+		if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
+			t.Fatalf("write old file: %v", err)
+		}
+		withSyncPromptTestInput(t, "\n", true)
+
+		syncCalls := 0
+		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+			switch req.Verb {
+			case intftcp.VerbPROBE:
+				return writeCLIProbeResponse(req, out)
+			case intftcp.VerbSYNC:
+				syncCalls++
+				if syncCalls == 1 {
+					return writeSyncResponse(out, "txsyncyesflagdelete", nil, []uint64{0})
+				}
+				return writeSyncResponse(out, "txsyncyesflagdelete", nil, nil)
+			default:
+				return fmt.Errorf("unexpected verb: %v", req.Verb)
+			}
+		})
+		defer srv.Close()
+
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := RunCLI([]string{srv.URL, "sync", "--yes", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("sync --yes delete-only: expected 0, got %d stderr=%s", code, stderr.String())
+		}
+		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+			t.Fatalf("expected old file to be removed, err=%v", err)
+		}
+		if strings.Contains(stderr.String(), "proceed?") {
+			t.Fatalf("did not expect prompt with --yes, got stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("mixed", func(t *testing.T) {
+		tmp := t.TempDir()
+		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesflagmixed", nil), "")
+		if err := os.MkdirAll(targetDir, 0o755); err != nil {
+			t.Fatalf("mkdir target: %v", err)
+		}
+		oldPath := filepath.Join(targetDir, "old.txt")
+		if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
+			t.Fatalf("write old file: %v", err)
+		}
+		withSyncPromptTestInput(t, "\n", true)
+
+		payload := []byte("hello")
+		entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+		syncCalls := 0
+		meta := &FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+			switch req.Verb {
+			case intftcp.VerbPROBE:
+				return writeCLIProbeResponse(req, out)
+			case intftcp.VerbSYNC:
+				syncCalls++
+				if syncCalls == 1 {
+					return writeSyncResponse(out, "txsyncyesflagmixed", []string{entry}, []uint64{0})
+				}
+				return writeSyncResponse(out, "txsyncyesflagmixed", []string{entry}, nil)
+			case intftcp.VerbSEND:
+				_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+				return err
+			case intftcp.VerbACK:
+				_, err := io.WriteString(out, "OK\r\n")
+				return err
+			default:
+				return fmt.Errorf("unexpected verb: %v", req.Verb)
+			}
+		})
+		defer srv.Close()
+
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := RunCLI([]string{srv.URL, "sync", "--yes", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("sync --yes mixed: expected 0, got %d stderr=%s", code, stderr.String())
+		}
+		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+			t.Fatalf("expected old file to be removed, err=%v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(targetDir, "new.txt"))
+		if err != nil {
+			t.Fatalf("read new file: %v", err)
+		}
+		if string(got) != string(payload) {
+			t.Fatalf("unexpected new file contents: %q", string(got))
+		}
+		if strings.Contains(stderr.String(), "proceed?") {
+			t.Fatalf("did not expect prompt with --yes, got stderr=%s", stderr.String())
+		}
+	})
 }
 
 func TestRunCLIStatus(t *testing.T) {
@@ -628,49 +1285,34 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	if code := RunCLI([]string{"127.0.0.1:1", "bogus"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for unknown cmd, got %d", code)
 	}
-	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t"}, &stdout, &stderr); code != 2 {
+	// get requires --fd and a positional target dir
+	if code := RunCLI([]string{"127.0.0.1:1", "get", "--fd", "0"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for missing target dir on get, got %d", code)
+	}
+	// get requires --fd
+	if code := RunCLI([]string{"127.0.0.1:1", "get", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for missing --fd, got %d", code)
-	}
-	if code := RunCLI([]string{"127.0.0.1:1", "get", "--fd", "0"}, &stdout, &stderr); code != 1 {
-		t.Fatalf("expected runtime error when get has no --tid and no --manifest, got %d", code)
-	}
-	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t", "--fd", "0", "--ack-every", "0"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for invalid --ack-every, got %d", code)
-	}
-	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t", "--fd", "0", "--load-strategy", "slow"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for invalid --load-strategy on get, got %d", code)
-	}
-	if !strings.Contains(stderr.String(), "invalid --load-strategy") {
-		t.Fatalf("expected invalid --load-strategy message, got: %s", stderr.String())
-	}
-	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "get", "--tid", "t", "--fd", "0", "--ack-every", "bad"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for invalid --ack-every size, got %d", code)
-	}
-	if !strings.Contains(stderr.String(), "invalid --ack-every") {
-		t.Fatalf("expected invalid --ack-every message, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for legacy --directory flag, got %d", code)
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "start", "--tid", "t", "--probe-bytes", "bad"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"127.0.0.1:1", "start", "--probe-bytes", "bad"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for unknown --probe-bytes, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "flag provided but not defined") {
 		t.Fatalf("expected unknown flag message, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "start", "--tid", "t", "--load-strategy", "slow"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"127.0.0.1:1", "start", "--load-strategy", "slow"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for unknown --load-strategy on start, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "flag provided but not defined") {
 		t.Fatalf("expected unknown flag message, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "-s", "/tmp", "--encrypt", "aes"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "-s", "/tmp", "--encrypt", "aes", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for unsupported --encrypt mode, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "invalid --encrypt") {

@@ -10,15 +10,14 @@ Arguments:
 
 Options:
   --rsync                    Run an rsync baseline instead of a pinch transfer.
+  --discard                  Benchmark pinch start with --discard (no target-dir writes).
   --flamegraph               Run start benchmark under perf and emit flamegraph SVG.
   --trace                    Capture runtime/trace for client and server (view with go tool trace).
   --build                    Build ./pinch before benchmarking (default: true).
   --no-build                 Skip build step.
   --server-url ADDR          File listener address for CLI (default: 127.0.0.1:3453).
   --server-startup-timeout S Seconds to wait for file listener readiness (default: 30).
-  --manifest PATH            Manifest output path (default: /tmp/pinch/manifest).
-  --out-root PATH            Download output root (default: /var/lib/pinch/data).
-  --discard                  Shortcut for --out-root /dev/null.
+  --target-dir PATH          Target directory for transfer/start (default: /var/lib/pinch/data).
   --no-sync                  Skip fdatasync after each file (passed to start command).
   --concurrency N            Start command concurrency (default: 128).
   --encrypt MODE             Encryption mode passed to CLI (supported: age).
@@ -55,11 +54,11 @@ BUILD=true
 FLAMEGRAPH=false
 TRACE=false
 RSYNC=false
+DISCARD=false
 SERVER_URL="127.0.0.1:3453"
 SERVER_STARTUP_TIMEOUT_SEC=30
 SOURCE_DIRECTORY=""
-MANIFEST_PATH="/tmp/pinch/manifest"
-OUT_ROOT="/var/lib/pinch/data"
+TARGET_DIR="/var/lib/pinch/data"
 CONCURRENCY="48"
 ENCRYPT_MODE=""
 NO_SYNC=false
@@ -94,6 +93,10 @@ while [[ $# -gt 0 ]]; do
       RSYNC=true
       shift
       ;;
+    --discard)
+      DISCARD=true
+      shift
+      ;;
     --trace)
       TRACE=true
       shift
@@ -126,19 +129,10 @@ while [[ $# -gt 0 ]]; do
       SERVER_STARTUP_TIMEOUT_SEC="$2"
       shift 2
       ;;
-    --manifest)
+    --target-dir)
       require_value "$1" "${2:-}"
-      MANIFEST_PATH="$2"
+      TARGET_DIR="$2"
       shift 2
-      ;;
-    --out-root)
-      require_value "$1" "${2:-}"
-      OUT_ROOT="$2"
-      shift 2
-      ;;
-    --discard)
-      OUT_ROOT="/dev/null"
-      shift
       ;;
     --no-sync)
       NO_SYNC=true
@@ -204,22 +198,24 @@ if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "age" ]]; then
   echo "unsupported --encrypt value: ${ENCRYPT_MODE} (only 'age' is supported)" >&2
   exit 2
 fi
+if [[ "${RSYNC}" == "true" && "${DISCARD}" == "true" ]]; then
+  echo "--discard is only supported for pinch start benchmarks, not --rsync" >&2
+  exit 2
+fi
 
 # ── rsync baseline mode ──────────────────────────────────────────────────
 if [[ "${RSYNC}" == "true" ]]; then
   require_cmd rsync
-  echo "bench (rsync baseline): source=${SOURCE_DIRECTORY} target=${OUT_ROOT}"
-  if [[ "${OUT_ROOT%/}" != "/dev/null" ]]; then
-    rm -rf "${OUT_ROOT}/"
-    mkdir -p "${OUT_ROOT}"
-  fi
+  echo "bench (rsync baseline): source=${SOURCE_DIRECTORY} target=${TARGET_DIR}"
+  rm -rf "${TARGET_DIR}/"
+  mkdir -p "${TARGET_DIR}"
 
   RSYNC_CMD=(rsync -aW --no-compress --info=progress2)
   if [[ "${NO_SYNC}" != "true" ]]; then
     RSYNC_CMD+=(--fsync)
   fi
   # Trailing slash on source so rsync copies contents, not the directory itself.
-  RSYNC_CMD+=("${SOURCE_DIRECTORY%/}/" "${OUT_ROOT%/}/")
+  RSYNC_CMD+=("${SOURCE_DIRECTORY%/}/" "${TARGET_DIR%/}/")
 
   echo "Running: ${RSYNC_CMD[*]}"
   { time "${RSYNC_CMD[@]}"; } 2>&1
@@ -324,23 +320,32 @@ start_server_perf() {
 trap cleanup_server EXIT INT TERM
 start_server
 
-echo "bench: source=${SOURCE_DIRECTORY} target=${OUT_ROOT}"
-echo "Cleaning prior benchmark output..."
-if [[ "${OUT_ROOT%/}" != "/dev/null" ]]; then
-  rm -rf "${OUT_ROOT}/"
+PARENT_DIR="$(dirname "${TARGET_DIR}")"
+STATE_DIR="${PARENT_DIR}/.pinch"
+
+echo "bench: source=${SOURCE_DIRECTORY} target=${TARGET_DIR}"
+if [[ "${DISCARD}" == "true" ]]; then
+  echo "Cleaning prior benchmark state..."
+  rm -rf "${STATE_DIR}/"
+else
+  echo "Cleaning prior benchmark output..."
+  rm -rf "${TARGET_DIR}/" "${STATE_DIR}/"
 fi
-rm -rf "${MANIFEST_PATH}"*
 
 echo "Preparing manifest..."
-TRANSFER_CMD=(./pinch filecli "${SERVER_URL}" transfer -o "${MANIFEST_PATH}" -s "${SOURCE_DIRECTORY}")
+TRANSFER_CMD=(./pinch filecli "${SERVER_URL}" transfer -s "${SOURCE_DIRECTORY}")
 if [[ -n "${ENCRYPT_MODE}" ]]; then
   TRANSFER_CMD+=(--encrypt "${ENCRYPT_MODE}")
 fi
+TRANSFER_CMD+=("${TARGET_DIR}")
 "${TRANSFER_CMD[@]}"
 
-START_CMD=(./pinch filecli "${SERVER_URL}" start --manifest "${MANIFEST_PATH}" --out-root "${OUT_ROOT}" --concurrency "${CONCURRENCY}")
+START_CMD=(./pinch filecli "${SERVER_URL}" start --concurrency "${CONCURRENCY}")
 if [[ -n "${ENCRYPT_MODE}" ]]; then
   START_CMD+=(--encrypt "${ENCRYPT_MODE}")
+fi
+if [[ "${DISCARD}" == "true" ]]; then
+  START_CMD+=(--discard)
 fi
 if [[ "${NO_SYNC}" == "true" ]]; then
   START_CMD+=(--no-sync)
@@ -348,6 +353,7 @@ fi
 if [[ "${TRACE}" == "true" ]]; then
   START_CMD+=(--trace "${CLIENT_TRACE}")
 fi
+START_CMD+=("${TARGET_DIR}")
 
 if [[ "$FLAMEGRAPH" != "true" ]]; then
   echo "Running timed start benchmark..."
