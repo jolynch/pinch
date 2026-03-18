@@ -26,9 +26,9 @@ mkdir -p "/var/lib/pinch/keys"
 mkdir -p "/var/lib/pinch/out"
 
 if [[ "${DETACH}" == "true" ]]; then
-    DOCKER_RUN="docker run --rm -d -v /var/lib/pinch/:/var/lib/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
+    DOCKER_RUN="docker run --rm -d -v /var/lib/pinch/:/var/lib/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server pipesrv -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
 else
-    DOCKER_RUN="docker run --rm -v /var/lib/pinch/:/var/lib/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
+    DOCKER_RUN="docker run --rm -v /var/lib/pinch/:/var/lib/pinch -p 127.0.0.1:${PORT}:8080 --name pinch-server jolynch/pinch-server pinch-server pipesrv -listen 0.0.0.0:8080 -die-after ${DIEAFTER}"
 fi
 
 

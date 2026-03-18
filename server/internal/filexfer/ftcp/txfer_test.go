@@ -61,10 +61,10 @@ func (d *txferTestDeps) VerifyTransferFileWindowHash(string, uint64, int64, stri
 
 func (d *txferTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { return true }
 
-func (d *txferTestDeps) SetTransferDeadline(string, int64) bool        { return false }
+func (d *txferTestDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (d *txferTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
-func (d *txferTestDeps) MarkTransferTooSlow(string) bool               { return false }
-func (d *txferTestDeps) Root() string                                  { return "/" }
+func (d *txferTestDeps) MarkTransferTooSlow(string) bool                  { return false }
+func (d *txferTestDeps) Root() string                                     { return "/" }
 
 func TestParseTXFERRequestRequiresHints(t *testing.T) {
 	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=12`))

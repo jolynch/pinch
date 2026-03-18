@@ -149,7 +149,6 @@ func TestHandleSYNCMixedDelta(t *testing.T) {
 	}
 }
 
-
 // --- Test helpers ---
 
 func writeTestFile(t *testing.T, root, rel, content string) {
@@ -204,7 +203,7 @@ func runSYNCTest(t *testing.T, root string, oldManifest string) ([]encoding.Mani
 
 	deps := &syncTestDeps{}
 	var out bytes.Buffer
-	if err := handleSYNCWithInput(context.Background(), req, &input, &out, deps); err != nil {
+	if err := handleSYNCWithInput(context.Background(), req, &input, &out, deps, nil); err != nil {
 		t.Fatalf("handleSYNCWithInput: %v", err)
 	}
 

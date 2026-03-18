@@ -1,7 +1,7 @@
 ARG REGISTRY=docker.io
 
 ###### BUILD CONTAINER ######
-FROM $REGISTRY/golang:latest as builder
+FROM $REGISTRY/golang:latest AS builder
 
 # Dependencies e.g.
 # RUN go get -u google.golang.org/grpc
@@ -35,4 +35,4 @@ COPY --from=builder /usr/local/bin/dumb-init /usr/bin/dumb-init
 COPY --from=builder /go/src/pinch-server /usr/local/bin/pinch-server
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
-CMD ["/usr/local/bin/pinch-server"]
+CMD ["/usr/local/bin/pinch-server", "pipesrv"]

@@ -20,8 +20,11 @@ import (
 
 	"runtime/trace"
 
+	"sync/atomic"
+
 	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
+	"github.com/jolynch/pinch/internal/filexfer"
 	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/jolynch/pinch/utils"
 )
@@ -60,6 +63,26 @@ func (sw *synchronizedWriter) Write(p []byte) (int, error) {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	return sw.w.Write(p)
+}
+
+type countingWriter struct {
+	io.Writer
+	total *atomic.Int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.Writer.Write(p)
+	if n > 0 {
+		cw.total.Add(int64(n))
+	}
+	return n, err
+}
+
+func (cw *countingWriter) Close() error {
+	if c, ok := cw.Writer.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 const defaultFileListener = "127.0.0.1:3453"
@@ -414,6 +437,8 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var noSync bool
 	var verbose bool
 	var traceFile string
+	var progressFilePath string
+	var progressIntervalRaw string
 	cf.StringVar(&txferID, "", "tid", "", "transfer id")
 	cf.StringVar(&manifestPath, "", "manifest", "", "path to manifest file (default: <tid>.fm2)")
 	cf.StringVar(&fileIDRaw, "", "fd", "", "file id to download")
@@ -428,6 +453,8 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	cf.BoolVar(&noSync, "", "no-sync", false, "ack without disk sync")
 	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
+	cf.StringVar(&progressFilePath, "", "progress-path", "", "write integer % to this file/pipe")
+	cf.StringVar(&progressIntervalRaw, "", "progress-path-interval", "1s", "progress write interval (e.g. 500ms, 10s)")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -438,6 +465,11 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	defer stopTracing()
 	if fileIDRaw == "" {
 		fmt.Fprintln(stderr, "get requires --fd")
+		return 2
+	}
+	progressInterval, err := time.ParseDuration(progressIntervalRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --progress-path-interval: %v\n", err)
 		return 2
 	}
 	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
@@ -532,14 +564,34 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		return 0
 	}
 	outputPath := resolveDownloadDestinationPath(entry, outRoot, outFile)
+	var totalCopied atomic.Int64
+	outputWriter := func(me ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
+		destPath := resolveDownloadDestinationPath(me, outRoot, outFile)
+		w, syncFn, err := openDownloadOutput(me, offset, destPath, stdout, noSync)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &countingWriter{Writer: w, total: &totalCopied}, syncFn, nil
+	}
+	if progressFilePath != "" {
+		totalBytes := entry.Size
+		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), progressFilePath, progressInterval, func() int {
+			if totalBytes <= 0 {
+				return 100
+			}
+			pct := int(totalCopied.Load() * 100 / totalBytes)
+			if pct > 100 {
+				pct = 100
+			}
+			return pct
+		})
+		defer func() { stopProgressFile(err == nil) }()
+	}
 	downloadBatchResp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
-		Manifest:      manifest,
-		FileIDs:       []uint64{fileID},
-		BatchMaxBytes: batchSize,
-		OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
-			destPath := resolveDownloadDestinationPath(entry, outRoot, outFile)
-			return openDownloadOutput(entry, offset, destPath, stdout, noSync)
-		},
+		Manifest:        manifest,
+		FileIDs:         []uint64{fileID},
+		BatchMaxBytes:   batchSize,
+		OutputWriter:    outputWriter,
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
 		ProgressUpdates: progressUpdates,
@@ -589,6 +641,8 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var deleteRemoved bool
 	var probeBytesRaw string
 	var traceFile string
+	var progressFilePath string
+	var progressIntervalRaw string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory on server")
 	cf.StringVar(&manifestPath, "", "manifest", "", "path to existing manifest file (required)")
 	cf.StringVar(&manifestOut, "o", "", "", "output path for updated manifest (default: overwrite --manifest)")
@@ -606,6 +660,8 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	probeBytesRaw = encoding.HumanBytes(defaultCLIProbeBytes)
 	cf.StringVar(&probeBytesRaw, "", "probe-bytes", probeBytesRaw, "probe payload size")
 	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
+	cf.StringVar(&progressFilePath, "", "progress-path", "", "write integer % to this file/pipe")
+	cf.StringVar(&progressIntervalRaw, "", "progress-path-interval", "1s", "progress write interval (e.g. 500ms, 10s)")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -624,6 +680,11 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	}
 	if manifestOut == "" {
 		manifestOut = manifestPath
+	}
+	progressInterval, err := time.ParseDuration(progressIntervalRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --progress-path-interval: %v\n", err)
+		return 2
 	}
 	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
 	if err != nil || ackEvery <= 0 {
@@ -853,11 +914,39 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	}
 	defer stopProgress()
 
+	var totalCopied atomic.Int64
+	outputWriter := func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
+		destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+		w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, noSync)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &countingWriter{Writer: w, total: &totalCopied}, syncFn, nil
+	}
+
 	startAll := time.Now()
 	var completed int64
 	var totalTransferred int64
 	var failures []error
 	var failuresMu sync.Mutex
+
+	if progressFilePath != "" {
+		var totalBytes int64
+		for _, e := range pendingEntries {
+			totalBytes += e.Size
+		}
+		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), progressFilePath, progressInterval, func() int {
+			if totalBytes <= 0 {
+				return 100
+			}
+			pct := int(totalCopied.Load() * 100 / totalBytes)
+			if pct > 100 {
+				pct = 100
+			}
+			return pct
+		})
+		defer func() { stopProgressFile(len(failures) == 0) }()
+	}
 	recordFailure := func(err error) {
 		if err == nil {
 			return
@@ -868,12 +957,9 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	}
 
 	startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
-		Manifest: mergedManifest,
-		Entries:  pendingEntries,
-		OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
-			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
-			return openDownloadOutput(entry, offset, destPath, nil, noSync)
-		},
+		Manifest:        mergedManifest,
+		Entries:         pendingEntries,
+		OutputWriter:    outputWriter,
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
 		Concurrency:     effectiveConcurrency,
@@ -955,6 +1041,8 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var progress bool
 	var perFile bool
 	var deadlineRaw string
+	var progressFilePath string
+	var progressIntervalRaw string
 	cf.StringVar(&txferID, "", "tid", "", "transfer id")
 	cf.StringVar(&manifestPath, "", "manifest", "", "path to manifest file (default: <tid>.fm2)")
 	cf.StringVar(&outRoot, "", "out-root", ".", "output root")
@@ -971,6 +1059,8 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "transfer deadline (e.g. 60s, 5m)")
 	var traceFile string
 	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
+	cf.StringVar(&progressFilePath, "", "progress-path", "", "write integer % to this file/pipe")
+	cf.StringVar(&progressIntervalRaw, "", "progress-path-interval", "1s", "progress write interval (e.g. 500ms, 10s)")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -979,6 +1069,11 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	stopTracing := startTracing(traceFile, stderr)
 	defer stopTracing()
+	progressInterval, err := time.ParseDuration(progressIntervalRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --progress-path-interval: %v\n", err)
+		return 2
+	}
 	// Compute verbosity level: 0=quiet, 1=progress, 2=per-file.
 	verbosity := 0
 	if progress || verbose {
@@ -1139,13 +1234,36 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		}
 		pendingEntries = append(pendingEntries, entry)
 	}
+	var totalCopied atomic.Int64
+	outputWriter := func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
+		destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+		w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, noSync)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &countingWriter{Writer: w, total: &totalCopied}, syncFn, nil
+	}
+	if progressFilePath != "" {
+		var totalBytes int64
+		for _, e := range pendingEntries {
+			totalBytes += e.Size
+		}
+		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), progressFilePath, progressInterval, func() int {
+			if totalBytes <= 0 {
+				return 100
+			}
+			pct := int(totalCopied.Load() * 100 / totalBytes)
+			if pct > 100 {
+				pct = 100
+			}
+			return pct
+		})
+		defer func() { stopProgressFile(len(failures) == 0) }()
+	}
 	startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
-		Manifest: manifest,
-		Entries:  pendingEntries,
-		OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
-			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
-			return openDownloadOutput(entry, offset, destPath, nil, noSync)
-		},
+		Manifest:        manifest,
+		Entries:         pendingEntries,
+		OutputWriter:    outputWriter,
 		AgePublicKey:    agePublicKey,
 		AgeIdentity:     ageIdentity,
 		Concurrency:     effectiveConcurrency,
@@ -1275,7 +1393,7 @@ func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer)
 				if rateBps > 0 && s.TotalSize > s.DoneSize {
 					remaining := float64(s.TotalSize - s.DoneSize)
 					etaSec := remaining / rateBps
-					etaPart = fmt.Sprintf(" eta=%s", (time.Duration(etaSec*float64(time.Second))).Round(time.Second))
+					etaPart = fmt.Sprintf(" eta=%s", (time.Duration(etaSec * float64(time.Second))).Round(time.Second))
 				}
 				fmt.Fprintf(
 					stderr,

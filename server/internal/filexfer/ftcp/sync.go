@@ -84,7 +84,7 @@ func handleSYNCCommand(_ context.Context, _ Request, _ io.Writer, _ Deps) error 
 	return protocolErr{code: "INTERNAL", message: "SYNC requires input reader, use handleSYNCWithInput"}
 }
 
-func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps) error {
+func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps, onTransferCreated func(string)) error {
 	parsed, err := parseSYNCRequest(req)
 	if err != nil {
 		return err
@@ -106,6 +106,9 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	transfer, err := deps.NewTransfer(root, 0, 0)
 	if err != nil {
 		return protocolErr{code: "INTERNAL", message: "failed to initialize transfer"}
+	}
+	if onTransferCreated != nil {
+		onTransferCreated(transfer.ID)
 	}
 	if ok := deps.SetTransferHints(transfer.ID, parsed.Mode, parsed.LinkMbps, parsed.Concurrency); !ok {
 		return protocolErr{code: "INTERNAL", message: "failed to persist transfer hints"}

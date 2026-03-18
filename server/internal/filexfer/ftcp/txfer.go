@@ -90,7 +90,7 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 	}, nil
 }
 
-func handleTXFER(_ context.Context, req Request, out io.Writer, deps Deps) error {
+func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, deps Deps, onCreated func(string)) error {
 	parsed, err := parseTXFERRequest(req)
 	if err != nil {
 		return err
@@ -104,6 +104,9 @@ func handleTXFER(_ context.Context, req Request, out io.Writer, deps Deps) error
 	transfer, err := deps.NewTransfer(root, 0, 0)
 	if err != nil {
 		return protocolErr{code: "INTERNAL", message: "failed to initialize transfer"}
+	}
+	if onCreated != nil {
+		onCreated(transfer.ID)
 	}
 	if ok := deps.SetTransferHints(transfer.ID, parsed.Mode, parsed.LinkMbps, parsed.Concurrency); !ok {
 		return protocolErr{code: "INTERNAL", message: "failed to persist transfer hints"}
@@ -140,6 +143,10 @@ func handleTXFER(_ context.Context, req Request, out io.Writer, deps Deps) error
 	}
 	cleanupTransfer = false
 	return nil
+}
+
+func handleTXFER(ctx context.Context, req Request, out io.Writer, deps Deps) error {
+	return handleTXFERWithCallback(ctx, req, out, deps, nil)
 }
 
 func validateDirectory(directory string) error {
@@ -293,4 +300,3 @@ func isBrokenPipe(err error) bool {
 		errors.Is(err, syscall.EPIPE) ||
 		errors.Is(err, syscall.ECONNRESET)
 }
-

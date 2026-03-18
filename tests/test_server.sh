@@ -17,6 +17,14 @@ DATA="${DATA:-tests/state/webster.txt}"
 ./pinch-server
 URL="localhost:${PORT}"
 
+# Wait for server to be ready
+for i in $(seq 1 30); do
+    if (echo >/dev/tcp/localhost/${PORT}) 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+
 FD=$(curl -s "${URL}/pinch?min-level=1&timeout=10s" | jq '.handles | keys[0]' -r)
 RFD=$(curl -s "${URL}/unpinch?timeout=10s" | jq '.handles | keys[0]' -r)
 
