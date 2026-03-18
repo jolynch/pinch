@@ -62,6 +62,46 @@ func HumanRate(bps float64) string {
 	return fmt.Sprintf("%.2f %s", bps, units[unit])
 }
 
+func HumanCount(n uint64, width int) string {
+	if width <= 0 {
+		return ""
+	}
+
+	raw := strconv.FormatUint(n, 10)
+	if len(raw) <= width {
+		return fmt.Sprintf("%*s", width, raw)
+	}
+
+	units := []string{"K", "M", "B", "T", "P"}
+
+	v := float64(n)
+	u := -1
+	for v >= 1000 && u < len(units)-1 {
+		v /= 1000
+		u++
+	}
+
+	if u >= 0 {
+		suffix := units[u]
+		for decimals := 1; decimals >= 0; decimals-- {
+			s := fmt.Sprintf("%.*f%s", decimals, v, suffix)
+			if len(s) <= width {
+				return fmt.Sprintf("%*s", width, s)
+			}
+		}
+
+		s := fmt.Sprintf("%.0f%s", v, suffix)
+		if len(s) <= width {
+			return fmt.Sprintf("%*s", width, s)
+		}
+	}
+
+	if len(raw) > width {
+		return raw[len(raw)-width:]
+	}
+	return fmt.Sprintf("%*s", width, raw)
+}
+
 func parseHumanValueAndUnit(raw string) (float64, string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

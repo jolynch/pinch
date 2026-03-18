@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -54,6 +55,13 @@ const defaultCLIAckEveryBytes int64 = 128 * 1024 * 1024
 const defaultVerboseProgressInterval = 2 * time.Second
 const defaultCLIProbeBytes int64 = 1 * 1024 * 1024
 
+var syncPromptInput io.Reader = os.Stdin
+
+var syncPromptIsTerminal = func() bool {
+	stat, err := os.Stdin.Stat()
+	return err == nil && stat != nil && (stat.Mode()&os.ModeCharDevice) != 0
+}
+
 type synchronizedWriter struct {
 	mu *sync.Mutex
 	w  io.Writer
@@ -86,12 +94,121 @@ func (cw *countingWriter) Close() error {
 }
 
 const defaultFileListener = "127.0.0.1:3453"
+const maxSyncRounds = 3
+
+// pinchState computes all state file paths from a target output directory.
+// Given targetDir="/var/lib/pinch/dst", state lives in the parent:
+//
+//	/var/lib/pinch/.pinch/manifest         ← client state: what's on disk (written by start/sync)
+//	/var/lib/pinch/.pinch/manifest.server  ← server state: written by transfer, read by start/get
+//	/var/lib/pinch/.pinch/manifest.progress
+//	/var/lib/pinch/.pinch/remote/          (staging for start)
+type pinchState struct {
+	TargetDir          string // the user-facing output directory
+	StateDir           string // parent/.pinch
+	ManifestPath       string // StateDir/manifest        (client state: what's on disk)
+	ServerManifestPath string // StateDir/manifest.server (server state: from transfer)
+	ProgressPath       string // StateDir/manifest.progress
+	StagingDir         string // StateDir/remote
+}
+
+func newPinchState(targetDir string) (*pinchState, error) {
+	targetDir = filepath.Clean(targetDir)
+	parent := filepath.Dir(targetDir)
+	if parent == targetDir {
+		return nil, fmt.Errorf("target directory %q has no distinct parent", targetDir)
+	}
+	stateDir := filepath.Join(parent, ".pinch")
+	return &pinchState{
+		TargetDir:          targetDir,
+		StateDir:           stateDir,
+		ManifestPath:       filepath.Join(stateDir, "manifest"),
+		ServerManifestPath: filepath.Join(stateDir, "manifest.server"),
+		ProgressPath:       filepath.Join(stateDir, "manifest.progress"),
+		StagingDir:         filepath.Join(stateDir, "remote"),
+	}, nil
+}
+
+func (ps *pinchState) ensureStateDir() error   { return os.MkdirAll(ps.StateDir, 0o755) }
+func (ps *pinchState) ensureStagingDir() error { return os.MkdirAll(ps.StagingDir, 0o755) }
+
+// scanLocalDir walks targetDir and returns a Manifest representing the files
+// currently on disk, using meta for header fields (Root, Mode, etc.).
+// If targetDir does not exist the returned manifest has no entries.
+func scanLocalDir(targetDir string, meta *Manifest) (*Manifest, error) {
+	out := &Manifest{
+		TransferID:  meta.TransferID,
+		Root:        meta.Root,
+		Mode:        meta.Mode,
+		LinkMbps:    meta.LinkMbps,
+		Concurrency: meta.Concurrency,
+	}
+	if _, err := os.Stat(targetDir); os.IsNotExist(err) {
+		return out, nil
+	}
+	var id uint64
+	err := filepath.WalkDir(targetDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return walkErr
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(targetDir, path)
+		if err != nil {
+			return err
+		}
+		out.Entries = append(out.Entries, ManifestEntry{
+			ID:    id,
+			Size:  info.Size(),
+			Mtime: info.ModTime().UnixNano(),
+			Mode:  info.Mode(),
+			Path:  filepath.ToSlash(rel),
+		})
+		id++
+		return nil
+	})
+	return out, err
+}
 
 func isKnownCommand(s string) bool {
 	switch s {
 	case "transfer", "start", "status", "get", "sync":
 		return true
 	}
+	return false
+}
+
+func confirmSyncProceed(stderr io.Writer, newCount int, staleCount int, rmCount int) bool {
+	if !syncPromptIsTerminal() {
+		return true
+	}
+
+	defaultYes := rmCount == 0 && (newCount > 0 || staleCount > 0)
+	prompt := "[y/N]"
+	if defaultYes {
+		prompt = "[Y/n]"
+	}
+	fmt.Fprintf(stderr, "proceed? %s: ", prompt)
+
+	scanner := bufio.NewScanner(syncPromptInput)
+	if !scanner.Scan() {
+		fmt.Fprintln(stderr, "aborted")
+		return false
+	}
+	answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	if answer == "" {
+		if defaultYes {
+			return true
+		}
+		fmt.Fprintln(stderr, "aborted")
+		return false
+	}
+	if strings.HasPrefix(answer, "y") {
+		return true
+	}
+	fmt.Fprintln(stderr, "aborted")
 	return false
 }
 
@@ -113,10 +230,6 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	if isKnownCommand(args[0]) {
 		serverURL = defaultFileListener
 		cmdStart = 0
-		// Only log the default address when not requesting help.
-		if !slices.Contains(args, "--help") && !slices.Contains(args, "-h") {
-			fmt.Fprintf(stderr, "connecting to %s\n", serverURL)
-		}
 	} else {
 		if err := validateServerURL(serverURL); err != nil {
 			fmt.Fprintf(stderr, "invalid server-url: %v\n", err)
@@ -170,15 +283,16 @@ func validateServerURL(raw string) error {
 }
 
 func printCLIUsage(w io.Writer) {
-	fmt.Fprintf(w, `usage: pinch filecli [<addr>] <command> [options]
+	fmt.Fprintf(w, `usage: pinch filecli [<addr>] <command> [options] <target-dir>
 
 Commands:
-  transfer   Create a file transfer and emit manifest
-  start      Download files from an existing transfer
-  sync       Incremental sync using an existing manifest
+  transfer   Create a file transfer manifest for <target-dir>
+  start      Download files to <target-dir> (via staging)
+  sync       Incremental sync <target-dir> until converged
   status     Query transfer status
   get        Download a single file from a transfer
 
+State is stored in <target-dir>/../.pinch/ (manifest, progress, staging).
 Default server address: %s
 Run 'pinch filecli <command> --help' for command-specific options.
 `, defaultFileListener)
@@ -226,11 +340,10 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	cf := newCLIFlags("transfer")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli transfer -s <dir> [-o <manifest>] [--encrypt age] [--load-strategy fast|gentle] [-v]")
+		fmt.Fprintln(stderr, "usage: pinch filecli transfer -s <dir> [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
 	var sourceDir string
-	var manifestOut string
 	var encryptMode string
 	var loadStrategyRaw string
 	var probeBytesRaw string
@@ -238,7 +351,6 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	var maxChunk int
 	var deadlineRaw string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory to transfer")
-	cf.StringVar(&manifestOut, "o", "", "", "output path for saved manifest")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
 	cf.StringVar(&loadStrategyRaw, "", "load-strategy", LoadStrategyFast, "server load strategy (fast|gentle)")
 	probeBytesRaw = encoding.HumanBytes(defaultCLIProbeBytes)
@@ -255,6 +367,20 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	if sourceDir == "" {
 		fmt.Fprintln(stderr, "transfer requires --source-directory (or -s)")
 		return 2
+	}
+	if cf.NArg() != 1 {
+		fmt.Fprintln(stderr, "transfer requires exactly one positional argument: <target-dir>")
+		return 2
+	}
+	ps, err := newPinchState(cf.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
+		return 2
+	}
+	// Wipe all previous state so every transfer starts clean.
+	if err := os.RemoveAll(ps.StateDir); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(stderr, "remove state directory failed: %v\n", err)
+		return 1
 	}
 	if maxChunk < 0 {
 		fmt.Fprintln(stderr, "--max-manifest-chunk-size must be >= 0")
@@ -293,6 +419,8 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		deadlineMS = d.Milliseconds()
 	}
 
+	fmt.Fprintf(stderr, "transfer(addr=[%s], source=[%s])\n", serverURL, sourceDir)
+
 	client := NewClient(serverURL, WithLoadStrategy(loadStrategy))
 	start := time.Now()
 	probeResult, err := client.ProbeLink(context.Background(), ProbeRequest{
@@ -308,7 +436,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	}
 	fmt.Fprintf(
 		stdout,
-		"transfer-probe: strategy=%s server_cpu=%d avg_ms=%d est_link=%dMbps concurrency=%d\n",
+		"transfer-probe : strategy=%s server_cpu=%d avg_ms=%d est_link=%dMbps concurrency=%d\n",
 		loadStrategy,
 		probeResult.ServerCPU,
 		probeResult.AvgLatencyMS,
@@ -336,41 +464,25 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	for _, e := range manifest.Entries {
 		total += e.Size
 	}
-	if manifestOut == "" || manifestOut == "-" {
-		manifestBytes, err := MarshalManifest(manifest)
-		if err != nil {
-			fmt.Fprintf(stderr, "encode manifest failed: %v\n", err)
-			return 1
-		}
-		if _, err := stdout.Write(manifestBytes); err != nil {
-			fmt.Fprintf(stderr, "write manifest failed: %v\n", err)
-			return 1
-		}
-		fmt.Fprintf(
-			stderr,
-			"transfer loaded: tid=%s files=%d total_size=%d root=%s elapsed=%s manifest=stdout\n",
-			manifest.TransferID,
-			len(manifest.Entries),
-			total,
-			manifest.Root,
-			time.Since(start).Round(time.Millisecond),
-		)
-		return 0
+	if err := ps.ensureStateDir(); err != nil {
+		fmt.Fprintf(stderr, "create state directory failed: %v\n", err)
+		return 1
 	}
-	if err := SaveManifest(manifestOut, manifest); err != nil {
+	if err := SaveManifest(ps.ServerManifestPath, manifest); err != nil {
 		fmt.Fprintf(stderr, "save manifest failed: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(
 		stdout,
-		"transfer loaded: tid=%s files=%d total_size=%d root=%s elapsed=%s manifest=%s\n",
+		"transfer-loaded: tid[%s] %d files (%s) from [%s] elapsed=%s\n",
 		manifest.TransferID,
 		len(manifest.Entries),
-		total,
+		encoding.HumanBytes(total),
 		manifest.Root,
 		time.Since(start).Round(time.Millisecond),
-		manifestOut,
 	)
+	fmt.Fprintf(stderr, "transfer-state : >(%s)\n", ps.ServerManifestPath)
+
 	return 0
 }
 
@@ -421,13 +533,10 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf := newCLIFlags("get")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli get [--tid <id>] --fd <uint64> [--manifest <path>] [--out-root <dir>] [-o <path|->] [--encrypt age] [-a <size>] [-b <size>] [-v]")
+		fmt.Fprintln(stderr, "usage: pinch filecli get --fd <uint64> [-o <path|->] [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
-	var txferID string
-	var manifestPath string
 	var fileIDRaw string
-	var outRoot string
 	var outFile string
 	var encryptMode string
 	var loadStrategyRaw string
@@ -439,10 +548,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var traceFile string
 	var progressFilePath string
 	var progressIntervalRaw string
-	cf.StringVar(&txferID, "", "tid", "", "transfer id")
-	cf.StringVar(&manifestPath, "", "manifest", "", "path to manifest file (default: <tid>.fm2)")
 	cf.StringVar(&fileIDRaw, "", "fd", "", "file id to download")
-	cf.StringVar(&outRoot, "", "out-root", ".", "output root")
 	cf.StringVar(&outFile, "o", "", "", "output file path, or '-' for stdout")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
 	cf.StringVar(&loadStrategyRaw, "", "load-strategy", LoadStrategyFast, "server load strategy (fast|gentle)")
@@ -465,6 +571,15 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	defer stopTracing()
 	if fileIDRaw == "" {
 		fmt.Fprintln(stderr, "get requires --fd")
+		return 2
+	}
+	if cf.NArg() != 1 {
+		fmt.Fprintln(stderr, "get requires exactly one positional argument: <target-dir>")
+		return 2
+	}
+	ps, err := newPinchState(cf.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 2
 	}
 	progressInterval, err := time.ParseDuration(progressIntervalRaw)
@@ -510,14 +625,20 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "invalid --fd: %v\n", err)
 		return 2
 	}
-	manifest, resolvedManifestPath, resolvedTxferID, err := loadManifestForGet(txferID, manifestPath)
+	outRoot := ps.TargetDir
+	// get prefers the client-state manifest; falls back to the server manifest
+	// so it can be used right after transfer before start has run.
+	manifestFile := ps.ManifestPath
+	if _, err := os.Stat(manifestFile); os.IsNotExist(err) {
+		manifestFile = ps.ServerManifestPath
+	}
+	fmt.Fprintf(stderr, "state: %s\n", manifestFile)
+	manifest, err := LoadManifest(manifestFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
 		return 1
 	}
-	txferID = resolvedTxferID
-	progressPath := resolvedManifestPath + ".progress"
-	progressState, err := loadProgressState(progressPath)
+	progressState, err := loadProgressState(ps.ProgressPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
 		return 1
@@ -535,7 +656,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 			onProgressUpdate(update)
 		}
 	}
-	stopProgress, markMetadataDonePersisted := startProgressWriter(progressPath, progressState, progressUpdates, forwardProgress, stderr)
+	stopProgress, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, progressState, progressUpdates, forwardProgress, stderr)
 	markMetadataDone := func(fileID uint64) {
 		markManifestEntryMetadataDone(manifest, fileID)
 		markMetadataDonePersisted(fileID)
@@ -623,13 +744,10 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf := newCLIFlags("sync")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli sync -s <dir> --manifest <path> [--out-root <dir>] [-o <manifest-out>] [-y] [--delete] [--encrypt age] [--comp adapt|none|lz4|zstd] [--concurrency N] [-a <size>] [-b <size>] [-v]")
+		fmt.Fprintln(stderr, "usage: pinch filecli sync [-s <dir>] [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
 	var sourceDir string
-	var manifestPath string
-	var manifestOut string
-	var outRoot string
 	var encryptMode string
 	var concurrency int
 	var ackEveryRaw string
@@ -638,15 +756,11 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var noSync bool
 	var verbose bool
 	var yes bool
-	var deleteRemoved bool
 	var probeBytesRaw string
 	var traceFile string
 	var progressFilePath string
 	var progressIntervalRaw string
-	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory on server")
-	cf.StringVar(&manifestPath, "", "manifest", "", "path to existing manifest file (required)")
-	cf.StringVar(&manifestOut, "o", "", "", "output path for updated manifest (default: overwrite --manifest)")
-	cf.StringVar(&outRoot, "", "out-root", ".", "local output root directory")
+	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory on server (default: manifest root)")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
 	cf.StringVar(&compRaw, "", "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "parallel download workers (0=manifest default)")
@@ -656,7 +770,6 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks")
 	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size")
 	cf.BoolVar(&noSync, "", "no-sync", false, "ack without fdatasync")
-	cf.BoolVar(&deleteRemoved, "", "delete", false, "delete local files removed on server")
 	probeBytesRaw = encoding.HumanBytes(defaultCLIProbeBytes)
 	cf.StringVar(&probeBytesRaw, "", "probe-bytes", probeBytesRaw, "probe payload size")
 	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
@@ -670,17 +783,16 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	}
 	stopTracing := startTracing(traceFile, stderr)
 	defer stopTracing()
-	if sourceDir == "" {
-		fmt.Fprintln(stderr, "sync requires --source-directory (or -s)")
+	if cf.NArg() != 1 {
+		fmt.Fprintln(stderr, "sync requires exactly one positional argument: <target-dir>")
 		return 2
 	}
-	if manifestPath == "" {
-		fmt.Fprintln(stderr, "sync requires --manifest")
+	ps, err := newPinchState(cf.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 2
 	}
-	if manifestOut == "" {
-		manifestOut = manifestPath
-	}
+	fmt.Fprintf(stderr, "state: %s (target: %s)\n", ps.ManifestPath, ps.TargetDir)
 	progressInterval, err := time.ParseDuration(progressIntervalRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --progress-path-interval: %v\n", err)
@@ -722,299 +834,308 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		return 2
 	}
 
-	// Load old manifest and progress.
-	oldManifest, err := LoadManifest(manifestPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
-		return 1
+	outRoot := ps.TargetDir
+
+	// Load server manifest once for metadata (Root, Mode, Concurrency, etc.).
+	serverManifest, serverManifestErr := LoadManifest(ps.ServerManifestPath)
+	if serverManifestErr != nil {
+		if sourceDir == "" {
+			fmt.Fprintf(stderr, "load server manifest failed (run transfer first, or provide -s): %v\n", serverManifestErr)
+			return 1
+		}
+		// No server manifest yet; use minimal defaults and rely on -s.
+		serverManifest = &Manifest{Mode: LoadStrategyFast, Concurrency: 48, LinkMbps: 1000}
 	}
-	loadStrategy, err := resolveLoadStrategy(oldManifest.Mode)
+
+	syncSourceDir := sourceDir
+	if syncSourceDir == "" {
+		syncSourceDir = serverManifest.Root
+	}
+	if syncSourceDir == "" {
+		fmt.Fprintln(stderr, "sync requires --source-directory (or -s) when manifest.server has no root")
+		return 2
+	}
+	loadStrategy, err := resolveLoadStrategy(serverManifest.Mode)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid manifest mode: %v\n", err)
 		return 1
 	}
-	progressPath := manifestPath + ".progress"
-	progressState, err := loadProgressState(progressPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
-		return 1
-	}
-	applyProgressStateToManifest(oldManifest, progressState)
 
-	// Probe link bandwidth.
-	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(comp))
-	probeResult, err := client.ProbeLink(context.Background(), ProbeRequest{
-		Samples:      3,
-		ProbeBytes:   probeBytes,
-		LoadStrategy: loadStrategy,
-		AgePublicKey: agePublicKey,
-		AgeIdentity:  ageIdentity,
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "probe failed: %v\n", err)
-		return 1
-	}
-
-	// SYNC: send old manifest, receive new manifest + removed paths.
-	syncResp, err := client.SyncManifest(context.Background(), SyncManifestRequest{
-		Directory:    sourceDir,
-		OldManifest:  oldManifest,
-		Mode:         loadStrategy,
-		LinkMbps:     probeResult.LinkMbps,
-		Concurrency:  probeResult.SuggestedConcurrency,
-		AgePublicKey: agePublicKey,
-		AgeIdentity:  ageIdentity,
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "sync failed: %v\n", err)
-		return 1
-	}
-	newManifest := syncResp.Manifest
-
-	// Compute delta: new, stale, unchanged, removed.
-	oldByPath := make(map[string]ManifestEntry, len(oldManifest.Entries))
-	for _, e := range oldManifest.Entries {
-		oldByPath[e.Path] = e
-	}
-	var newFiles, staleFiles, unchangedFiles []ManifestEntry
-	var newBytes, staleBytes int64
-	for _, entry := range newManifest.Entries {
-		if old, ok := oldByPath[entry.Path]; ok {
-			if old.Size == entry.Size && old.Mtime == entry.Mtime && old.Mode == entry.Mode {
-				// Unchanged — carry over progress.
-				entry.Progress = old.Progress
-				unchangedFiles = append(unchangedFiles, entry)
-			} else {
-				// Stale — reset progress.
-				staleFiles = append(staleFiles, entry)
-				staleBytes += entry.Size
-			}
-		} else {
-			newFiles = append(newFiles, entry)
-			newBytes += entry.Size
+	for round := 0; round < maxSyncRounds; round++ {
+		// Build local manifest by scanning the target directory (what client has on disk).
+		oldManifest, err := scanLocalDir(ps.TargetDir, serverManifest)
+		if err != nil {
+			fmt.Fprintf(stderr, "scan local directory failed: %v\n", err)
+			return 1
 		}
-	}
-	rmPaths := syncResp.RemovedPaths
 
-	fmt.Fprintf(stdout,
-		"sync-delta: new=%d (%s) stale=%d (%s) unchanged=%d rm=%d link=%dMbps concurrency=%d\n",
-		len(newFiles), encoding.HumanBytes(newBytes),
-		len(staleFiles), encoding.HumanBytes(staleBytes),
-		len(unchangedFiles),
-		len(rmPaths),
-		probeResult.LinkMbps,
-		probeResult.SuggestedConcurrency,
-	)
+		// Probe link bandwidth.
+		client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(comp))
+		probeResult, err := client.ProbeLink(context.Background(), ProbeRequest{
+			Samples:      3,
+			ProbeBytes:   probeBytes,
+			LoadStrategy: loadStrategy,
+			AgePublicKey: agePublicKey,
+			AgeIdentity:  ageIdentity,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "probe failed: %v\n", err)
+			return 1
+		}
 
-	if len(newFiles) == 0 && len(staleFiles) == 0 && len(rmPaths) == 0 {
-		fmt.Fprintln(stdout, "sync: nothing to do")
-		return 0
-	}
+		// SYNC: send old manifest, receive new manifest + removed paths.
+		syncResp, err := client.SyncManifest(context.Background(), SyncManifestRequest{
+			Directory:    syncSourceDir,
+			OldManifest:  oldManifest,
+			Mode:         loadStrategy,
+			LinkMbps:     probeResult.LinkMbps,
+			Concurrency:  probeResult.SuggestedConcurrency,
+			AgePublicKey: agePublicKey,
+			AgeIdentity:  ageIdentity,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "sync failed: %v\n", err)
+			return 1
+		}
+		newManifest := syncResp.Manifest
 
-	// Prompt for confirmation if interactive.
-	if !yes {
-		stat, _ := os.Stdin.Stat()
-		isTerminal := stat != nil && (stat.Mode()&os.ModeCharDevice) != 0
-		if isTerminal {
-			fmt.Fprintf(stderr, "proceed? [y/N]: ")
-			scanner := bufio.NewScanner(os.Stdin)
-			if !scanner.Scan() || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(scanner.Text())), "y") {
-				fmt.Fprintln(stderr, "aborted")
+		// Compute delta: new, stale, unchanged, removed.
+		oldByPath := make(map[string]ManifestEntry, len(oldManifest.Entries))
+		for _, e := range oldManifest.Entries {
+			oldByPath[e.Path] = e
+		}
+		var newFiles, staleFiles, unchangedFiles []ManifestEntry
+		var newBytes, staleBytes int64
+		for _, entry := range newManifest.Entries {
+			if old, ok := oldByPath[entry.Path]; ok {
+				if old.Size == entry.Size && old.Mtime == entry.Mtime && old.Mode == entry.Mode {
+					entry.Progress = old.Progress
+					unchangedFiles = append(unchangedFiles, entry)
+				} else {
+					staleFiles = append(staleFiles, entry)
+					staleBytes += entry.Size
+				}
+			} else {
+				newFiles = append(newFiles, entry)
+				newBytes += entry.Size
+			}
+		}
+		rmPaths := syncResp.RemovedPaths
+
+		fmt.Fprintf(stdout,
+			"sync-delta[%d]: new=%d (%s) stale=%d (%s) unchanged=%d rm=%d link=%dMbps concurrency=%d\n",
+			round,
+			len(newFiles), encoding.HumanBytes(newBytes),
+			len(staleFiles), encoding.HumanBytes(staleBytes),
+			len(unchangedFiles),
+			len(rmPaths),
+			probeResult.LinkMbps,
+			probeResult.SuggestedConcurrency,
+		)
+
+		if len(newFiles) == 0 && len(staleFiles) == 0 && len(rmPaths) == 0 {
+			fmt.Fprintln(stdout, "sync: converged, nothing to do")
+			return 0
+		}
+
+		// Prompt for confirmation on the first round only.
+		if round == 0 && !yes {
+			if !confirmSyncProceed(stderr, len(newFiles), len(staleFiles), len(rmPaths)) {
 				return 0
 			}
 		}
-	}
 
-	// Build merged manifest with new entries, carry progress for unchanged.
-	mergedManifest := &Manifest{
-		TransferID:  newManifest.TransferID,
-		Root:        newManifest.Root,
-		Mode:        newManifest.Mode,
-		LinkMbps:    newManifest.LinkMbps,
-		Concurrency: newManifest.Concurrency,
-		Entries:     newManifest.Entries,
-	}
-	// Apply carried progress to merged manifest entries.
-	for _, uf := range unchangedFiles {
-		for i := range mergedManifest.Entries {
-			if mergedManifest.Entries[i].ID == uf.ID {
-				mergedManifest.Entries[i].Progress = uf.Progress
-				break
+		// Build merged manifest with new entries, carry progress for unchanged.
+		mergedManifest := &Manifest{
+			TransferID:  newManifest.TransferID,
+			Root:        newManifest.Root,
+			Mode:        newManifest.Mode,
+			LinkMbps:    newManifest.LinkMbps,
+			Concurrency: newManifest.Concurrency,
+			Entries:     newManifest.Entries,
+		}
+		for _, uf := range unchangedFiles {
+			for i := range mergedManifest.Entries {
+				if mergedManifest.Entries[i].ID == uf.ID {
+					mergedManifest.Entries[i].Progress = uf.Progress
+					break
+				}
 			}
 		}
-	}
 
-	// Save merged manifest.
-	if err := SaveManifest(manifestOut, mergedManifest); err != nil {
-		fmt.Fprintf(stderr, "save manifest failed: %v\n", err)
-		return 1
-	}
+		// Update server manifest with the latest server state for next round / future commands.
+		if err := SaveManifest(ps.ServerManifestPath, mergedManifest); err != nil {
+			fmt.Fprintf(stderr, "save server manifest failed: %v\n", err)
+			return 1
+		}
+		serverManifest = mergedManifest
 
-	// Delete local files for removed paths (only when --delete is specified).
-	if deleteRemoved {
+		// Always delete removed files to converge.
 		for _, rmPath := range rmPaths {
 			localPath := filepath.Join(outRoot, filepath.FromSlash(rmPath))
 			if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
 				fmt.Fprintf(stderr, "sync: rm %s: %v\n", localPath, err)
 			}
 		}
-	}
-	// Truncate local files for stale entries.
-	for _, entry := range staleFiles {
-		localPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
-		if err := os.Truncate(localPath, 0); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(stderr, "sync: truncate %s: %v\n", localPath, err)
+		// Truncate local files for stale entries.
+		for _, entry := range staleFiles {
+			localPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
+			if err := os.Truncate(localPath, 0); err != nil && !os.IsNotExist(err) {
+				fmt.Fprintf(stderr, "sync: truncate %s: %v\n", localPath, err)
+			}
 		}
-	}
 
-	// Build progress state for merged manifest.
-	mergedProgress := make(map[uint64]ManifestProgress, len(mergedManifest.Entries))
-	for _, e := range mergedManifest.Entries {
-		if e.Progress.AckBytes > 0 || e.Progress.MetadataDone {
-			mergedProgress[e.ID] = e.Progress
+		// Build progress state for merged manifest.
+		mergedProgress := make(map[uint64]ManifestProgress, len(mergedManifest.Entries))
+		for _, e := range mergedManifest.Entries {
+			if e.Progress.AckBytes > 0 || e.Progress.MetadataDone {
+				mergedProgress[e.ID] = e.Progress
+			}
 		}
-	}
 
-	// Download pending entries (new + stale).
-	pendingEntries := make([]ManifestEntry, 0, len(newFiles)+len(staleFiles))
-	for _, entry := range mergedManifest.Entries {
-		if entry.Progress.AckBytes >= entry.Size && entry.Progress.MetadataDone {
+		// Download pending entries (new + stale).
+		pendingEntries := make([]ManifestEntry, 0, len(newFiles)+len(staleFiles))
+		for _, entry := range mergedManifest.Entries {
+			if entry.Progress.AckBytes >= entry.Size && entry.Progress.MetadataDone {
+				continue
+			}
+			pendingEntries = append(pendingEntries, entry)
+		}
+
+		if len(pendingEntries) == 0 {
+			fmt.Fprintln(stdout, "sync: no downloads needed")
 			continue
 		}
-		pendingEntries = append(pendingEntries, entry)
-	}
 
-	if len(pendingEntries) == 0 {
-		fmt.Fprintln(stdout, "sync: no downloads needed")
-		return 0
-	}
-
-	effectiveConcurrency := mergedManifest.Concurrency
-	if concurrencyExplicit {
-		effectiveConcurrency = concurrency
-	}
-
-	progressUpdates := make(chan DownloadProgressUpdate, 1024)
-	var onProgressUpdate func(DownloadProgressUpdate)
-	if verbose {
-		progressReporter := newVerboseProgressReporter(stderr)
-		onProgressUpdate = progressReporter.ReportUpdate
-	}
-	mergedProgressPath := manifestOut + ".progress"
-	forwardProgress := func(update DownloadProgressUpdate) {
-		applyProgressUpdateToManifest(mergedManifest, update)
-		if onProgressUpdate != nil {
-			onProgressUpdate(update)
+		effectiveConcurrency := mergedManifest.Concurrency
+		if concurrencyExplicit {
+			effectiveConcurrency = concurrency
 		}
-	}
-	stopProgress, markMetadataDonePersisted := startProgressWriter(mergedProgressPath, mergedProgress, progressUpdates, forwardProgress, stderr)
-	markMetadataDone := func(fileID uint64) {
-		markManifestEntryMetadataDone(mergedManifest, fileID)
-		markMetadataDonePersisted(fileID)
-	}
-	defer stopProgress()
 
-	var totalCopied atomic.Int64
-	outputWriter := func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
-		destPath := resolveDownloadDestinationPath(entry, outRoot, "")
-		w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, noSync)
-		if err != nil {
-			return nil, nil, err
+		progressUpdates := make(chan DownloadProgressUpdate, 1024)
+		var onProgressUpdate func(DownloadProgressUpdate)
+		if verbose {
+			progressReporter := newVerboseProgressReporter(stderr)
+			onProgressUpdate = progressReporter.ReportUpdate
 		}
-		return &countingWriter{Writer: w, total: &totalCopied}, syncFn, nil
-	}
-
-	startAll := time.Now()
-	var completed int64
-	var totalTransferred int64
-	var failures []error
-	var failuresMu sync.Mutex
-
-	if progressFilePath != "" {
-		var totalBytes int64
-		for _, e := range pendingEntries {
-			totalBytes += e.Size
-		}
-		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), progressFilePath, progressInterval, func() int {
-			if totalBytes <= 0 {
-				return 100
+		forwardProgress := func(update DownloadProgressUpdate) {
+			applyProgressUpdateToManifest(mergedManifest, update)
+			if onProgressUpdate != nil {
+				onProgressUpdate(update)
 			}
-			pct := int(totalCopied.Load() * 100 / totalBytes)
-			if pct > 100 {
-				pct = 100
-			}
-			return pct
-		})
-		defer func() { stopProgressFile(len(failures) == 0) }()
-	}
-	recordFailure := func(err error) {
-		if err == nil {
-			return
 		}
-		failuresMu.Lock()
-		failures = append(failures, err)
-		failuresMu.Unlock()
-	}
+		stopProgress, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, mergedProgress, progressUpdates, forwardProgress, stderr)
+		markMetadataDone := func(fileID uint64) {
+			markManifestEntryMetadataDone(mergedManifest, fileID)
+			markMetadataDonePersisted(fileID)
+		}
 
-	startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
-		Manifest:        mergedManifest,
-		Entries:         pendingEntries,
-		OutputWriter:    outputWriter,
-		AgePublicKey:    agePublicKey,
-		AgeIdentity:     ageIdentity,
-		Concurrency:     effectiveConcurrency,
-		BatchMaxBytes:   batchSize,
-		ProgressUpdates: progressUpdates,
-		OnFileDone: func(evt StartFileDoneEvent) {
-			entry, ok := mergedManifest.EntryByID(evt.File.Meta.FileID)
-			if !ok {
-				recordFailure(fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID))
-				return
-			}
+		var totalCopied atomic.Int64
+		outputWriter := func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
-			if err := applyDownloadedTrailerMetadata(destPath, evt.File.Meta.TrailerMetadata); err != nil {
-				recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
+			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, noSync)
+			if err != nil {
+				return nil, nil, err
+			}
+			return &countingWriter{Writer: w, total: &totalCopied}, syncFn, nil
+		}
+
+		startAll := time.Now()
+		var completed int64
+		var totalTransferred int64
+		var failures []error
+		var failuresMu sync.Mutex
+
+		if progressFilePath != "" {
+			var totalBytes int64
+			for _, e := range pendingEntries {
+				totalBytes += e.Size
+			}
+			stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), progressFilePath, progressInterval, func() int {
+				if totalBytes <= 0 {
+					return 100
+				}
+				pct := int(totalCopied.Load() * 100 / totalBytes)
+				if pct > 100 {
+					pct = 100
+				}
+				return pct
+			})
+			defer func() { stopProgressFile(len(failures) == 0) }()
+		}
+		recordFailure := func(err error) {
+			if err == nil {
 				return
 			}
-			markMetadataDone(evt.File.Meta.FileID)
-			printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
-		},
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "sync download failed: %v\n", err)
-		return 1
-	}
-	completed += int64(startResp.Downloaded)
-	totalTransferred += startResp.TransferredBytes
-	for _, startErr := range startResp.Errors {
-		recordFailure(startErr)
+			failuresMu.Lock()
+			failures = append(failures, err)
+			failuresMu.Unlock()
+		}
+
+		startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
+			Manifest:        mergedManifest,
+			Entries:         pendingEntries,
+			OutputWriter:    outputWriter,
+			AgePublicKey:    agePublicKey,
+			AgeIdentity:     ageIdentity,
+			Concurrency:     effectiveConcurrency,
+			BatchMaxBytes:   batchSize,
+			ProgressUpdates: progressUpdates,
+			OnFileDone: func(evt StartFileDoneEvent) {
+				entry, ok := mergedManifest.EntryByID(evt.File.Meta.FileID)
+				if !ok {
+					recordFailure(fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID))
+					return
+				}
+				destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+				if err := applyDownloadedTrailerMetadata(destPath, evt.File.Meta.TrailerMetadata); err != nil {
+					recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
+					return
+				}
+				markMetadataDone(evt.File.Meta.FileID)
+				printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
+			},
+		})
+		stopProgress()
+		if err != nil {
+			fmt.Fprintf(stderr, "sync download failed: %v\n", err)
+			return 1
+		}
+		completed += int64(startResp.Downloaded)
+		totalTransferred += startResp.TransferredBytes
+		for _, startErr := range startResp.Errors {
+			recordFailure(startErr)
+		}
+
+		failuresMu.Lock()
+		finalFailures := append([]error(nil), failures...)
+		failuresMu.Unlock()
+		for _, err := range finalFailures {
+			fmt.Fprintf(stderr, "sync error: %v\n", err)
+		}
+
+		elapsedAll := time.Since(startAll)
+		overallSpeed := 0.0
+		if elapsedAll > 0 {
+			overallSpeed = float64(totalTransferred) / elapsedAll.Seconds()
+		}
+		fmt.Fprintf(stdout,
+			"sync complete[%d]: tid=%s downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
+			round,
+			mergedManifest.TransferID,
+			completed,
+			len(finalFailures),
+			encoding.HumanBytes(totalTransferred),
+			encoding.HumanRate(overallSpeed),
+			elapsedAll.Round(time.Millisecond),
+		)
+		if len(finalFailures) > 0 {
+			return 1
+		}
 	}
 
-	failuresMu.Lock()
-	finalFailures := append([]error(nil), failures...)
-	failuresMu.Unlock()
-	for _, err := range finalFailures {
-		fmt.Fprintf(stderr, "sync error: %v\n", err)
-	}
-
-	elapsedAll := time.Since(startAll)
-	overallSpeed := 0.0
-	if elapsedAll > 0 {
-		overallSpeed = float64(totalTransferred) / elapsedAll.Seconds()
-	}
-	fmt.Fprintf(stdout,
-		"sync complete: tid=%s downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
-		mergedManifest.TransferID,
-		completed,
-		len(finalFailures),
-		encoding.HumanBytes(totalTransferred),
-		encoding.HumanRate(overallSpeed),
-		elapsedAll.Round(time.Millisecond),
-	)
-	if len(finalFailures) > 0 {
-		return 1
-	}
-	return 0
+	fmt.Fprintf(stderr, "sync: failed to converge after %d rounds\n", maxSyncRounds)
+	return 1
 }
 
 func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -1025,12 +1146,9 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf := newCLIFlags("start")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli start [--tid <id>] [--manifest <path>] [--out-root <dir>] [--encrypt age] [--concurrency N] [-a <size>] [-b <size>] [--no-sync] [-v]")
+		fmt.Fprintln(stderr, "usage: pinch filecli start [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
-	var txferID string
-	var manifestPath string
-	var outRoot string
 	var encryptMode string
 	var concurrency int
 	var ackEveryRaw string
@@ -1040,16 +1158,15 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var verbose bool
 	var progress bool
 	var perFile bool
+	var discard bool
 	var deadlineRaw string
 	var progressFilePath string
 	var progressIntervalRaw string
-	cf.StringVar(&txferID, "", "tid", "", "transfer id")
-	cf.StringVar(&manifestPath, "", "manifest", "", "path to manifest file (default: <tid>.fm2)")
-	cf.StringVar(&outRoot, "", "out-root", ".", "output root")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
 	cf.BoolVar(&verbose, "v", "verbose", false, "verbose progress output")
-	cf.BoolVar(&progress, "", "progress", false, "show transfer progress every 2s")
+	cf.BoolVar(&progress, "", "progress", true, "show transfer progress every 2s")
 	cf.BoolVar(&perFile, "", "per-file", false, "per-file progress (implies --progress)")
+	cf.BoolVar(&discard, "", "discard", false, "discard downloaded file contents instead of writing to the target directory")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "parallel download workers (0=manifest default)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks")
@@ -1069,6 +1186,16 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	stopTracing := startTracing(traceFile, stderr)
 	defer stopTracing()
+	if cf.NArg() != 1 {
+		fmt.Fprintln(stderr, "start requires exactly one positional argument: <target-dir>")
+		return 2
+	}
+	ps, err := newPinchState(cf.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
+		return 2
+	}
+	fmt.Fprintf(stderr, "state: %s -> %s\n", ps.ServerManifestPath, ps.TargetDir)
 	progressInterval, err := time.ParseDuration(progressIntervalRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --progress-path-interval: %v\n", err)
@@ -1128,7 +1255,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
 	}
-	manifest, resolvedManifestPath, resolvedTxferID, err := loadManifestForStart(txferID, manifestPath)
+	manifest, err := LoadManifest(ps.ServerManifestPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
 		return 1
@@ -1152,9 +1279,18 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	if concurrencyExplicit {
 		effectiveConcurrency = concurrency
 	}
-	txferID = resolvedTxferID
-	progressPath := resolvedManifestPath + ".progress"
-	progressState, err := loadProgressState(progressPath)
+	txferID := manifest.TransferID
+	outRoot := ps.StagingDir
+	if discard {
+		outRoot = os.DevNull
+	} else {
+		// Downloads go to .pinch/remote/ staging directory.
+		if err := ps.ensureStagingDir(); err != nil {
+			fmt.Fprintf(stderr, "create staging directory failed: %v\n", err)
+			return 1
+		}
+	}
+	progressState, err := loadProgressState(ps.ProgressPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
 		return 1
@@ -1176,12 +1312,17 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 			onStartProgressUpdate(update)
 		}
 	}
-	stopProgress, markMetadataDonePersisted := startProgressWriter(progressPath, progressState, progressUpdates, forwardProgress, stderr)
+	stopProgress, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, progressState, progressUpdates, forwardProgress, stderr)
 	markMetadataDone := func(fileID uint64) {
 		markManifestEntryMetadataDone(manifest, fileID)
 		markMetadataDonePersisted(fileID)
 	}
-	defer stopProgress()
+	progressStopped := false
+	defer func() {
+		if !progressStopped {
+			stopProgress()
+		}
+	}()
 	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(comp))
 	serverSendBufBytes := int64(utils.MaxSocketWriteBufferBytes())
 	if miniProbe, err := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); err == nil && miniProbe.ServerSendBufBytes > 0 {
@@ -1295,6 +1436,8 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	for _, startErr := range startResp.Errors {
 		recordFailure(startErr)
 	}
+	stopProgress()
+	progressStopped = true
 	failuresMu.Lock()
 	finalFailures := append([]error(nil), failures...)
 	failuresMu.Unlock()
@@ -1309,7 +1452,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	fmt.Fprintf(
 		stdout,
-		"start complete: tid=%s requested=%d downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
+		"start-complete: tid=%s requested=%d downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
 		txferID,
 		len(manifest.Entries),
 		completed,
@@ -1319,6 +1462,28 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		elapsedAll.Round(time.Millisecond),
 	)
 	if len(finalFailures) > 0 {
+		return 1
+	}
+	if discard {
+		if err := os.Remove(ps.ProgressPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "remove progress state failed: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	// Atomic swap: replace target directory with staging directory.
+	if err := os.RemoveAll(ps.TargetDir); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(stderr, "remove old target directory failed: %v\n", err)
+		return 1
+	}
+	if err := os.Rename(ps.StagingDir, ps.TargetDir); err != nil {
+		fmt.Fprintf(stderr, "rename staging to target failed: %v\n", err)
+		return 1
+	}
+	// Record what's now on disk so sync can compute correct deltas.
+	if err := SaveManifest(ps.ManifestPath, manifest); err != nil {
+		fmt.Fprintf(stderr, "save local manifest failed: %v\n", err)
 		return 1
 	}
 	return 0
@@ -1397,11 +1562,12 @@ func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer)
 				}
 				fmt.Fprintf(
 					stderr,
-					"transfer-progress: files=%d/%d (%.1f%%) bytes=%s/%s (%.1f%%) rate=%s%s\n",
-					s.Done, s.NumFiles, s.PercentFiles,
-					encoding.HumanBytes(s.DoneSize), encoding.HumanBytes(s.TotalSize), s.PercentBytes,
-					encoding.HumanRate(rateBps),
-					etaPart,
+					"transfer-progress:[%6s/%6s](%5.1f%%) bytes=[%8s/%8s](%5.1f%%) rate=%6s%s\n",
+					encoding.HumanCount(s.Done, 6), encoding.HumanCount(uint64(s.NumFiles), 6),
+					s.PercentFiles,
+					encoding.HumanBytes(s.DoneSize), encoding.HumanBytes(s.TotalSize),
+					s.PercentBytes,
+					encoding.HumanRate(rateBps), etaPart,
 				)
 			}
 			select {
@@ -1563,34 +1729,6 @@ func markManifestEntryMetadataDone(manifest *Manifest, fileID uint64) {
 			return
 		}
 	}
-}
-
-func loadManifestForStart(txferID string, manifestPath string) (*Manifest, string, string, error) {
-	return loadManifestWithOptionalTID("start", txferID, manifestPath)
-}
-
-func loadManifestForGet(txferID string, manifestPath string) (*Manifest, string, string, error) {
-	return loadManifestWithOptionalTID("get", txferID, manifestPath)
-}
-
-func loadManifestWithOptionalTID(cmd string, txferID string, manifestPath string) (*Manifest, string, string, error) {
-	if manifestPath == "" {
-		if txferID == "" {
-			return nil, "", "", fmt.Errorf("%s requires --manifest when --tid is not provided", cmd)
-		}
-		manifestPath = txferID + ".fm2"
-	}
-	manifest, err := LoadManifest(manifestPath)
-	if err != nil {
-		return nil, "", "", err
-	}
-	if txferID == "" {
-		txferID = manifest.TransferID
-	}
-	if manifest.TransferID != txferID {
-		return nil, "", "", fmt.Errorf("manifest transfer id mismatch: expected %s got %s", txferID, manifest.TransferID)
-	}
-	return manifest, manifestPath, txferID, nil
 }
 
 func loadProgressState(progressPath string) (map[uint64]ManifestProgress, error) {
@@ -1794,10 +1932,7 @@ func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest 
 	}
 	destPath := outFile
 	if destPath == "" {
-		if outRoot == "" {
-			outRoot = "."
-		}
-		destPath = filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
+		destPath = resolveDownloadDestinationPath(entry, outRoot, "")
 	}
 	if destPath == "-" {
 		return nil
@@ -1954,6 +2089,12 @@ func applyTrailerMetadataToPath(path string, meta *FileTrailerMetadata) error {
 		}
 		if err := fd.Chmod(os.FileMode(modeBits)); err != nil {
 			return fmt.Errorf("chmod destination to %s: %w", modeRaw, err)
+		}
+	}
+	if meta.MtimeNS > 0 {
+		mtime := time.Unix(0, meta.MtimeNS)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			return fmt.Errorf("set destination mtime to %d: %w", meta.MtimeNS, err)
 		}
 	}
 	uidRaw := strings.TrimSpace(meta.UID)

@@ -263,6 +263,38 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 	compressPolicy := policy.NewCompressionPolicy()
 	windowHasher := xxh3.New128()
 
+	// Zero-byte files: emit one terminal frame with no payload so the client
+	// always receives a frame stream rather than a bare OK response.
+	if windowLen == 0 {
+		md := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
+		zeroArgs := frameStreamArgs{
+			Ctx:          ctx,
+			FileID:       item.FileID,
+			Offset:       0,
+			FrameSize:    0,
+			Comp:         "none",
+			Mode:         item.Mode,
+			HeaderTS:     time.Now().UnixMilli(),
+			Next:         0,
+			IsTerminal:   true,
+			TerminalMD:   &md,
+			WindowHasher: windowHasher,
+			Output:       out,
+		}
+		if err := writeFrameHeader(out, zeroArgs, 0, nil); err != nil {
+			return err
+		}
+		windowHashToken, err := writeFrameTrailer(out, zeroArgs, nil)
+		if err != nil {
+			return err
+		}
+		if !deps.SetTransferFileWindowHash(txferID, item.FileID, 0, windowHashToken) {
+			return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
+		}
+		_ = deps.SetTransferFileState(txferID, item.FileID, TransferStateDone)
+		return nil
+	}
+
 	for remaining := windowLen; remaining > 0; {
 		frameSize := min(remaining, defaultFileFrameLogicalSize)
 		nextOffset := cursor + frameSize
