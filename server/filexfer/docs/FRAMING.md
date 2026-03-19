@@ -213,7 +213,7 @@ Commands:
 - `TXFER <path> [verbose=<0|1>] [max-manifest-chunk-size=<n>]`
 - `SEND <txferid> [comp=<mode>] <fid> <offset> <size> <path> ...`
 - `ACK <txferid> <fid> <ack-token> <delta-bytes> <recv-ms> <sync-ms> <path>`
-- `CXSUM <txferid> <fid> <window-size> <checksums_csv> <path>`
+- `CXSUM <txferid> fd=<fid> <path> [offset=<n>] [size=<n>] [algo=xxh128|xxh64] ...`
 - `STATUS <txferid>`
 
 Path/blob args are encoded as quoted strings or length-prefixed tokens (`<len>:<bytes>`).
@@ -284,19 +284,21 @@ status line:
 3. `FXT/1` trailer line
 4. terminal status line (`OK` or `ERR ...`)
 
-The response emits one frame per checksum window and flushes after every frame when possible.
+The response emits one frame per requested checksum range and flushes after every frame when possible.
 
 Command arguments:
 
-- `<path>` (required; quoted or `<len>:<bytes>`)
-- `<window-size>` (optional behavior via caller value, commonly `min(64 MiB, file_size)`)
-- `<checksums_csv>` (comma-separated)
-  - supported: `none`, `xxh128`, `xxh64`
+- `fd=<fid>` starts a checksum item and may repeat.
+- `<path>` is required for each item and may be quoted or `<len>:<bytes>`.
+- `offset=<n>` is optional and defaults to `0`.
+- `size=<n>` is optional and defaults to EOF.
+- `algo=<name>` is optional.
+  - supported: `xxh128`, `xxh64`
   - default: `xxh128`
 
 Checksum trailer semantics:
 
-- Per-window frames include repeated `file-hash=<algo>:<value>` tokens as rolling cumulative checksum snapshots.
-- Terminal frame (`next=0`) includes final `file-hash=<algo>:<value>` values.
+- Each requested range produces exactly one terminal frame (`next=0`).
+- `file-hash=<algo>:<value>` is the checksum token for that requested range, not a rolling cumulative checksum.
 - Every frame still includes `hash=xxh64:<hex16>` as frame integrity checksum.
-- Terminal frame includes the same metadata tokens as `SEND`.
+- Every checksum frame may include the same metadata tokens as `SEND`; current implementation includes them on terminal checksum frames.

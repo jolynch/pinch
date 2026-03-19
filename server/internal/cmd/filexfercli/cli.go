@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"github.com/jolynch/pinch/internal/filexfer"
 	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/jolynch/pinch/utils"
+	"github.com/zeebo/xxh3"
 )
 
 func startTracing(path string, stderr io.Writer) (stop func()) {
@@ -54,6 +56,8 @@ const defaultVerboseStatusInterval = 10 * time.Second
 const defaultCLIAckEveryBytes int64 = 128 * 1024 * 1024
 const defaultVerboseProgressInterval = 2 * time.Second
 const defaultCLIProbeBytes int64 = 1 * 1024 * 1024
+const defaultVerifySampleFrameSize int64 = 8 * 1024 * 1024
+const verifySampleBytes int64 = 8
 
 var syncPromptInput io.Reader = os.Stdin
 
@@ -174,7 +178,7 @@ func scanLocalDir(targetDir string, meta *Manifest) (*Manifest, error) {
 
 func isKnownCommand(s string) bool {
 	switch s {
-	case "transfer", "start", "status", "get", "sync":
+	case "copy", "transfer", "start", "status", "get", "sync":
 		return true
 	}
 	return false
@@ -247,16 +251,12 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	cmdArgs := args[cmdStart+1:]
 
 	switch cmd {
-	case "transfer":
-		return runTransferCLI(serverURL, cmdArgs, stdout, stderr)
-	case "start":
-		return runStartCLI(serverURL, cmdArgs, stdout, stderr)
+	case "copy":
+		return runCopyCLI(serverURL, cmdArgs, stdout, stderr)
 	case "status":
 		return runStatusCLI(serverURL, cmdArgs, stdout, stderr)
 	case "get":
 		return runGetCLI(serverURL, cmdArgs, stdout, stderr)
-	case "sync":
-		return runSyncCLI(serverURL, cmdArgs, stdout, stderr)
 	case "--help", "-h", "help":
 		printCLIUsage(stderr)
 		return 0
@@ -283,16 +283,14 @@ func validateServerURL(raw string) error {
 }
 
 func printCLIUsage(w io.Writer) {
-	fmt.Fprintf(w, `usage: pinch filecli [<addr>] <command> [options] <target-dir>
+	fmt.Fprintf(w, `usage: pinch filecli [<addr>] <command> [options]
 
 Commands:
-  transfer   Create a file transfer manifest for <target-dir>
-  start      Download files to <target-dir> (via staging)
-  sync       Incremental sync <target-dir> until converged
+  copy       Copy REMOTE_SRC to LOCAL_DST
   status     Query transfer status
   get        Download a single file from a transfer
 
-State is stored in <target-dir>/../.pinch/ (manifest, progress, staging).
+State is stored in <local-dst>/../.pinch/ (manifest, progress, staging).
 Default server address: %s
 Run 'pinch filecli <command> --help' for command-specific options.
 `, defaultFileListener)
@@ -334,6 +332,569 @@ func resolveComp(raw string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported --comp value %q (supported: adapt, none, lz4, zstd)", raw)
 	}
+}
+
+type copyCLIConfig struct {
+	remoteSrc           string
+	localDst            string
+	encryptMode         string
+	compRaw             string
+	concurrency         int
+	ackEveryRaw         string
+	batchSizeRaw        string
+	probeBytesRaw       string
+	deadlineRaw         string
+	traceFile           string
+	progressFilePath    string
+	progressIntervalRaw string
+	clean               bool
+	skipFetch           bool
+	skipWrite           bool
+	skipFsync           bool
+	verifyMeta          bool
+	verifyDataSamplePct int
+	verbose             bool
+	progress            bool
+	perFile             bool
+	yes                 bool
+}
+
+func appendOptionalFlag(args []string, name string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return args
+	}
+	return append(args, name, value)
+}
+
+func appendBoolFlag(args []string, enabled bool, name string) []string {
+	if !enabled {
+		return args
+	}
+	return append(args, name)
+}
+
+func appendBoolValueFlag(args []string, name string, value bool) []string {
+	return append(args, fmt.Sprintf("%s=%t", name, value))
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func cleanupCopyState(targetDir string, stderr io.Writer) int {
+	ps, err := newPinchState(targetDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
+		return 1
+	}
+	if err := os.RemoveAll(ps.StateDir); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(stderr, "remove state directory failed: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
+	cf := newCLIFlags("copy")
+	cf.SetOutput(stderr)
+	cf.fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: pinch filecli copy [flags] REMOTE_SRC LOCAL_DST")
+		fmt.Fprintln(stderr)
+		fmt.Fprintln(stderr, "Copy REMOTE_SRC from the server to LOCAL_DST on the local machine.")
+		fmt.Fprintln(stderr)
+		fmt.Fprintln(stderr, "Behavior:")
+		fmt.Fprintln(stderr, "  - If LOCAL_DST does not exist: transfer + start")
+		fmt.Fprintln(stderr, "  - If LOCAL_DST exists: transfer + sync")
+		fmt.Fprintln(stderr, "  - --clean removes LOCAL_DST first and forces a clean transfer")
+		fmt.Fprintln(stderr, "  - --skip-fetch fetches and writes manifest state only; no start/sync")
+		fmt.Fprintln(stderr, "  - --skip-write fetches bodies to a discard sink and never mutates LOCAL_DST")
+		fmt.Fprintln(stderr, "  - --verify-meta reruns read-only metadata verification after copy")
+		fmt.Fprintln(stderr, "  - --verify-data-sample=N implies --verify-meta and verifies random data samples")
+		fmt.Fprintln(stderr)
+		cf.PrintDefaults(stderr)
+	}
+	cfg := copyCLIConfig{
+		ackEveryRaw:         encoding.HumanBytes(defaultCLIAckEveryBytes),
+		batchSizeRaw:        encoding.HumanBytes(defaultCLIAckEveryBytes),
+		probeBytesRaw:       encoding.HumanBytes(defaultCLIProbeBytes),
+		progressIntervalRaw: "1s",
+		progress:            true,
+	}
+	cf.BoolVar(&cfg.clean, "", "clean", false, "removeAll LOCAL_DST first, then force a clean transfer")
+	cf.BoolVar(&cfg.skipFetch, "", "skip-fetch", false, "fetch and persist remote manifest state only; do not start or sync files")
+	cf.BoolVar(&cfg.skipWrite, "", "skip-write", false, "do not mutate LOCAL_DST; fetch file bodies to discard instead of writing them")
+	cf.BoolVar(&cfg.skipFsync, "", "skip-fsync", false, "acknowledge writes without fdatasync")
+	cf.BoolVar(&cfg.verifyMeta, "", "verify-meta", false, "run read-only metadata verification after copy; with --skip-fetch this is allowed only if LOCAL_DST already exists")
+	cf.IntVar(&cfg.verifyDataSamplePct, "", "verify-data-sample", 0, "percent of frame slots to sample per file for data verification (0-100); implies --verify-meta; not allowed with --skip-fetch or --skip-write")
+	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "response encryption mode (supported: age)")
+	cf.StringVar(&cfg.compRaw, "", "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
+	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "parallel download / verification workers (0=manifest default)")
+	cf.BoolVar(&cfg.verbose, "v", "verbose", false, "verbose progress output")
+	cf.BoolVar(&cfg.yes, "y", "yes", false, "skip confirmation prompt on sync paths")
+	cf.BoolVar(&cfg.progress, "", "progress", true, "show transfer progress every 2s")
+	cf.BoolVar(&cfg.perFile, "", "per-file", false, "per-file progress (implies --progress)")
+	cf.StringVar(&cfg.ackEveryRaw, "a", "ack-every", cfg.ackEveryRaw, "bytes between progress acks")
+	cf.StringVar(&cfg.batchSizeRaw, "b", "batch-size", cfg.batchSizeRaw, "parallel batch size / unit of work per concurrent request")
+	cf.StringVar(&cfg.probeBytesRaw, "", "probe-bytes", cfg.probeBytesRaw, "probe payload size")
+	cf.StringVar(&cfg.deadlineRaw, "", "deadline", "", "transfer deadline (e.g. 60s, 5m)")
+	cf.StringVar(&cfg.traceFile, "", "trace", "", "write runtime/trace output to this file")
+	cf.StringVar(&cfg.progressFilePath, "", "progress-path", "", "write integer % to this file/pipe")
+	cf.StringVar(&cfg.progressIntervalRaw, "", "progress-path-interval", cfg.progressIntervalRaw, "progress write interval (e.g. 500ms, 10s)")
+	if err := cf.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if cf.NArg() != 2 {
+		fmt.Fprintln(stderr, "copy requires exactly two positional arguments: REMOTE_SRC LOCAL_DST")
+		return 2
+	}
+	cfg.remoteSrc = cf.Arg(0)
+	cfg.localDst = cf.Arg(1)
+	if !filepath.IsAbs(cfg.remoteSrc) {
+		fmt.Fprintln(stderr, "copy requires REMOTE_SRC to be an absolute server path")
+		return 2
+	}
+	if cfg.verifyDataSamplePct < 0 || cfg.verifyDataSamplePct > 100 {
+		fmt.Fprintln(stderr, "--verify-data-sample must be between 0 and 100")
+		return 2
+	}
+	if cfg.verifyDataSamplePct > 0 {
+		cfg.verifyMeta = true
+	}
+	if cfg.verifyDataSamplePct > 0 && (cfg.skipFetch || cfg.skipWrite) {
+		fmt.Fprintln(stderr, "--verify-data-sample cannot be used with --skip-fetch or --skip-write")
+		return 2
+	}
+	if cfg.verifyMeta && cfg.skipWrite {
+		fmt.Fprintln(stderr, "--verify-meta cannot be used with --skip-write")
+		return 2
+	}
+
+	localExists := pathExists(cfg.localDst)
+	if cfg.verifyMeta && cfg.skipFetch && !localExists {
+		fmt.Fprintln(stderr, "--verify-meta with --skip-fetch requires an existing LOCAL_DST")
+		return 2
+	}
+	if cfg.clean && !cfg.skipFetch {
+		if err := os.RemoveAll(cfg.localDst); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "remove local destination failed: %v\n", err)
+			return 1
+		}
+		localExists = false
+	}
+
+	transferArgs := []string{"-s", cfg.remoteSrc}
+	transferArgs = appendOptionalFlag(transferArgs, "--encrypt", cfg.encryptMode)
+	transferArgs = appendOptionalFlag(transferArgs, "--probe-bytes", cfg.probeBytesRaw)
+	transferArgs = appendOptionalFlag(transferArgs, "--deadline", cfg.deadlineRaw)
+	transferArgs = append(transferArgs, cfg.localDst)
+	if code := runTransferCLI(serverURL, transferArgs, stdout, stderr); code != 0 {
+		return code
+	}
+
+	if cfg.skipFetch {
+		if cfg.verifyMeta {
+			return verifyCopy(serverURL, cfg, stdout, stderr)
+		}
+		return 0
+	}
+
+	if localExists {
+		syncArgs := make([]string, 0, 32)
+		syncArgs = appendOptionalFlag(syncArgs, "--encrypt", cfg.encryptMode)
+		syncArgs = appendOptionalFlag(syncArgs, "--comp", cfg.compRaw)
+		if cfg.concurrency > 0 {
+			syncArgs = append(syncArgs, "--concurrency", strconv.Itoa(cfg.concurrency))
+		}
+		syncArgs = appendBoolFlag(syncArgs, cfg.verbose, "--verbose")
+		syncArgs = appendBoolFlag(syncArgs, cfg.yes, "--yes")
+		syncArgs = appendOptionalFlag(syncArgs, "--ack-every", cfg.ackEveryRaw)
+		syncArgs = appendOptionalFlag(syncArgs, "--batch-size", cfg.batchSizeRaw)
+		syncArgs = appendBoolFlag(syncArgs, cfg.skipFsync, "--skip-fsync")
+		syncArgs = appendBoolFlag(syncArgs, cfg.skipWrite, "--skip-write")
+		syncArgs = appendOptionalFlag(syncArgs, "--probe-bytes", cfg.probeBytesRaw)
+		syncArgs = appendOptionalFlag(syncArgs, "--trace", cfg.traceFile)
+		syncArgs = appendOptionalFlag(syncArgs, "--progress-path", cfg.progressFilePath)
+		syncArgs = appendOptionalFlag(syncArgs, "--progress-path-interval", cfg.progressIntervalRaw)
+		syncArgs = append(syncArgs, cfg.localDst)
+		if code := runSyncCLI(serverURL, syncArgs, stdout, stderr); code != 0 {
+			return code
+		}
+	} else {
+		startArgs := make([]string, 0, 32)
+		startArgs = appendOptionalFlag(startArgs, "--encrypt", cfg.encryptMode)
+		startArgs = appendBoolFlag(startArgs, cfg.verbose, "--verbose")
+		startArgs = appendBoolValueFlag(startArgs, "--progress", cfg.progress)
+		startArgs = appendBoolFlag(startArgs, cfg.perFile, "--per-file")
+		startArgs = appendOptionalFlag(startArgs, "--comp", cfg.compRaw)
+		startArgs = appendOptionalFlag(startArgs, "--ack-every", cfg.ackEveryRaw)
+		startArgs = appendOptionalFlag(startArgs, "--batch-size", cfg.batchSizeRaw)
+		startArgs = appendBoolFlag(startArgs, cfg.skipFsync, "--skip-fsync")
+		startArgs = appendOptionalFlag(startArgs, "--deadline", cfg.deadlineRaw)
+		startArgs = appendOptionalFlag(startArgs, "--trace", cfg.traceFile)
+		startArgs = appendOptionalFlag(startArgs, "--progress-path", cfg.progressFilePath)
+		startArgs = appendOptionalFlag(startArgs, "--progress-path-interval", cfg.progressIntervalRaw)
+		if cfg.concurrency > 0 {
+			startArgs = append(startArgs, "--concurrency", strconv.Itoa(cfg.concurrency))
+		}
+		startArgs = appendBoolFlag(startArgs, cfg.skipWrite, "--skip-write")
+		startArgs = append(startArgs, cfg.localDst)
+		if code := runStartCLI(serverURL, startArgs, stdout, stderr); code != 0 {
+			return code
+		}
+	}
+
+	if cfg.verifyMeta {
+		if code := verifyCopy(serverURL, cfg, stdout, stderr); code != 0 {
+			return code
+		}
+	}
+	if code := cleanupCopyState(cfg.localDst, stderr); code != 0 {
+		return code
+	}
+	return 0
+}
+
+type manifestDelta struct {
+	newFiles       []ManifestEntry
+	staleFiles     []ManifestEntry
+	unchangedFiles []ManifestEntry
+	removedPaths   []string
+	newBytes       int64
+	staleBytes     int64
+}
+
+func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io.Writer) int {
+	ps, err := newPinchState(cfg.localDst)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
+		return 2
+	}
+	serverManifest, err := LoadManifest(ps.ServerManifestPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "load server manifest failed: %v\n", err)
+		return 1
+	}
+	localManifest, err := scanLocalDir(ps.TargetDir, serverManifest)
+	if err != nil {
+		fmt.Fprintf(stderr, "scan local directory failed: %v\n", err)
+		return 1
+	}
+	delta := compareManifestEntries(localManifest, serverManifest)
+	if len(delta.newFiles) > 0 || len(delta.staleFiles) > 0 || len(delta.removedPaths) > 0 {
+		fmt.Fprintf(
+			stderr,
+			"copy-verify-meta: mismatch new=%d (%s) stale=%d (%s) rm=%d\n",
+			len(delta.newFiles),
+			encoding.HumanBytes(delta.newBytes),
+			len(delta.staleFiles),
+			encoding.HumanBytes(delta.staleBytes),
+			len(delta.removedPaths),
+		)
+		return 1
+	}
+	fmt.Fprintf(stdout, "copy-verify-meta: ok files=%d\n", len(serverManifest.Entries))
+	if cfg.verifyDataSamplePct <= 0 {
+		return 0
+	}
+	sampledFiles, sampledRanges, err := verifyCopyDataSamples(serverURL, cfg, serverManifest, stdout)
+	if err != nil {
+		fmt.Fprintf(stderr, "copy-verify-data: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "copy-verify-data: ok files=%d samples=%d pct=%d\n", sampledFiles, sampledRanges, cfg.verifyDataSamplePct)
+	return 0
+}
+
+func compareManifestEntries(localManifest *Manifest, serverManifest *Manifest) manifestDelta {
+	delta := manifestDelta{}
+	localByPath := make(map[string]ManifestEntry, len(localManifest.Entries))
+	for _, entry := range localManifest.Entries {
+		localByPath[entry.Path] = entry
+	}
+	serverByPath := make(map[string]ManifestEntry, len(serverManifest.Entries))
+	for _, entry := range serverManifest.Entries {
+		serverByPath[entry.Path] = entry
+		local, ok := localByPath[entry.Path]
+		if !ok {
+			delta.newFiles = append(delta.newFiles, entry)
+			delta.newBytes += entry.Size
+			continue
+		}
+		if manifestEntryMatches(local, entry) {
+			delta.unchangedFiles = append(delta.unchangedFiles, entry)
+			continue
+		}
+		delta.staleFiles = append(delta.staleFiles, entry)
+		delta.staleBytes += entry.Size
+	}
+	for _, entry := range localManifest.Entries {
+		if _, ok := serverByPath[entry.Path]; !ok {
+			delta.removedPaths = append(delta.removedPaths, entry.Path)
+		}
+	}
+	sort.Strings(delta.removedPaths)
+	return delta
+}
+
+func manifestEntryMatches(local ManifestEntry, remote ManifestEntry) bool {
+	return local.Size == remote.Size && local.Mtime == remote.Mtime && local.Mode == remote.Mode
+}
+
+type verifySample struct {
+	Offset int64
+	Size   int64
+}
+
+type verifySampleTask struct {
+	entry      ManifestEntry
+	serverPath string
+	localPath  string
+	samples    []verifySample
+}
+
+func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *Manifest, stdout io.Writer) (int, int, error) {
+	if manifest == nil {
+		return 0, 0, errors.New("missing manifest")
+	}
+	agePublicKey, ageIdentity, err := resolveEncryptionOptions(cfg.encryptMode)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid --encrypt: %w", err)
+	}
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	tasks := make([]verifySampleTask, 0, len(manifest.Entries))
+	totalRanges := 0
+	for _, entry := range manifest.Entries {
+		samples := buildVerifySamples(entry.Size, cfg.verifyDataSamplePct, rng)
+		if len(samples) == 0 {
+			continue
+		}
+		tasks = append(tasks, verifySampleTask{
+			entry:      entry,
+			serverPath: filepath.Clean(filepath.Join(manifest.Root, filepath.FromSlash(entry.Path))),
+			localPath:  filepath.Join(cfg.localDst, filepath.FromSlash(entry.Path)),
+			samples:    samples,
+		})
+		totalRanges += len(samples)
+	}
+	if len(tasks) == 0 {
+		return 0, 0, nil
+	}
+	workers := cfg.concurrency
+	if workers <= 0 {
+		workers = manifest.Concurrency
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	taskCh := make(chan verifySampleTask, workers)
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	var completed atomic.Int64
+	var progressDone chan struct{}
+	if stdout != nil {
+		progressDone = make(chan struct{})
+		go func() {
+			defer close(progressDone)
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					done := completed.Load()
+					fmt.Fprintf(stdout, "copy-verify-data: progress files=%d/%d samples=%d pct=%d\n", done, len(tasks), totalRanges, cfg.verifyDataSamplePct)
+				}
+			}
+		}()
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := NewClient(serverURL)
+			for task := range taskCh {
+				if err := verifySampleTaskData(ctx, client, manifest.TransferID, task, agePublicKey, ageIdentity); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+				completed.Add(1)
+			}
+		}()
+	}
+	for _, task := range tasks {
+		select {
+		case <-ctx.Done():
+			close(taskCh)
+			wg.Wait()
+			if progressDone != nil {
+				<-progressDone
+			}
+			select {
+			case err := <-errCh:
+				return 0, 0, err
+			default:
+				return 0, 0, context.Canceled
+			}
+		case err := <-errCh:
+			cancel()
+			close(taskCh)
+			wg.Wait()
+			if progressDone != nil {
+				<-progressDone
+			}
+			return 0, 0, err
+		case taskCh <- task:
+		}
+	}
+	close(taskCh)
+	wg.Wait()
+	cancel()
+	if progressDone != nil {
+		<-progressDone
+	}
+	select {
+	case err := <-errCh:
+		return 0, 0, err
+	default:
+	}
+	return len(tasks), totalRanges, nil
+}
+
+func buildVerifySamples(fileSize int64, pct int, rng *rand.Rand) []verifySample {
+	if fileSize <= 0 || pct <= 0 {
+		return nil
+	}
+	frameSlots := int((fileSize + defaultVerifySampleFrameSize - 1) / defaultVerifySampleFrameSize)
+	if frameSlots <= 0 {
+		return nil
+	}
+	sampleCount := (frameSlots*pct + 99) / 100
+	if sampleCount <= 0 {
+		sampleCount = 1
+	}
+	slotIndexes := make([]int, 0, sampleCount)
+	if sampleCount >= frameSlots {
+		for i := 0; i < frameSlots; i++ {
+			slotIndexes = append(slotIndexes, i)
+		}
+	} else {
+		perm := rng.Perm(frameSlots)
+		slotIndexes = append(slotIndexes, perm[:sampleCount]...)
+		sort.Ints(slotIndexes)
+	}
+	samples := make([]verifySample, 0, len(slotIndexes))
+	for _, slotIndex := range slotIndexes {
+		slotStart := int64(slotIndex) * defaultVerifySampleFrameSize
+		slotLen := minInt64(defaultVerifySampleFrameSize, fileSize-slotStart)
+		size := minInt64(verifySampleBytes, slotLen)
+		offset := slotStart
+		maxJitter := slotLen - size
+		if maxJitter > 0 {
+			offset += rng.Int63n(maxJitter + 1)
+		}
+		samples = append(samples, verifySample{Offset: offset, Size: size})
+	}
+	return samples
+}
+
+func verifySampleTaskData(ctx context.Context, client *Client, transferID string, task verifySampleTask, agePublicKey string, ageIdentity string) error {
+	fd, err := os.Open(task.localPath)
+	if err != nil {
+		return fmt.Errorf("open local sample path %s: %w", task.localPath, err)
+	}
+	defer fd.Close()
+
+	targets := make([]FetchChecksumTarget, 0, len(task.samples))
+	wantHashes := make([]string, 0, len(task.samples))
+	buf := make([]byte, verifySampleBytes)
+	for _, sample := range task.samples {
+		targets = append(targets, FetchChecksumTarget{
+			FileID:   task.entry.ID,
+			FullPath: task.serverPath,
+			Offset:   sample.Offset,
+			Size:     sample.Size,
+			Algo:     "xxh128",
+		})
+		want, err := computeLocalSampleHash(fd, sample.Offset, sample.Size, buf)
+		if err != nil {
+			return fmt.Errorf("hash local sample %s@%d: %w", task.localPath, sample.Offset, err)
+		}
+		wantHashes = append(wantHashes, want)
+	}
+
+	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	resp, err := client.FetchChecksumStream(verifyCtx, FetchChecksumStreamRequest{
+		TransferID:   transferID,
+		Targets:      targets,
+		AgePublicKey: agePublicKey,
+		AgeIdentity:  ageIdentity,
+	})
+	if err != nil {
+		return fmt.Errorf("checksum request failed for %s: %w", task.serverPath, err)
+	}
+	defer resp.Reader.Close()
+
+	results, err := readChecksumResults(resp.Reader)
+	if err != nil {
+		return fmt.Errorf("read checksum response for %s: %w", task.serverPath, err)
+	}
+	if len(results) != len(task.samples) {
+		return fmt.Errorf("checksum response count mismatch for %s: got %d want %d", task.serverPath, len(results), len(task.samples))
+	}
+	for i, result := range results {
+		sample := task.samples[i]
+		if result.FileID != task.entry.ID {
+			return fmt.Errorf("checksum file id mismatch for %s: got %d want %d", task.serverPath, result.FileID, task.entry.ID)
+		}
+		if result.Offset != sample.Offset || result.Size != sample.Size {
+			return fmt.Errorf("checksum range mismatch for %s: got offset=%d size=%d want offset=%d size=%d", task.serverPath, result.Offset, result.Size, sample.Offset, sample.Size)
+		}
+		if !strings.EqualFold(result.FileHashToken, wantHashes[i]) {
+			return fmt.Errorf("checksum mismatch for %s at offset=%d size=%d", task.localPath, sample.Offset, sample.Size)
+		}
+	}
+	return nil
+}
+
+func computeLocalSampleHash(fd *os.File, offset int64, size int64, scratch []byte) (string, error) {
+	if size < 0 {
+		return "", errors.New("negative sample size")
+	}
+	if size == 0 {
+		return encoding.FormatXXH128HashToken(xxh3.Hash128(nil)), nil
+	}
+	buf := scratch
+	if int64(len(buf)) < size {
+		buf = make([]byte, size)
+	}
+	n, err := fd.ReadAt(buf[:size], offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	if int64(n) != size {
+		return "", io.ErrUnexpectedEOF
+	}
+	return encoding.FormatXXH128HashToken(xxh3.Hash128(buf[:size])), nil
+}
+
+func minInt64(a int64, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -754,6 +1315,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var batchSizeRaw string
 	var compRaw string
 	var noSync bool
+	var skipWrite bool
 	var verbose bool
 	var yes bool
 	var probeBytesRaw string
@@ -769,6 +1331,8 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks")
 	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size")
+	cf.BoolVar(&skipWrite, "", "skip-write", false, "do not mutate the target directory; fetch bodies to discard instead of writing them")
+	cf.BoolVar(&noSync, "", "skip-fsync", false, "ack without fdatasync")
 	cf.BoolVar(&noSync, "", "no-sync", false, "ack without fdatasync")
 	probeBytesRaw = encoding.HumanBytes(defaultCLIProbeBytes)
 	cf.StringVar(&probeBytesRaw, "", "probe-bytes", probeBytesRaw, "probe payload size")
@@ -909,7 +1473,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		for _, entry := range newManifest.Entries {
 			if old, ok := oldByPath[entry.Path]; ok {
 				if old.Size == entry.Size && old.Mtime == entry.Mtime && old.Mode == entry.Mode {
-					entry.Progress = old.Progress
+					entry.Progress = ManifestProgress{AckBytes: entry.Size, MetadataDone: true}
 					unchangedFiles = append(unchangedFiles, entry)
 				} else {
 					staleFiles = append(staleFiles, entry)
@@ -939,7 +1503,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		}
 
 		// Prompt for confirmation on the first round only.
-		if round == 0 && !yes {
+		if round == 0 && !yes && !skipWrite {
 			if !confirmSyncProceed(stderr, len(newFiles), len(staleFiles), len(rmPaths)) {
 				return 0
 			}
@@ -971,17 +1535,19 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		serverManifest = mergedManifest
 
 		// Always delete removed files to converge.
-		for _, rmPath := range rmPaths {
-			localPath := filepath.Join(outRoot, filepath.FromSlash(rmPath))
-			if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-				fmt.Fprintf(stderr, "sync: rm %s: %v\n", localPath, err)
+		if !skipWrite {
+			for _, rmPath := range rmPaths {
+				localPath := filepath.Join(outRoot, filepath.FromSlash(rmPath))
+				if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+					fmt.Fprintf(stderr, "sync: rm %s: %v\n", localPath, err)
+				}
 			}
-		}
-		// Truncate local files for stale entries.
-		for _, entry := range staleFiles {
-			localPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
-			if err := os.Truncate(localPath, 0); err != nil && !os.IsNotExist(err) {
-				fmt.Fprintf(stderr, "sync: truncate %s: %v\n", localPath, err)
+			// Truncate local files for stale entries.
+			for _, entry := range staleFiles {
+				localPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
+				if err := os.Truncate(localPath, 0); err != nil && !os.IsNotExist(err) {
+					fmt.Fprintf(stderr, "sync: truncate %s: %v\n", localPath, err)
+				}
 			}
 		}
 
@@ -1003,6 +1569,10 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		}
 
 		if len(pendingEntries) == 0 {
+			if skipWrite {
+				fmt.Fprintln(stdout, "sync: skip-write, no downloads needed")
+				return 0
+			}
 			fmt.Fprintln(stdout, "sync: no downloads needed")
 			continue
 		}
@@ -1033,6 +1603,9 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		var totalCopied atomic.Int64
 		outputWriter := func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+			if skipWrite {
+				destPath = os.DevNull
+			}
 			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, noSync)
 			if err != nil {
 				return nil, nil, err
@@ -1088,6 +1661,9 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 					return
 				}
 				destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+				if skipWrite {
+					destPath = os.DevNull
+				}
 				if err := applyDownloadedTrailerMetadata(destPath, evt.File.Meta.TrailerMetadata); err != nil {
 					recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
 					return
@@ -1132,6 +1708,9 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		if len(finalFailures) > 0 {
 			return 1
 		}
+		if skipWrite {
+			return 0
+		}
 	}
 
 	fmt.Fprintf(stderr, "sync: failed to converge after %d rounds\n", maxSyncRounds)
@@ -1166,12 +1745,14 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf.BoolVar(&verbose, "v", "verbose", false, "verbose progress output")
 	cf.BoolVar(&progress, "", "progress", true, "show transfer progress every 2s")
 	cf.BoolVar(&perFile, "", "per-file", false, "per-file progress (implies --progress)")
+	cf.BoolVar(&discard, "", "skip-write", false, "discard downloaded file contents instead of writing to the target directory")
 	cf.BoolVar(&discard, "", "discard", false, "discard downloaded file contents instead of writing to the target directory")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "parallel download workers (0=manifest default)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks")
 	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size, unit of work per concurrent request")
 	cf.StringVar(&compRaw, "", "comp", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
+	cf.BoolVar(&noSync, "", "skip-fsync", false, "ack without fdatasync")
 	cf.BoolVar(&noSync, "", "no-sync", false, "ack without fdatasync")
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "transfer deadline (e.g. 60s, 5m)")
 	var traceFile string
@@ -1956,11 +2537,14 @@ func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest 
 
 func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Client, transferID string, fileID uint64, serverPath string, fileSize int64, agePublicKey string, ageIdentity string) (*FileTrailerMetadata, error) {
 	resp, err := client.FetchChecksumStream(ctx, FetchChecksumStreamRequest{
-		TransferID:   transferID,
-		FileID:       fileID,
-		FullPath:     serverPath,
-		WindowSize:   fileSize,
-		ChecksumsCSV: "xxh128",
+		TransferID: transferID,
+		Targets: []FetchChecksumTarget{{
+			FileID:   fileID,
+			FullPath: serverPath,
+			Offset:   0,
+			Size:     fileSize,
+			Algo:     "xxh128",
+		}},
 		AgePublicKey: agePublicKey,
 		AgeIdentity:  ageIdentity,
 	})
@@ -1968,22 +2552,67 @@ func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Clien
 		return nil, fmt.Errorf("checksum request failed: %w", err)
 	}
 	defer resp.Reader.Close()
-	br := bufio.NewReader(resp.Reader)
-	var terminal *FileTrailerMetadata
-	for {
-		headerLine, readErr := br.ReadString('\n')
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) && strings.TrimSpace(headerLine) == "" {
-				break
-			}
-			return nil, fmt.Errorf("read checksum frame header: %w", readErr)
+	results, err := readChecksumResults(resp.Reader)
+	if err != nil {
+		return nil, err
+	}
+	for _, result := range results {
+		if result.FileID == fileID && result.Metadata != nil {
+			return result.Metadata, nil
 		}
-		wsize, err := parseFrameWireSize(strings.TrimRight(headerLine, "\r\n"))
+	}
+	return nil, nil
+}
+
+type checksumFrameHeader struct {
+	FileID   uint64
+	Offset   int64
+	Size     int64
+	WireSize int64
+}
+
+type checksumFrameTrailer struct {
+	FileID        uint64
+	FileHashToken string
+	Next          int64
+	Metadata      *FileTrailerMetadata
+}
+
+type checksumResult struct {
+	FileID        uint64
+	Offset        int64
+	Size          int64
+	FileHashToken string
+	Metadata      *FileTrailerMetadata
+}
+
+func readChecksumResults(reader io.Reader) ([]checksumResult, error) {
+	br := bufio.NewReader(reader)
+	results := make([]checksumResult, 0, 8)
+	for {
+		headerLine, err := br.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) && headerLine == "" {
+				return results, nil
+			}
+			return nil, fmt.Errorf("read checksum frame header: %w", err)
+		}
+		trimmedHeader := strings.TrimRight(headerLine, "\r\n")
+		if trimmedHeader == "" {
+			continue
+		}
+		if isChecksumOKLine(trimmedHeader) {
+			return results, nil
+		}
+		if strings.HasPrefix(trimmedHeader, "ERR ") {
+			return nil, errors.New(trimmedHeader)
+		}
+		header, err := parseChecksumFrameHeader(trimmedHeader)
 		if err != nil {
 			return nil, err
 		}
-		if wsize > 0 {
-			if _, err := io.CopyN(io.Discard, br, wsize); err != nil {
+		if header.WireSize > 0 {
+			if _, err := io.CopyN(io.Discard, br, header.WireSize); err != nil {
 				return nil, fmt.Errorf("discard checksum frame payload: %w", err)
 			}
 		}
@@ -1991,50 +2620,88 @@ func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Clien
 		if err != nil {
 			return nil, fmt.Errorf("read checksum frame trailer: %w", err)
 		}
-		meta, isTerminal, err := parseTrailerMetadata(strings.TrimRight(trailerLine, "\r\n"))
+		trailer, err := parseChecksumFrameTrailer(strings.TrimRight(trailerLine, "\r\n"))
 		if err != nil {
 			return nil, err
 		}
-		if isTerminal && meta != nil {
-			terminal = meta
+		if trailer.FileID != header.FileID {
+			return nil, errors.New("checksum frame trailer file id mismatch")
 		}
+		results = append(results, checksumResult{
+			FileID:        header.FileID,
+			Offset:        header.Offset,
+			Size:          header.Size,
+			FileHashToken: trailer.FileHashToken,
+			Metadata:      trailer.Metadata,
+		})
 	}
-	return terminal, nil
 }
 
-func parseFrameWireSize(line string) (int64, error) {
+func isChecksumOKLine(line string) bool {
+	line = strings.TrimSpace(line)
+	return line == "OK" || strings.HasPrefix(line, "OK ")
+}
+
+func parseChecksumFrameHeader(line string) (checksumFrameHeader, error) {
 	fields := strings.Fields(line)
 	if len(fields) < 3 || fields[0] != "FX/1" {
-		return 0, errors.New("invalid checksum frame header")
+		return checksumFrameHeader{}, errors.New("invalid checksum frame header")
 	}
+	fileID, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return checksumFrameHeader{}, errors.New("invalid checksum frame file id")
+	}
+	props := make(map[string]string, len(fields)-2)
 	for _, token := range fields[2:] {
-		if strings.HasPrefix(token, "wsize=") {
-			v, err := strconv.ParseInt(strings.TrimPrefix(token, "wsize="), 10, 64)
-			if err != nil || v < 0 {
-				return 0, errors.New("invalid checksum frame wsize")
-			}
-			return v, nil
+		key, val, ok := strings.Cut(token, "=")
+		if ok {
+			props[key] = val
 		}
 	}
-	return 0, errors.New("checksum frame missing wsize")
+	offset, err := strconv.ParseInt(props["offset"], 10, 64)
+	if err != nil || offset < 0 {
+		return checksumFrameHeader{}, errors.New("invalid checksum frame offset")
+	}
+	size, err := strconv.ParseInt(props["size"], 10, 64)
+	if err != nil || size < 0 {
+		return checksumFrameHeader{}, errors.New("invalid checksum frame size")
+	}
+	wsize, err := strconv.ParseInt(props["wsize"], 10, 64)
+	if err != nil || wsize < 0 {
+		return checksumFrameHeader{}, errors.New("invalid checksum frame wsize")
+	}
+	return checksumFrameHeader{
+		FileID:   fileID,
+		Offset:   offset,
+		Size:     size,
+		WireSize: wsize,
+	}, nil
 }
 
-func parseTrailerMetadata(line string) (*FileTrailerMetadata, bool, error) {
+func parseChecksumFrameTrailer(line string) (checksumFrameTrailer, error) {
 	fields := strings.Fields(line)
 	if len(fields) < 3 || fields[0] != "FXT/1" {
-		return nil, false, errors.New("invalid checksum frame trailer")
+		return checksumFrameTrailer{}, errors.New("invalid checksum frame trailer")
 	}
-	isTerminal := false
+	fileID, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return checksumFrameTrailer{}, errors.New("invalid checksum frame trailer file id")
+	}
+	next := int64(-1)
 	meta := &FileTrailerMetadata{}
 	hasMeta := false
+	fileHashToken := ""
 	for _, token := range fields[2:] {
 		if strings.HasPrefix(token, "next=") {
 			nextRaw := strings.TrimPrefix(token, "next=")
-			next, err := strconv.ParseInt(nextRaw, 10, 64)
+			next, err = strconv.ParseInt(nextRaw, 10, 64)
 			if err != nil || next < 0 {
-				return nil, false, errors.New("invalid checksum frame trailer next offset")
+				return checksumFrameTrailer{}, errors.New("invalid checksum frame trailer next offset")
 			}
-			isTerminal = next == 0
+			continue
+		}
+		if strings.HasPrefix(token, "file-hash=") {
+			fileHashToken = strings.TrimPrefix(token, "file-hash=")
 			continue
 		}
 		if strings.HasPrefix(token, "meta:") {
@@ -2065,10 +2732,18 @@ func parseTrailerMetadata(line string) (*FileTrailerMetadata, bool, error) {
 			}
 		}
 	}
+	if next != 0 {
+		return checksumFrameTrailer{}, errors.New("checksum frame trailer next offset must be 0")
+	}
 	if !hasMeta {
 		meta = nil
 	}
-	return meta, isTerminal, nil
+	return checksumFrameTrailer{
+		FileID:        fileID,
+		FileHashToken: fileHashToken,
+		Next:          next,
+		Metadata:      meta,
+	}, nil
 }
 
 func applyTrailerMetadataToPath(path string, meta *FileTrailerMetadata) error {

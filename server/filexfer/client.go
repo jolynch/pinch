@@ -353,12 +353,17 @@ type FetchFileResponse struct {
 
 type FetchChecksumStreamRequest struct {
 	TransferID   string
-	FileID       uint64
-	FullPath     string
-	WindowSize   int64
-	ChecksumsCSV string
+	Targets      []FetchChecksumTarget
 	AgePublicKey string
 	AgeIdentity  string
+}
+
+type FetchChecksumTarget struct {
+	FileID   uint64
+	FullPath string
+	Offset   int64
+	Size     int64
+	Algo     string // xxh128|xxh64; empty means server default (xxh128)
 }
 
 type FetchChecksumStreamResponse struct {
@@ -656,8 +661,19 @@ func (c *Client) FetchChecksumStream(ctx context.Context, request FetchChecksumS
 	if request.TransferID == "" {
 		return FetchChecksumStreamResponse{}, errors.New("missing transfer id")
 	}
-	if request.FullPath == "" {
-		return FetchChecksumStreamResponse{}, errors.New("missing full path")
+	if len(request.Targets) == 0 {
+		return FetchChecksumStreamResponse{}, errors.New("missing checksum targets")
+	}
+	for _, target := range request.Targets {
+		if target.FullPath == "" {
+			return FetchChecksumStreamResponse{}, errors.New("missing full path")
+		}
+		if target.Offset < 0 {
+			return FetchChecksumStreamResponse{}, errors.New("invalid checksum offset")
+		}
+		if target.Size < 0 {
+			return FetchChecksumStreamResponse{}, errors.New("invalid checksum size")
+		}
 	}
 
 	reader, err := c.fetchChecksumStreamTCP(ctx, request)

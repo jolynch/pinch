@@ -130,6 +130,31 @@ func TestParseRequestACKMultipleBlocksWithTelemetry(t *testing.T) {
 	}
 }
 
+func TestParseRequestCXSUMMultipleBlocksWithOptions(t *testing.T) {
+	payload := []byte(`CXSUM tx1 fd=1 "/tmp/a.txt" offset=10 size=20 algo=xxh64 fd=1 10:/tmp/a.txt size=8`)
+	req, err := ParseRequest(payload)
+	if err != nil {
+		t.Fatalf("ParseRequest err: %v", err)
+	}
+	if req.Verb != VerbCXSUM {
+		t.Fatalf("verb=%v", req.Verb)
+	}
+	if len(req.Params) != 3 {
+		t.Fatalf("params len=%d", len(req.Params))
+	}
+	if got := req.Params[0]["txferid"]; got != "tx1" {
+		t.Fatalf("unexpected txferid: %q", got)
+	}
+	first := req.Params[1]
+	if first["fid"] != "1" || first["path"] != "/tmp/a.txt" || first["offset"] != "10" || first["size"] != "20" || first["algo"] != "xxh64" {
+		t.Fatalf("unexpected first CXSUM block: %#v", first)
+	}
+	second := req.Params[2]
+	if second["fid"] != "1" || second["path"] != "/tmp/a.txt" || second["size"] != "8" {
+		t.Fatalf("unexpected second CXSUM block: %#v", second)
+	}
+}
+
 func TestParseRequestMalformedLenValue(t *testing.T) {
 	_, err := ParseRequest([]byte(`SEND tx1 fd=1 10:/tmp`))
 	if err == nil {
