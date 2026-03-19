@@ -886,23 +886,28 @@ func (c *Client) fetchChecksumStreamTCP(ctx context.Context, request FetchChecks
 		conn.Close()
 		return nil, fmt.Errorf("send AUTH: %w", err)
 	}
-	windowSize := request.WindowSize
-	if windowSize <= 0 {
-		windowSize = 64 * 1024 * 1024
+	var cmd strings.Builder
+	cmd.WriteString("CXSUM ")
+	cmd.WriteString(request.TransferID)
+	for _, target := range request.Targets {
+		cmd.WriteString(" fd=")
+		cmd.WriteString(strconv.FormatUint(target.FileID, 10))
+		cmd.WriteByte(' ')
+		cmd.WriteString(makeLenToken(target.FullPath))
+		if target.Offset > 0 {
+			cmd.WriteString(" offset=")
+			cmd.WriteString(strconv.FormatInt(target.Offset, 10))
+		}
+		if target.Size > 0 {
+			cmd.WriteString(" size=")
+			cmd.WriteString(strconv.FormatInt(target.Size, 10))
+		}
+		if algo := strings.TrimSpace(target.Algo); algo != "" {
+			cmd.WriteString(" algo=")
+			cmd.WriteString(algo)
+		}
 	}
-	checksums := strings.TrimSpace(request.ChecksumsCSV)
-	if checksums == "" {
-		checksums = "xxh128"
-	}
-	cmd := fmt.Sprintf(
-		"CXSUM %s %d %d %s %s",
-		request.TransferID,
-		request.FileID,
-		windowSize,
-		checksums,
-		makeLenToken(request.FullPath),
-	)
-	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
+	if err := c.sendTCPCommand(conn, state, cmd.String()); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("send CXSUM: %w", err)
 	}

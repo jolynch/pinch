@@ -12,47 +12,75 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-const defaultChecksumWindowSize int64 = 64 * 1024 * 1024
 const checksumReadBufferSize int64 = 1 * 1024 * 1024
 
+type cxsumItem struct {
+	FileID     uint64
+	Path       string
+	Offset     int64
+	Size       int64
+	HasSize    bool
+	Algorithms []string
+}
+
 type cxsumRequest struct {
-	TransferID   string
-	FileID       uint64
-	WindowSize   int64
-	ChecksumsCSV string
-	Path         string
+	TransferID string
+	Items      []cxsumItem
 }
 
 func parseCXSUMRequest(req Request) (cxsumRequest, error) {
 	if req.Verb != VerbCXSUM {
 		return cxsumRequest{}, protocolErr{code: "BAD_COMMAND", message: "not CXSUM"}
 	}
-	if len(req.Params) != 1 {
+	if len(req.Params) < 2 {
 		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM arguments"}
 	}
-	p := req.Params[0]
-	txferID := p["txferid"]
+	txferID := req.Params[0]["txferid"]
 	if txferID == "" {
 		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
 	}
-	fileID, err := strconv.ParseUint(p["fid"], 10, 64)
-	if err != nil {
-		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid file id"}
-	}
-	windowSize, err := strconv.ParseInt(p["window-size"], 10, 64)
-	if err != nil || windowSize <= 0 {
-		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid window size"}
-	}
-	path := p["path"]
-	if path == "" {
-		return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing path"}
+	items := make([]cxsumItem, 0, len(req.Params)-1)
+	for _, p := range req.Params[1:] {
+		fileID, err := strconv.ParseUint(p["fid"], 10, 64)
+		if err != nil {
+			return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid file id"}
+		}
+		path := p["path"]
+		if path == "" {
+			return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing path"}
+		}
+		offset := int64(0)
+		if raw := strings.TrimSpace(p["offset"]); raw != "" {
+			offset, err = strconv.ParseInt(raw, 10, 64)
+			if err != nil || offset < 0 {
+				return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid checksum offset"}
+			}
+		}
+		size := int64(0)
+		hasSize := false
+		if raw := strings.TrimSpace(p["size"]); raw != "" {
+			size, err = strconv.ParseInt(raw, 10, 64)
+			if err != nil || size < 0 {
+				return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid checksum size"}
+			}
+			hasSize = true
+		}
+		algorithms, err := parseRequestedChecksums([]string{p["algo"]})
+		if err != nil {
+			return cxsumRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid checksum parameter"}
+		}
+		items = append(items, cxsumItem{
+			FileID:     fileID,
+			Path:       path,
+			Offset:     offset,
+			Size:       size,
+			HasSize:    hasSize,
+			Algorithms: algorithms,
+		})
 	}
 	return cxsumRequest{
-		TransferID:   txferID,
-		FileID:       fileID,
-		WindowSize:   windowSize,
-		ChecksumsCSV: p["checksums-csv"],
-		Path:         path,
+		TransferID: txferID,
+		Items:      items,
 	}, nil
 }
 
@@ -61,45 +89,48 @@ func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error
 	if err != nil {
 		return err
 	}
-	fd, fileRef, err := deps.GetFile(parsed.TransferID, parsed.FileID, parsed.Path)
-	if err != nil {
-		return mapLookupError(err)
-	}
-	defer fd.Close()
+	buf := make([]byte, checksumReadBufferSize)
+	for _, item := range parsed.Items {
+		fd, fileRef, err := deps.GetFile(parsed.TransferID, item.FileID, item.Path)
+		if err != nil {
+			return mapLookupError(err)
+		}
 
-	fileInfo, err := fd.Stat()
-	if err != nil {
-		return protocolErr{code: "INTERNAL", message: "failed to stat file"}
-	}
-	fileSize := fileInfo.Size()
-	if fileSize < 0 {
-		return protocolErr{code: "INTERNAL", message: "invalid file size"}
-	}
-	windowSize, err := parseChecksumWindowSize(strconv.FormatInt(parsed.WindowSize, 10), fileSize)
-	if err != nil {
-		return protocolErr{code: "BAD_REQUEST", message: "invalid window size"}
-	}
-	algorithms, err := parseRequestedChecksums([]string{parsed.ChecksumsCSV})
-	if err != nil {
-		return protocolErr{code: "BAD_REQUEST", message: "invalid checksum parameter"}
-	}
+		fileInfo, statErr := fd.Stat()
+		if statErr != nil {
+			_ = fd.Close()
+			return protocolErr{code: "INTERNAL", message: "failed to stat file"}
+		}
+		fileSize := fileInfo.Size()
+		if item.Offset > fileSize {
+			_ = fd.Close()
+			return protocolErr{code: "BAD_REQUEST", message: "checksum offset beyond eof"}
+		}
+		rangeSize := fileSize - item.Offset
+		if item.HasSize {
+			if item.Offset+item.Size > fileSize {
+				_ = fd.Close()
+				return protocolErr{code: "BAD_REQUEST", message: "checksum range beyond eof"}
+			}
+			rangeSize = item.Size
+		}
+		fileHashes, hashErr := hashChecksumRange(fd, item.Offset, rangeSize, item.Algorithms, buf)
+		_ = fd.Close()
+		if hashErr != nil {
+			return protocolErr{code: "INTERNAL", message: "failed to checksum file range"}
+		}
 
-	metadata := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
-	full128 := xxh3.New128()
-	full64 := xxh3.New()
-
-	if fileSize == 0 {
-		fileHashes := finalChecksumTokens(algorithms, full128, full64)
-		headerTS := time.Now().UnixMilli()
-		trailerTS := time.Now().UnixMilli()
 		headerHash := "none:0"
 		if len(fileHashes) > 0 {
 			headerHash = fileHashes[0]
 		}
-		_, err := encoding.WriteFrame(out, encoding.WriteArgs{
-			FileID:     parsed.FileID,
-			Offset:     0,
-			Size:       0,
+		metadata := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
+		headerTS := time.Now().UnixMilli()
+		trailerTS := time.Now().UnixMilli()
+		if _, err := encoding.WriteFrame(out, encoding.WriteArgs{
+			FileID:     item.FileID,
+			Offset:     item.Offset,
+			Size:       rangeSize,
 			WSize:      0,
 			Comp:       "none",
 			Enc:        "none",
@@ -109,103 +140,48 @@ func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error
 			FileHashes: fileHashes,
 			Next:       0,
 			Metadata:   &metadata,
-		})
-		if err != nil {
+		}); err != nil {
 			return err
 		}
-		return nil
-	}
-
-	bufSize := checksumReadBufferSize
-	if windowSize < bufSize {
-		bufSize = windowSize
-	}
-	if bufSize <= 0 {
-		bufSize = checksumReadBufferSize
-	}
-	buf := make([]byte, bufSize)
-	cursor := int64(0)
-	for cursor < fileSize {
-		chunkSize := fileSize - cursor
-		if chunkSize > windowSize {
-			chunkSize = windowSize
-		}
-
-		reader := io.NewSectionReader(fd, cursor, chunkSize)
-		remaining := chunkSize
-		for remaining > 0 {
-			n, readErr := reader.Read(buf)
-			if n > 0 {
-				part := buf[:n]
-				_, _ = full128.Write(part)
-				_, _ = full64.Write(part)
-				remaining -= int64(n)
-			}
-			if readErr == io.EOF {
-				break
-			}
-			if readErr != nil {
-				return protocolErr{code: "INTERNAL", message: "failed to read file chunk"}
-			}
-		}
-		if remaining != 0 {
-			return protocolErr{code: "INTERNAL", message: "failed to read complete file chunk"}
-		}
-
-		rollingFileHashes := finalChecksumTokens(algorithms, full128, full64)
-		nextOffset := cursor + chunkSize
-		isTerminal := nextOffset == fileSize
-		nextValue := nextOffset
-		fileHashes := rollingFileHashes
-		var meta *encoding.FileFrameMetadata
-		if isTerminal {
-			nextValue = 0
-			meta = &metadata
-		}
-		headerHash := "none:0"
-		if len(fileHashes) > 0 {
-			headerHash = fileHashes[0]
-		}
-
-		headerTS := time.Now().UnixMilli()
-		trailerTS := time.Now().UnixMilli()
-		_, err := encoding.WriteFrame(out, encoding.WriteArgs{
-			FileID:     parsed.FileID,
-			Offset:     cursor,
-			Size:       chunkSize,
-			WSize:      0,
-			Comp:       "none",
-			Enc:        "none",
-			HeaderHash: headerHash,
-			HeaderTS:   headerTS,
-			TrailerTS:  trailerTS,
-			FileHashes: fileHashes,
-			Next:       nextValue,
-			Metadata:   meta,
-		})
-		if err != nil {
-			return err
-		}
-		cursor = nextOffset
 	}
 	return nil
 }
 
-func parseChecksumWindowSize(raw string, fileSize int64) (int64, error) {
-	if raw != "" {
-		v, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || v <= 0 {
-			return 0, fmt.Errorf("invalid window size")
+func hashChecksumRange(fd io.ReaderAt, offset int64, size int64, algorithms []string, buf []byte) ([]string, error) {
+	full128 := xxh3.New128()
+	full64 := xxh3.New()
+	if size == 0 {
+		return finalChecksumTokens(algorithms, full128, full64), nil
+	}
+	if len(buf) == 0 {
+		buf = make([]byte, checksumReadBufferSize)
+	}
+	reader := io.NewSectionReader(fd, offset, size)
+	remaining := size
+	for remaining > 0 {
+		chunk := int64(len(buf))
+		if remaining < chunk {
+			chunk = remaining
 		}
-		return v, nil
+		n, err := io.ReadFull(reader, buf[:chunk])
+		if n > 0 {
+			part := buf[:n]
+			_, _ = full128.Write(part)
+			_, _ = full64.Write(part)
+			remaining -= int64(n)
+		}
+		if err == nil {
+			continue
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		return nil, err
 	}
-	if fileSize <= 0 {
-		return defaultChecksumWindowSize, nil
+	if remaining != 0 {
+		return nil, fmt.Errorf("short checksum read")
 	}
-	if fileSize < defaultChecksumWindowSize {
-		return fileSize, nil
-	}
-	return defaultChecksumWindowSize, nil
+	return finalChecksumTokens(algorithms, full128, full64), nil
 }
 
 func parseRequestedChecksums(raw []string) ([]string, error) {

@@ -6,29 +6,31 @@ usage() {
 Usage: ./bench.sh SOURCE_DIRECTORY [options]
 
 Arguments:
-  SOURCE_DIRECTORY           Source directory for transfer (required).
+  SOURCE_DIRECTORY           Remote source directory for copy (required).
 
 Options:
-  --rsync                    Run an rsync baseline instead of a pinch transfer.
-  --discard                  Benchmark pinch start with --discard (no target-dir writes).
-  --flamegraph               Run start benchmark under perf and emit flamegraph SVG.
+  --rsync                    Run an rsync baseline instead of a pinch copy.
+  --skip-write               Benchmark pinch copy with --skip-write (no target-dir writes).
+  --discard                  Alias for --skip-write.
+  --flamegraph               Run copy benchmark under perf and emit flamegraph SVG.
   --trace                    Capture runtime/trace for client and server (view with go tool trace).
   --build                    Build ./pinch before benchmarking (default: true).
   --no-build                 Skip build step.
   --server-url ADDR          File listener address for CLI (default: 127.0.0.1:3453).
   --server-startup-timeout S Seconds to wait for file listener readiness (default: 30).
-  --target-dir PATH          Target directory for transfer/start (default: /var/lib/pinch/data).
-  --no-sync                  Skip fdatasync after each file (passed to start command).
-  --concurrency N            Start command concurrency (default: 128).
+  --target-dir PATH          Target directory for copy (default: /var/lib/pinch/data).
+  --skip-fsync               Skip fdatasync after each file/window (passed to copy).
+  --no-sync                  Alias for --skip-fsync.
+  --concurrency N            Copy command concurrency (default: 128).
   --encrypt MODE             Encryption mode passed to CLI (supported: age).
   --freq HZ                  perf sample frequency (default: 199).
-  --perf-data PATH           perf.data output path (default: /tmp/pinch-start.perf.data).
-  --flamegraph-svg PATH      Flamegraph SVG output path (default: /tmp/pinch-start.svg).
+  --perf-data PATH           perf.data output path (default: /tmp/pinch-copy.perf.data).
+  --flamegraph-svg PATH      Flamegraph SVG output path (default: /tmp/pinch-copy.svg).
   --server-perf-data PATH    Server perf.data output path (default: /tmp/pinch-server.perf.data).
   --server-flamegraph-svg PATH
                              Server flamegraph SVG output path (default: /tmp/pinch-server.svg).
   --flamegraph-dir PATH      Path to FlameGraph repo (optional if scripts on PATH).
-  --client-trace PATH        Client trace output path (default: /tmp/pinch-start.trace).
+  --client-trace PATH        Client trace output path (default: /tmp/pinch-copy.trace).
   --server-trace PATH        Server trace output path (default: /tmp/pinch-server.trace).
   -h, --help                 Show help.
 EOF
@@ -54,21 +56,21 @@ BUILD=true
 FLAMEGRAPH=false
 TRACE=false
 RSYNC=false
-DISCARD=false
+SKIP_WRITE=false
 SERVER_URL="127.0.0.1:3453"
 SERVER_STARTUP_TIMEOUT_SEC=30
 SOURCE_DIRECTORY=""
 TARGET_DIR="/var/lib/pinch/data"
 CONCURRENCY="48"
 ENCRYPT_MODE=""
-NO_SYNC=false
+SKIP_FSYNC=false
 PERF_FREQ="199"
-PERF_DATA="/tmp/pinch-start.perf.data"
-FLAMEGRAPH_SVG="/tmp/pinch-start.svg"
+PERF_DATA="/tmp/pinch-copy.perf.data"
+FLAMEGRAPH_SVG="/tmp/pinch-copy.svg"
 SERVER_PERF_DATA="/tmp/pinch-server.perf.data"
 SERVER_FLAMEGRAPH_SVG="/tmp/pinch-server.svg"
 FLAMEGRAPH_DIR=""
-CLIENT_TRACE="/tmp/pinch-start.trace"
+CLIENT_TRACE="/tmp/pinch-copy.trace"
 SERVER_TRACE="/tmp/pinch-server.trace"
 
 if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
@@ -93,8 +95,8 @@ while [[ $# -gt 0 ]]; do
       RSYNC=true
       shift
       ;;
-    --discard)
-      DISCARD=true
+    --skip-write|--discard)
+      SKIP_WRITE=true
       shift
       ;;
     --trace)
@@ -134,8 +136,8 @@ while [[ $# -gt 0 ]]; do
       TARGET_DIR="$2"
       shift 2
       ;;
-    --no-sync)
-      NO_SYNC=true
+    --skip-fsync|--no-sync)
+      SKIP_FSYNC=true
       shift
       ;;
     --concurrency)
@@ -198,8 +200,8 @@ if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "age" ]]; then
   echo "unsupported --encrypt value: ${ENCRYPT_MODE} (only 'age' is supported)" >&2
   exit 2
 fi
-if [[ "${RSYNC}" == "true" && "${DISCARD}" == "true" ]]; then
-  echo "--discard is only supported for pinch start benchmarks, not --rsync" >&2
+if [[ "${RSYNC}" == "true" && "${SKIP_WRITE}" == "true" ]]; then
+  echo "--skip-write is only supported for pinch copy benchmarks, not --rsync" >&2
   exit 2
 fi
 
@@ -211,7 +213,7 @@ if [[ "${RSYNC}" == "true" ]]; then
   mkdir -p "${TARGET_DIR}"
 
   RSYNC_CMD=(rsync -aW --no-compress --info=progress2)
-  if [[ "${NO_SYNC}" != "true" ]]; then
+  if [[ "${SKIP_FSYNC}" != "true" ]]; then
     RSYNC_CMD+=(--fsync)
   fi
   # Trailing slash on source so rsync copies contents, not the directory itself.
@@ -324,40 +326,27 @@ PARENT_DIR="$(dirname "${TARGET_DIR}")"
 STATE_DIR="${PARENT_DIR}/.pinch"
 
 echo "bench: source=${SOURCE_DIRECTORY} target=${TARGET_DIR}"
-if [[ "${DISCARD}" == "true" ]]; then
-  echo "Cleaning prior benchmark state..."
-  rm -rf "${STATE_DIR}/"
-else
-  echo "Cleaning prior benchmark output..."
-  rm -rf "${TARGET_DIR}/" "${STATE_DIR}/"
-fi
+echo "Cleaning prior benchmark output..."
+rm -rf "${TARGET_DIR}/" "${STATE_DIR}/"
 
-echo "Preparing manifest..."
-TRANSFER_CMD=(./pinch filecli "${SERVER_URL}" transfer -s "${SOURCE_DIRECTORY}")
+COPY_CMD=(./pinch filecli "${SERVER_URL}" copy --concurrency "${CONCURRENCY}")
 if [[ -n "${ENCRYPT_MODE}" ]]; then
-  TRANSFER_CMD+=(--encrypt "${ENCRYPT_MODE}")
+  COPY_CMD+=(--encrypt "${ENCRYPT_MODE}")
 fi
-TRANSFER_CMD+=("${TARGET_DIR}")
-"${TRANSFER_CMD[@]}"
-
-START_CMD=(./pinch filecli "${SERVER_URL}" start --concurrency "${CONCURRENCY}")
-if [[ -n "${ENCRYPT_MODE}" ]]; then
-  START_CMD+=(--encrypt "${ENCRYPT_MODE}")
+if [[ "${SKIP_WRITE}" == "true" ]]; then
+  COPY_CMD+=(--skip-write)
 fi
-if [[ "${DISCARD}" == "true" ]]; then
-  START_CMD+=(--discard)
-fi
-if [[ "${NO_SYNC}" == "true" ]]; then
-  START_CMD+=(--no-sync)
+if [[ "${SKIP_FSYNC}" == "true" ]]; then
+  COPY_CMD+=(--skip-fsync)
 fi
 if [[ "${TRACE}" == "true" ]]; then
-  START_CMD+=(--trace "${CLIENT_TRACE}")
+  COPY_CMD+=(--trace "${CLIENT_TRACE}")
 fi
-START_CMD+=("${TARGET_DIR}")
+COPY_CMD+=("${SOURCE_DIRECTORY}" "${TARGET_DIR}")
 
 if [[ "$FLAMEGRAPH" != "true" ]]; then
-  echo "Running timed start benchmark..."
-  { time "${START_CMD[@]}" 2>/dev/null | awk '!/^start-file: /'; } 2>&1
+  echo "Running timed copy benchmark..."
+  { time "${COPY_CMD[@]}" 2>/dev/null | awk '!/^start-file: /'; } 2>&1
   if [[ "${TRACE}" == "true" ]]; then
     echo "Client trace written to: ${CLIENT_TRACE}  (view with: go tool trace ${CLIENT_TRACE})"
     echo "Server trace written to: ${SERVER_TRACE}  (view with: go tool trace ${SERVER_TRACE})"
@@ -392,7 +381,7 @@ SERVER_PERF_FOLDED="${SERVER_PERF_DATA}.folded"
 
 echo "Recording perf profile (sudo may prompt)..."
 start_server_perf
-sudo perf record -o "${PERF_DATA}" -F "${PERF_FREQ}" -g --call-graph fp -- "${START_CMD[@]}"
+sudo perf record -o "${PERF_DATA}" -F "${PERF_FREQ}" -g --call-graph fp -- "${COPY_CMD[@]}"
 stop_server_perf
 
 echo "Generating client flamegraph..."

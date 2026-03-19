@@ -150,18 +150,21 @@ Rules:
 
 ## CXSUM
 
-Streams checksum frames for a file.
+Streams checksum frames for one or more requested file ranges.
 
 ### Request
 
-`CXSUM <txferid> <fid> <window-size> <checksums-csv> <path>`
+`CXSUM <txferid> fd=<fid> <path> [offset=<n>] [size=<n>] [algo=xxh128|xxh64] ...`
 
 - `<path>` is quoted or length-prefixed.
-- algorithms: `xxh128`, `xxh64`, `none`.
+- `fd=<fid>` may be repeated to request multiple ranges, including multiple ranges for the same file id.
+- `offset` defaults to `0`.
+- omitted `size` means checksum through EOF.
+- `algo` defaults to `xxh128`.
 
 ### Response
 
-- `FX/1` frame stream (rolling checksums)
+- `FX/1` frame stream (one zero-payload frame per requested range, in request order)
 - terminal status line: `OK` or `ERR ...`
 
 ## STATUS

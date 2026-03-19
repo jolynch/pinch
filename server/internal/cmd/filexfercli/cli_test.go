@@ -352,7 +352,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	serverManifestPath := filepath.Join(tmp, ".pinch", "manifest.server")
-	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", targetDir}, &stdout, &stderr)
+	code := runTransferCLI(srv.URL, []string{"-s", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -552,7 +552,7 @@ func TestRunCLITransferWithEncryptAge(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "transfer", "-s", "/remote", "--encrypt", "age", targetDir}, &stdout, &stderr)
+	code := runTransferCLI(srv.URL, []string{"-s", "/remote", "--encrypt", "age", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -611,7 +611,7 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "start", "--concurrency", "2", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
+	code := runStartCLI(srv.URL, []string{"--concurrency", "2", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -657,7 +657,7 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "start", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
+	code := runStartCLI(srv.URL, []string{"--ack-every", "1KiB", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -703,7 +703,7 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "start", "--discard", "--progress=false", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
+	code := runStartCLI(srv.URL, []string{"--discard", "--progress=false", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("start --discard: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -776,8 +776,7 @@ func TestRunCLIStartDiscardKeepsProgressOnFailure(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{
-		srv.URL, "start",
+	code := runStartCLI(srv.URL, []string{
 		"--discard",
 		"--progress=false",
 		"--concurrency", "1",
@@ -823,8 +822,7 @@ func TestRunCLIStartDiscardSkipsCompletedMetadataRefresh(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{
-		srv.URL, "start",
+	code := runStartCLI(srv.URL, []string{
 		"--discard",
 		"--progress=false",
 		"--ack-every", "1KiB",
@@ -876,7 +874,7 @@ func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync no-op: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -920,7 +918,7 @@ func TestRunCLISyncDownloadPromptDefaultsYes(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync download: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -962,7 +960,7 @@ func TestRunCLISyncDeletePromptDefaultsNo(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync delete abort: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -1004,7 +1002,7 @@ func TestRunCLISyncMixedPromptDefaultsNo(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync mixed abort: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -1051,7 +1049,7 @@ func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+		code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("sync explicit yes download: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -1094,7 +1092,7 @@ func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+		code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", targetDir}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("sync explicit yes delete: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -1135,7 +1133,7 @@ func TestRunCLISyncNonTerminalSkipsPrompt(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "sync", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync non-terminal: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -1179,7 +1177,7 @@ func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := RunCLI([]string{srv.URL, "sync", "--yes", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+		code := runSyncCLI(srv.URL, []string{"--yes", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("sync --yes delete-only: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -1231,7 +1229,7 @@ func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := RunCLI([]string{srv.URL, "sync", "--yes", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+		code := runSyncCLI(srv.URL, []string{"--yes", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("sync --yes mixed: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -1249,6 +1247,160 @@ func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 			t.Fatalf("did not expect prompt with --yes, got stderr=%s", stderr.String())
 		}
 	})
+}
+
+func TestRunCLICopyStartPath(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := filepath.Join(tmp, "dst")
+	payload := []byte("hello")
+	manifestRaw := buildTestManifestRaw("txcopy-start", []string{
+		buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt"),
+	})
+	meta := &FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "/remote", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("copy start path: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	got, err := os.ReadFile(filepath.Join(targetDir, "new.txt"))
+	if err != nil {
+		t.Fatalf("read copied file: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("unexpected copied file: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch")); !os.IsNotExist(err) {
+		t.Fatalf("expected copy to remove state dir, stat err=%v", err)
+	}
+}
+
+func TestRunCLICopySyncPath(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	payload := []byte("hello")
+	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+	manifestRaw := buildTestManifestRaw("txcopy-sync", []string{entry})
+	meta := &FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+	withSyncPromptTestInput(t, "", false)
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txcopy-sync", []string{entry}, nil)
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "/remote", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("copy sync path: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	got, err := os.ReadFile(filepath.Join(targetDir, "new.txt"))
+	if err != nil {
+		t.Fatalf("read synced file: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("unexpected synced file: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch")); !os.IsNotExist(err) {
+		t.Fatalf("expected copy to remove state dir, stat err=%v", err)
+	}
+}
+
+func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := filepath.Join(tmp, "dst")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	destPath := filepath.Join(targetDir, "same.txt")
+	if err := os.WriteFile(destPath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write local file: %v", err)
+	}
+	if err := os.Chtimes(destPath, time.Unix(0, 100), time.Unix(0, 100)); err != nil {
+		t.Fatalf("chtimes local file: %v", err)
+	}
+	info, err := os.Stat(destPath)
+	if err != nil {
+		t.Fatalf("stat local file: %v", err)
+	}
+	manifestRaw := buildTestManifestRaw("txcopy-verify", []string{
+		buildTestManifestEntry(0, info.Size(), info.ModTime().UnixNano(), info.Mode(), "same.txt"),
+	})
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--skip-fetch", "--verify-meta", "/remote", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("copy skip-fetch verify-meta: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "copy-verify-meta: ok") {
+		t.Fatalf("expected verify output, got stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch")); err != nil {
+		t.Fatalf("expected skip-fetch copy to preserve state dir, stat err=%v", err)
+	}
 }
 
 func TestRunCLIStatus(t *testing.T) {
@@ -1295,28 +1447,31 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for legacy --directory flag, got %d", code)
+		t.Fatalf("expected usage exit 2 for removed transfer command, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "unknown command: transfer") {
+		t.Fatalf("expected unknown transfer command, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"127.0.0.1:1", "start", "--probe-bytes", "bad"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for unknown --probe-bytes, got %d", code)
+		t.Fatalf("expected usage exit 2 for removed start command, got %d", code)
 	}
-	if !strings.Contains(stderr.String(), "flag provided but not defined") {
-		t.Fatalf("expected unknown flag message, got: %s", stderr.String())
-	}
-	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "start", "--load-strategy", "slow"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for unknown --load-strategy on start, got %d", code)
-	}
-	if !strings.Contains(stderr.String(), "flag provided but not defined") {
-		t.Fatalf("expected unknown flag message, got: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "unknown command: start") {
+		t.Fatalf("expected unknown start command, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "-s", "/tmp", "--encrypt", "aes", "/tmp/dst"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for unsupported --encrypt mode, got %d", code)
+	if code := RunCLI([]string{"127.0.0.1:1", "sync", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for removed sync command, got %d", code)
 	}
-	if !strings.Contains(stderr.String(), "invalid --encrypt") {
-		t.Fatalf("expected invalid --encrypt error, got: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "unknown command: sync") {
+		t.Fatalf("expected unknown sync command, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--verify-data-sample", "5", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid verify/skip-fetch combo, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "--verify-data-sample cannot be used with --skip-fetch or --skip-write") {
+		t.Fatalf("expected invalid verify-data-sample error, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"--tid", "tx", "get"}, &stdout, &stderr); code != 2 {
@@ -1324,6 +1479,13 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "file-listener address") {
 		t.Fatalf("expected explicit server address error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := RunCLI([]string{"help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("expected help exit 0, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "  copy") || strings.Contains(stderr.String(), "\n  transfer") || strings.Contains(stderr.String(), "\n  start") || strings.Contains(stderr.String(), "\n  sync") {
+		t.Fatalf("expected top-level help to mention copy only, got: %s", stderr.String())
 	}
 }
 

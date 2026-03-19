@@ -182,27 +182,50 @@ func ParseRequest(payload []byte) (Request, error) {
 		}
 		return req, nil
 	case VerbCXSUM:
-		txferID, txErr := c.readToken()
-		fid, fidErr := c.readToken()
-		windowSize, wErr := c.readToken()
-		checksums, checksErr := c.readToken()
-		if txErr != nil || fidErr != nil || wErr != nil || checksErr != nil {
+		txferID, readErr := c.readToken()
+		if readErr != nil || txferID == "" {
+			return Request{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
+		}
+		req.Params = append(req.Params, map[string]string{"txferid": txferID})
+		for !c.eof() {
+			fdToken, fdErr := c.readToken()
+			if fdErr != nil {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM item"}
+			}
+			if !strings.HasPrefix(fdToken, "fd=") {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM file id"}
+			}
+			fid := strings.TrimSpace(strings.TrimPrefix(fdToken, "fd="))
+			if fid == "" {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM file id"}
+			}
+			path, pathErr := c.readPathValue()
+			if pathErr != nil {
+				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM path"}
+			}
+			item := map[string]string{
+				"fid":  fid,
+				"path": string(path),
+			}
+			for !c.eof() {
+				if c.hasPrefix("fd=") {
+					break
+				}
+				tok, tokErr := c.readToken()
+				if tokErr != nil {
+					return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM item option"}
+				}
+				key, val, ok := strings.Cut(tok, "=")
+				if !ok {
+					return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM item option"}
+				}
+				item[key] = val
+			}
+			req.Params = append(req.Params, item)
+		}
+		if len(req.Params) == 1 {
 			return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM arguments"}
 		}
-		path, pathErr := c.readPathValue()
-		if pathErr != nil {
-			return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid CXSUM path"}
-		}
-		if !c.eof() {
-			return Request{}, protocolErr{code: "BAD_REQUEST", message: "unexpected CXSUM arguments"}
-		}
-		req.Params = append(req.Params, map[string]string{
-			"txferid":       txferID,
-			"fid":           fid,
-			"window-size":   windowSize,
-			"checksums-csv": checksums,
-			"path":          string(path),
-		})
 		return req, nil
 	case VerbSTATUS:
 		txferID, txErr := c.readToken()
