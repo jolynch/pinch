@@ -615,7 +615,7 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "start-plan: strategy=gentle link=700Mbps concurrency=2 (manifest=3)") {
+	if !strings.Contains(stdout.String(), "start-plan: strategy=gentle link=700Mbps conc=2 (srv-conc=3)") {
 		t.Fatalf("missing start plan line: %s", stdout.String())
 	}
 	// After start, staging dir is renamed to target dir.
@@ -661,7 +661,7 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "start-plan: strategy=fast link=1200Mbps concurrency=5 (manifest=5)") {
+	if !strings.Contains(stdout.String(), "start-plan: strategy=fast link=1200Mbps conc=5 (srv-conc=5)") {
 		t.Fatalf("missing default start plan line: %s", stdout.String())
 	}
 }
@@ -874,7 +874,7 @@ func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync no-op: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -918,7 +918,7 @@ func TestRunCLISyncDownloadPromptDefaultsYes(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync download: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -960,7 +960,7 @@ func TestRunCLISyncDeletePromptDefaultsNo(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync delete abort: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -1002,7 +1002,7 @@ func TestRunCLISyncMixedPromptDefaultsNo(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync mixed abort: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -1049,7 +1049,7 @@ func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+		code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("sync explicit yes download: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -1092,7 +1092,7 @@ func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+		code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", targetDir}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("sync explicit yes delete: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -1133,7 +1133,7 @@ func TestRunCLISyncNonTerminalSkipsPrompt(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("sync non-terminal: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -1177,7 +1177,7 @@ func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := runSyncCLI(srv.URL, []string{"--yes", "--probe-bytes", "1B", targetDir}, &stdout, &stderr)
+		code := runSyncCLI(srv.URL, []string{"--yes", "--probe-size", "1B", targetDir}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("sync --yes delete-only: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -1229,7 +1229,7 @@ func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := runSyncCLI(srv.URL, []string{"--yes", "--probe-bytes", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+		code := runSyncCLI(srv.URL, []string{"--yes", "--probe-size", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("sync --yes mixed: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -1282,7 +1282,7 @@ func TestRunCLICopyStartPath(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy start path: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -1321,6 +1321,9 @@ func TestRunCLICopySyncPath(t *testing.T) {
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbSYNC:
+			if got := req.Params[0]["directory"]; got != "/remote" {
+				return fmt.Errorf("unexpected sync directory: %q", got)
+			}
 			return writeSyncResponse(out, "txcopy-sync", []string{entry}, nil)
 		case intftcp.VerbSEND:
 			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
@@ -1453,7 +1456,7 @@ func TestRunCLIUsageErrors(t *testing.T) {
 		t.Fatalf("expected unknown transfer command, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "start", "--probe-bytes", "bad"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"127.0.0.1:1", "start", "--probe-size", "bad"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed start command, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "unknown command: start") {
@@ -1465,6 +1468,92 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "unknown command: sync") {
 		t.Fatalf("expected unknown sync command, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("expected copy help exit 0, got %d", code)
+	}
+	copyHelp := stderr.String()
+	if !strings.Contains(copyHelp, `--clean`) || !strings.Contains(copyHelp, `(default false)`) {
+		t.Fatalf("expected bool default in copy help, got: %s", copyHelp)
+	}
+	if !strings.Contains(copyHelp, `--concurrency int`) || !strings.Contains(copyHelp, `(default 0)`) {
+		t.Fatalf("expected int default in copy help, got: %s", copyHelp)
+	}
+	if !strings.Contains(copyHelp, `--progress-file-interval string`) || !strings.Contains(copyHelp, `(default "1s")`) {
+		t.Fatalf("expected string default in copy help, got: %s", copyHelp)
+	}
+	lines := strings.Split(copyHelp, "\n")
+	for _, line := range lines {
+		if len(line) > 88 {
+			t.Fatalf("expected copy help to wrap at 88 chars, got %d: %q", len(line), line)
+		}
+	}
+	wrappedVerifySample := false
+	for i, line := range lines {
+		if !strings.Contains(line, "--verify-data-sample int") {
+			continue
+		}
+		if i+1 >= len(lines) {
+			break
+		}
+		next := lines[i+1]
+		if len(next) > 0 && next[0] == ' ' && strings.Contains(next, "data verification") {
+			wrappedVerifySample = true
+		}
+		break
+	}
+	if !wrappedVerifySample {
+		t.Fatalf("expected wrapped help indentation for verify-data-sample, got: %s", copyHelp)
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--compress", "bogus", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --compress, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --compress: unsupported --compress value") {
+		t.Fatalf("expected invalid --compress error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--comp", "lz4", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for removed --comp flag, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -comp") {
+		t.Fatalf("expected removed --comp flag error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--per-file", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for removed --per-file flag, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -per-file") {
+		t.Fatalf("expected removed --per-file flag error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--progress-path", "/tmp/pct", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for removed --progress-path flag, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -progress-path") {
+		t.Fatalf("expected removed --progress-path flag error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--probe-bytes", "1B", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for removed --probe-bytes flag, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -probe-bytes") {
+		t.Fatalf("expected removed --probe-bytes flag error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--probe-size", "bad", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --probe-size, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --probe-size") {
+		t.Fatalf("expected invalid --probe-size error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--progress-file-interval", "bad", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --progress-file-interval, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --progress-file-interval") {
+		t.Fatalf("expected invalid --progress-file-interval error, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := runCopyCLI("127.0.0.1:1", []string{"--verify-data-sample", "5", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
@@ -1517,10 +1606,10 @@ func TestVerboseProgressReporterIncludesAckedBytes(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 progress lines, got %d: %q", len(lines), stderr.String())
 	}
-	if got := lines[0]; !strings.Contains(got, "progress: fd=42 20% bytes=20 B/100 B [0 B]") {
+	if got := lines[0]; !strings.Contains(got, "file progress[42]: 20% bytes=20 B/100 B [0 B]") {
 		t.Fatalf("unexpected first progress line: %q", got)
 	}
-	if got := lines[1]; !strings.Contains(got, "progress: fd=42 40% bytes=40 B/100 B [10 B]") {
+	if got := lines[1]; !strings.Contains(got, "file progress[42]: 40% bytes=40 B/100 B [10 B]") {
 		t.Fatalf("unexpected second progress line: %q", got)
 	}
 	for _, line := range lines {
@@ -1558,10 +1647,10 @@ func TestVerboseProgressReporterTimeCadenceAndCompletion(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 progress lines, got %d: %q", len(lines), stderr.String())
 	}
-	if got := lines[0]; !strings.Contains(got, "progress: fd=7 10% ") {
+	if got := lines[0]; !strings.Contains(got, "file progress[7]: 10% ") {
 		t.Fatalf("expected timed 10%% line, got %q", got)
 	}
-	if got := lines[1]; !strings.Contains(got, "progress: fd=7 100% ") {
+	if got := lines[1]; !strings.Contains(got, "file progress[7]: 100% ") {
 		t.Fatalf("expected final 100%% line, got %q", got)
 	}
 }
@@ -1597,10 +1686,10 @@ func TestVerboseProgressReporterConcurrentUse(t *testing.T) {
 	wg.Wait()
 
 	out := stderr.String()
-	if !strings.Contains(out, "progress: fd=1 ") {
+	if !strings.Contains(out, "file progress[1]: ") {
 		t.Fatalf("expected fd=1 progress lines, got %q", out)
 	}
-	if !strings.Contains(out, "progress: fd=2 ") {
+	if !strings.Contains(out, "file progress[2]: ") {
 		t.Fatalf("expected fd=2 progress lines, got %q", out)
 	}
 }
