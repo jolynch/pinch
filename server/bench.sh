@@ -23,6 +23,8 @@ Options:
   --no-sync                  Alias for --skip-fsync.
   --concurrency N            Copy command concurrency (default: 128).
   --encrypt MODE             Encryption mode passed to CLI (supported: age).
+  --compress MODE            Compression mode passed to copy (adapt|none|lz4|zstd).
+  --disable-zero-copy        Force server to use buffered send path (no tee/splice).
   --freq HZ                  perf sample frequency (default: 199).
   --perf-data PATH           perf.data output path (default: /tmp/pinch-copy.perf.data).
   --flamegraph-svg PATH      Flamegraph SVG output path (default: /tmp/pinch-copy.svg).
@@ -63,6 +65,8 @@ SOURCE_DIRECTORY=""
 TARGET_DIR="/var/lib/pinch/data"
 CONCURRENCY="48"
 ENCRYPT_MODE=""
+COMPRESS_MODE=""
+DISABLE_ZERO_COPY=false
 SKIP_FSYNC=false
 PERF_FREQ="199"
 PERF_DATA="/tmp/pinch-copy.perf.data"
@@ -149,6 +153,15 @@ while [[ $# -gt 0 ]]; do
       require_value "$1" "${2:-}"
       ENCRYPT_MODE="$2"
       shift 2
+      ;;
+    --compress)
+      require_value "$1" "${2:-}"
+      COMPRESS_MODE="$2"
+      shift 2
+      ;;
+    --disable-zero-copy)
+      DISABLE_ZERO_COPY=true
+      shift
       ;;
     --freq)
       require_value "$1" "${2:-}"
@@ -296,6 +309,9 @@ start_server() {
   if [[ "${TRACE}" == "true" ]]; then
     server_args+=(--trace "${SERVER_TRACE}")
   fi
+  if [[ "${DISABLE_ZERO_COPY}" == "true" ]]; then
+    server_args+=(--disable-zero-copy)
+  fi
   ./pinch "${server_args[@]}" >"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
   SERVER_APP_PID="${SERVER_PID}"
@@ -332,6 +348,9 @@ rm -rf "${TARGET_DIR}/" "${STATE_DIR}/"
 COPY_CMD=(./pinch filecli "${SERVER_URL}" copy --concurrency "${CONCURRENCY}")
 if [[ -n "${ENCRYPT_MODE}" ]]; then
   COPY_CMD+=(--encrypt "${ENCRYPT_MODE}")
+fi
+if [[ -n "${COMPRESS_MODE}" ]]; then
+  COPY_CMD+=(--compress "${COMPRESS_MODE}")
 fi
 if [[ "${SKIP_WRITE}" == "true" ]]; then
   COPY_CMD+=(--skip-write)
