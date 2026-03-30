@@ -22,7 +22,7 @@ func ParseRequest(payload []byte) (Request, error) {
 	if err != nil {
 		return Request{Verb: VerbUnknown}, protocolErr{code: "BAD_COMMAND", message: "unknown command"}
 	}
-	if c.eof() && verb != VerbAUTH {
+	if c.eof() && verb != VerbAUTH && verb != VerbSTATUS {
 		return Request{Verb: verb}, protocolErr{code: "BAD_REQUEST", message: "missing command arguments"}
 	}
 	req := Request{Verb: verb}
@@ -228,6 +228,11 @@ func ParseRequest(payload []byte) (Request, error) {
 		}
 		return req, nil
 	case VerbSTATUS:
+		if c.eof() {
+			// No transfer ID: list all transfers.
+			req.Params = append(req.Params, map[string]string{})
+			return req, nil
+		}
 		txferID, txErr := c.readToken()
 		if txErr != nil || txferID == "" {
 			return Request{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}

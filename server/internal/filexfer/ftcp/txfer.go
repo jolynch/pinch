@@ -96,11 +96,17 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 		return err
 	}
 	parsed.Directory = filepath.Join(deps.Root(), parsed.Directory)
-	if err := validateDirectory(parsed.Directory); err != nil {
+	isDir, err := validatePath(parsed.Directory)
+	if err != nil {
 		return protocolErr{code: "UNPROCESSABLE", message: err.Error()}
 	}
 
 	root := filepath.Clean(parsed.Directory)
+	var singleFileName string
+	if !isDir {
+		singleFileName = filepath.Base(root)
+		root = filepath.Dir(root)
+	}
 	transfer, err := deps.NewTransfer(root, 0, 0)
 	if err != nil {
 		return protocolErr{code: "INTERNAL", message: "failed to initialize transfer"}
@@ -135,11 +141,17 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 		}
 	}()
 
-	if err := encodeManifest(out, transfer.ID, root, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, parsed.MaxChunkSize, parsed.Verbose, deps); err != nil {
-		if isBrokenPipe(err) {
+	var encodeErr error
+	if singleFileName != "" {
+		encodeErr = encodeSingleFileManifest(out, transfer.ID, root, singleFileName, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, deps)
+	} else {
+		encodeErr = encodeManifest(out, transfer.ID, root, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, parsed.MaxChunkSize, parsed.Verbose, deps)
+	}
+	if encodeErr != nil {
+		if isBrokenPipe(encodeErr) {
 			return nil
 		}
-		return protocolErr{code: "BAD_REQUEST", message: err.Error()}
+		return protocolErr{code: "BAD_REQUEST", message: encodeErr.Error()}
 	}
 	cleanupTransfer = false
 	return nil
@@ -149,23 +161,89 @@ func handleTXFER(ctx context.Context, req Request, out io.Writer, deps Deps) err
 	return handleTXFERWithCallback(ctx, req, out, deps, nil)
 }
 
-func validateDirectory(directory string) error {
-	if !filepath.IsAbs(directory) {
-		return errors.New("directory must be an absolute path")
+func validatePath(path string) (isDir bool, err error) {
+	if !filepath.IsAbs(path) {
+		return false, errors.New("path must be an absolute path")
 	}
-	stat, err := os.Stat(directory)
+	stat, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return errors.New("directory does not exist")
+			return false, errors.New("path does not exist")
 		}
-		return errors.New("directory is not usable")
+		return false, errors.New("path is not usable")
 	}
-	if !stat.IsDir() {
-		return errors.New("directory is not a directory")
+	if stat.IsDir() {
+		if _, err := os.ReadDir(path); err != nil {
+			return false, errors.New("directory is not readable")
+		}
+		return true, nil
 	}
-	if _, err := os.ReadDir(directory); err != nil {
-		return errors.New("directory is not readable")
+	fd, err := os.Open(path)
+	if err != nil {
+		return false, errors.New("file is not readable")
 	}
+	fd.Close()
+	return false, nil
+}
+
+func encodeSingleFileManifest(
+	w io.Writer,
+	transferID string,
+	root string,
+	filename string,
+	mode string,
+	linkMbps int64,
+	concurrency int,
+	deadlineMS int64,
+	deps Deps,
+) error {
+	fullPath := filepath.Join(root, filename)
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return err
+	}
+
+	rootToken := fmt.Sprintf("%d:%s", len(root), root)
+	header := fmt.Sprintf(
+		"FM/1 %s %s mode=%s link-mbps=%d concurrency=%d",
+		transferID,
+		rootToken,
+		mode,
+		linkMbps,
+		concurrency,
+	)
+	if deadlineMS > 0 {
+		header += fmt.Sprintf(" deadline-ms=%d", deadlineMS)
+	}
+	header += "\n"
+
+	if _, err := io.WriteString(w, header); err != nil {
+		return err
+	}
+
+	entryMtime := strconv.FormatInt(info.ModTime().UnixNano(), 10)
+	entryMode := encoding.FormatManifestMode(info.Mode())
+	pathToken := encoding.EncodePathToken("", filename)
+	mtimeToken, _ := encoding.EncodeMtimeToken("", entryMtime)
+	line := fmt.Sprintf("0 %d %s %s %s\n", info.Size(), mtimeToken, entryMode, pathToken)
+
+	updatesCh := make(chan TransferFileStateUpdate, 1)
+	done := deps.RegisterTransferFileState(transferID, updatesCh, TransferStateStarted)
+	defer func() {
+		close(updatesCh)
+		<-done
+	}()
+
+	updatesCh <- TransferFileStateUpdate{
+		FileID:   0,
+		PathHash: xxh3.Hash128([]byte(filepath.Clean(fullPath))),
+		FileSize: info.Size(),
+	}
+
+	if _, err := io.WriteString(w, line); err != nil {
+		return err
+	}
+	deps.ClipTransfer(transferID)
 	return nil
 }
 

@@ -287,8 +287,8 @@ func printCLIUsage(w io.Writer) {
 
 Commands:
   copy       Copy REMOTE_SRC to LOCAL_DST
-  status     Query transfer status
-  get        Download a single file from a transfer
+  status     Query and monitor transfer progress
+  get        Download a single remote file
 
 State is stored in <local-dst>/../.pinch/ (manifest, progress, staging).
 Default server address: %s
@@ -339,6 +339,7 @@ type copyCLIConfig struct {
 	localDst                string
 	encryptMode             string
 	compressRaw             string
+	modeRaw                 string
 	concurrency             int
 	ackEveryRaw             string
 	batchSizeRaw            string
@@ -452,25 +453,26 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		progressFileIntervalRaw: "1s",
 		progress:                true,
 	}
-	cf.BoolVar(&cfg.clean, "", "clean", false, "remove LOCAL_DST first, then force a clean transfer")
-	cf.BoolVar(&cfg.skipFetch, "", "skip-fetch", false, "fetch and persist remote manifest state only; do not start or sync files")
-	cf.BoolVar(&cfg.skipWrite, "", "skip-write", false, "do not mutate LOCAL_DST; fetch file bodies to discard instead of writing them")
-	cf.BoolVar(&cfg.skipFsync, "", "skip-fsync", false, "acknowledge writes without fdatasync")
-	cf.BoolVar(&cfg.verifyMeta, "", "verify-meta", false, "run read-only metadata verification after copy; with --skip-fetch this is allowed only if LOCAL_DST already exists")
-	cf.IntVar(&cfg.verifyDataSamplePct, "", "verify-data-sample", 0, "percent of frame slots to sample per file for data verification (0-100); implies --verify-meta; not allowed with --skip-fetch or --skip-write")
-	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "encryption algorithm: none|age (default: none)")
-	cf.StringVar(&cfg.compressRaw, "", "compress", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
-	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "parallel download / verification workers (0=adapt from server)")
-	cf.BoolVar(&cfg.progress, "", "progress", true, "show transfer progress every 2s")
-	cf.BoolVar(&cfg.verbose, "v", "verbose", false, "per-file progress output")
-	cf.StringVar(&cfg.progressFilePath, "", "progress-file", "", "write integer % to this file/pipe")
-	cf.StringVar(&cfg.progressFileIntervalRaw, "", "progress-file-interval", cfg.progressFileIntervalRaw, "progress write interval (e.g. 500ms, 10s)")
-	cf.BoolVar(&cfg.yes, "y", "yes", false, "skip confirmation prompt on sync paths")
-	cf.StringVar(&cfg.ackEveryRaw, "a", "ack-every", cfg.ackEveryRaw, "bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
-	cf.StringVar(&cfg.batchSizeRaw, "b", "batch-size", cfg.batchSizeRaw, "parallel batch size / unit of work per concurrent request; 1B, 4KiB, 8MiB")
-	cf.StringVar(&cfg.probeSizeRaw, "", "probe-size", cfg.probeSizeRaw, "probe payload size; e.g. 1B, 4KiB, 8MiB")
-	cf.StringVar(&cfg.deadlineRaw, "", "deadline", "", "transfer deadline (e.g. 60s, 5m)")
-	cf.StringVar(&cfg.traceFile, "", "trace", "", "write runtime/trace output to this file")
+	cf.BoolVar(&cfg.clean, "", "clean", false, "Remove LOCAL_DST first, then force a clean transfer")
+	cf.BoolVar(&cfg.skipFetch, "", "skip-fetch", false, "Fetch and persist remote manifest state only; do not start or sync files")
+	cf.BoolVar(&cfg.skipWrite, "", "skip-write", false, "Do not mutate LOCAL_DST; fetch file bodies to discard instead of writing them")
+	cf.BoolVar(&cfg.skipFsync, "", "skip-fsync", false, "Acknowledge writes without fdatasync")
+	cf.BoolVar(&cfg.verifyMeta, "", "verify-meta", false, "Run read-only metadata verification after copy; with --skip-fetch this is allowed only if LOCAL_DST already exists")
+	cf.IntVar(&cfg.verifyDataSamplePct, "", "verify-data-sample", 0, "Percent of frame slots to sample per file for data verification (0-100); implies --verify-meta; not allowed with --skip-fetch or --skip-write")
+	cf.StringVar(&cfg.modeRaw, "", "mode", LoadStrategyFast, "Server read strategy: fast|gentle")
+	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.StringVar(&cfg.compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
+	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "Parallel download / verification workers (0=adapt from server)")
+	cf.BoolVar(&cfg.progress, "", "progress", true, "Show transfer progress every 2s")
+	cf.BoolVar(&cfg.verbose, "v", "verbose", false, "Per-file progress output")
+	cf.StringVar(&cfg.progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
+	cf.StringVar(&cfg.progressFileIntervalRaw, "", "progress-file-interval", cfg.progressFileIntervalRaw, "Progress write interval (e.g. 500ms, 10s)")
+	cf.BoolVar(&cfg.yes, "y", "yes", false, "Skip confirmation prompt on sync paths")
+	cf.StringVar(&cfg.ackEveryRaw, "a", "ack-every", cfg.ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
+	cf.StringVar(&cfg.batchSizeRaw, "b", "batch-size", cfg.batchSizeRaw, "Parallel batch size / unit of work per concurrent request; 1B, 4KiB, 8MiB")
+	cf.StringVar(&cfg.probeSizeRaw, "", "probe-size", cfg.probeSizeRaw, "Probe payload size; e.g. 1B, 4KiB, 8MiB")
+	cf.StringVar(&cfg.deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
+	cf.StringVar(&cfg.traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -510,6 +512,11 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	compress, err := resolveCompress(cfg.compressRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --compress: %v\n", err)
+		return 2
+	}
+	loadStrategy, err := resolveLoadStrategy(cfg.modeRaw)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --mode: %v\n", err)
 		return 2
 	}
 	probeBytes, err := encoding.ParseByteSize(cfg.probeSizeRaw)
@@ -564,7 +571,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		targetDir:    cfg.localDst,
 		agePublicKey: agePublicKey,
 		ageIdentity:  ageIdentity,
-		loadStrategy: LoadStrategyFast,
+		loadStrategy: loadStrategy,
 		probeBytes:   probeBytes,
 		verbose:      false,
 		maxChunk:     0,
@@ -804,9 +811,9 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *Manife
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			client := NewClient(serverURL)
+			client := NewClient(serverURL, WithClientAgePublicKey(agePublicKey), WithClientAgeIdentity(ageIdentity))
 			for task := range taskCh {
-				if err := verifySampleTaskData(ctx, client, manifest.TransferID, task, agePublicKey, ageIdentity); err != nil {
+				if err := verifySampleTaskData(ctx, client, manifest.TransferID, task); err != nil {
 					select {
 					case errCh <- err:
 					default:
@@ -894,18 +901,18 @@ func buildVerifySamples(fileSize int64, pct int, rng *rand.Rand) []verifySample 
 	return samples
 }
 
-func verifySampleTaskData(ctx context.Context, client *Client, transferID string, task verifySampleTask, agePublicKey string, ageIdentity string) error {
+func verifySampleTaskData(ctx context.Context, client *Client, transferID string, task verifySampleTask) error {
 	fd, err := os.Open(task.localPath)
 	if err != nil {
 		return fmt.Errorf("open local sample path %s: %w", task.localPath, err)
 	}
 	defer fd.Close()
 
-	targets := make([]FetchChecksumTarget, 0, len(task.samples))
+	targets := make([]ChecksumTarget, 0, len(task.samples))
 	wantHashes := make([]string, 0, len(task.samples))
 	buf := make([]byte, verifySampleBytes)
 	for _, sample := range task.samples {
-		targets = append(targets, FetchChecksumTarget{
+		targets = append(targets, ChecksumTarget{
 			FileID:   task.entry.ID,
 			FullPath: task.serverPath,
 			Offset:   sample.Offset,
@@ -921,11 +928,9 @@ func verifySampleTaskData(ctx context.Context, client *Client, transferID string
 
 	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	resp, err := client.FetchChecksumStream(verifyCtx, FetchChecksumStreamRequest{
-		TransferID:   transferID,
-		Targets:      targets,
-		AgePublicKey: agePublicKey,
-		AgeIdentity:  ageIdentity,
+	resp, err := client.GetChecksum(verifyCtx, GetChecksumRequest{
+		TransferID: transferID,
+		Targets:    targets,
 	})
 	if err != nil {
 		return fmt.Errorf("checksum request failed for %s: %w", task.serverPath, err)
@@ -996,14 +1001,14 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	var verbose bool
 	var maxChunk int
 	var deadlineRaw string
-	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory to transfer")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "encryption algorithm: none|age (default: none)")
-	cf.StringVar(&loadStrategyRaw, "", "load-strategy", LoadStrategyFast, "server load strategy (fast|gentle)")
+	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory to transfer")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.StringVar(&loadStrategyRaw, "", "load-strategy", LoadStrategyFast, "Server load strategy (fast|gentle)")
 	probeSizeRaw = encoding.HumanBytes(defaultCLIProbeBytes)
-	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "probe payload size for transfer metadata; 1B, 4KiB, 8MiB")
-	cf.BoolVar(&verbose, "v", "verbose", false, "disable front-coding")
-	cf.IntVar(&maxChunk, "", "max-manifest-chunk-size", 0, "max chunk bytes for manifest stream")
-	cf.StringVar(&deadlineRaw, "", "deadline", "", "transfer deadline (e.g. 60s, 5m)")
+	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "Probe payload size for transfer metadata; 1B, 4KiB, 8MiB")
+	cf.BoolVar(&verbose, "v", "verbose", false, "Disable front-coding")
+	cf.IntVar(&maxChunk, "", "max-manifest-chunk-size", 0, "Max chunk bytes for manifest stream")
+	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -1081,14 +1086,12 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 
 	fmt.Fprintf(stderr, "transfer(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
-	client := NewClient(serverURL, WithLoadStrategy(cfg.loadStrategy))
+	client := NewClient(serverURL, WithLoadStrategy(cfg.loadStrategy), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity))
 	start := time.Now()
 	probeResult, err := client.ProbeLink(context.Background(), ProbeRequest{
 		Samples:      3,
 		ProbeBytes:   cfg.probeBytes,
 		LoadStrategy: cfg.loadStrategy,
-		AgePublicKey: cfg.agePublicKey,
-		AgeIdentity:  cfg.ageIdentity,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "probe failed: %v\n", err)
@@ -1103,7 +1106,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		probeResult.LinkMbps,
 		probeResult.SuggestedConcurrency,
 	)
-	manifestResp, err := client.FetchManifest(context.Background(), FetchManifestRequest{
+	manifestResp, err := client.GetManifest(context.Background(), GetManifestRequest{
 		Directory:    cfg.sourceDir,
 		Verbose:      cfg.verbose,
 		MaxChunkSize: cfg.maxChunk,
@@ -1111,8 +1114,6 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		LinkMbps:     probeResult.LinkMbps,
 		Concurrency:  probeResult.SuggestedConcurrency,
 		DeadlineMS:   cfg.deadlineMS,
-		AgePublicKey: cfg.agePublicKey,
-		AgeIdentity:  cfg.ageIdentity,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "transfer failed: %v\n", err)
@@ -1150,77 +1151,264 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 	cf := newCLIFlags("status")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli status --tid <id>")
+		fmt.Fprintln(stderr, "usage: pinch filecli [addr] status [--tid <id>] [LOCAL_DST]")
+		fmt.Fprintln(stderr)
+		fmt.Fprintln(stderr, "Query and monitor transfer progress.")
+		fmt.Fprintln(stderr)
+		fmt.Fprintln(stderr, "Modes:")
+		fmt.Fprintln(stderr, "  status LOCAL_DST       Discover transfer from .pinch/ state and poll until complete")
+		fmt.Fprintln(stderr, "  status --tid <id>      Poll a transfer by ID (server-side progress only)")
+		fmt.Fprintln(stderr, "  status                 List all active transfers on the server")
+		fmt.Fprintln(stderr)
 		cf.PrintDefaults(stderr)
 	}
 	var txferID string
-	cf.StringVar(&txferID, "", "tid", "", "transfer id")
+	cf.StringVar(&txferID, "", "tid", "", "Transfer ID")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
 	}
-	if txferID == "" {
-		fmt.Fprintln(stderr, "status requires --tid")
+	if cf.NArg() > 1 {
+		fmt.Fprintln(stderr, "status accepts at most one positional argument: LOCAL_DST")
 		return 2
 	}
 
 	client := NewClient(serverURL)
-	statusResp, err := client.GetTransferStatus(context.Background(), GetTransferStatusRequest{
-		TransferID: txferID,
-	})
+
+	// Mode 1: LOCAL_DST given — discover transfer from .pinch/ state.
+	if cf.NArg() == 1 {
+		localDst := cf.Arg(0)
+		ps, err := newPinchState(localDst)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
+			return 2
+		}
+		if _, err := os.Stat(ps.ServerManifestPath); os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "No active transfer for %s\n", localDst)
+			return 0
+		}
+		manifest, err := LoadManifest(ps.ServerManifestPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
+			return 1
+		}
+		txferID = manifest.TransferID
+		return pollTransferStatus(client, txferID, manifest, ps.ProgressPath, stdout, stderr)
+	}
+
+	// Mode 2: --tid given — poll by transfer ID (no local progress).
+	if txferID != "" {
+		return pollTransferStatus(client, txferID, nil, "", stdout, stderr)
+	}
+
+	// Mode 3: no args — list all active transfers.
+	listResp, err := client.ListStatuses(context.Background(), ListStatusesRequest{})
 	if err != nil {
 		fmt.Fprintf(stderr, "status failed: %v\n", err)
 		return 1
 	}
-	status := statusResp.Status
-
-	fmt.Fprintf(stdout, "transfer=%s files=%d done=%d done_size=%d total_size=%d\n", status.TransferID, status.NumFiles, status.Done, status.DoneSize, status.TotalSize)
-	fmt.Fprintf(stdout, "complete: files=%.2f%% bytes=%.2f%%\n", status.PercentFiles, status.PercentBytes)
-	fmt.Fprintf(
-		stdout,
-		"downloads: started=%d running=%d done=%d missing=%d\n",
-		status.DownloadStatus.Started,
-		status.DownloadStatus.Running,
-		status.DownloadStatus.Done,
-		status.DownloadStatus.Missing,
-	)
+	if len(listResp.Statuses) == 0 {
+		fmt.Fprintln(stdout, "No active transfers")
+		return 0
+	}
+	for _, s := range listResp.Statuses {
+		fmt.Fprintf(
+			stdout,
+			"[%s] source=[%s] files=[%d/%d](%.1f%%) bytes=[%s/%s](%.1f%%)\n",
+			s.TransferID,
+			s.Directory,
+			s.Done, s.NumFiles, s.PercentFiles,
+			encoding.HumanBytes(s.DoneSize), encoding.HumanBytes(s.TotalSize), s.PercentBytes,
+		)
+	}
 	return 0
+}
+
+func computeLocalProgress(manifest *Manifest, progressPath string) (doneFiles int, totalFiles int, doneBytes int64, totalBytes int64) {
+	if manifest == nil || progressPath == "" {
+		return
+	}
+	totalFiles = len(manifest.Entries)
+	for _, e := range manifest.Entries {
+		totalBytes += e.Size
+	}
+	progressState, err := loadProgressState(progressPath)
+	if err != nil {
+		return
+	}
+	for _, e := range manifest.Entries {
+		if p, ok := progressState[e.ID]; ok {
+			ack := p.AckBytes
+			if ack > e.Size {
+				ack = e.Size
+			}
+			doneBytes += ack
+			if ack >= e.Size {
+				doneFiles++
+			}
+		}
+	}
+	return
+}
+
+func pollTransferStatus(client *Client, txferID string, manifest *Manifest, progressPath string, stdout io.Writer, stderr io.Writer) int {
+	hasLocal := manifest != nil && progressPath != ""
+	var totalBytes int64
+	var totalFiles int
+	if manifest != nil {
+		totalFiles = len(manifest.Entries)
+		for _, e := range manifest.Entries {
+			totalBytes += e.Size
+		}
+	}
+
+	ticker := time.NewTicker(defaultVerboseProgressInterval)
+	defer ticker.Stop()
+	var prevDoneSize int64
+	prevTime := time.Now()
+	startTime := prevTime
+
+	// Track high-water marks for local progress so it never regresses
+	// (the progress file may be cleaned up when the copy finishes).
+	var peakLocalDoneFiles int
+	var peakLocalDoneBytes int64
+
+	for {
+		statusResp, statusErr := client.GetStatus(context.Background(), GetStatusRequest{
+			TransferID: txferID,
+		})
+		if statusErr != nil {
+			if strings.Contains(statusErr.Error(), "NOT_FOUND") {
+				fmt.Fprintf(stderr, "Transfer %s expired on server\n", txferID)
+				return 0
+			}
+			fmt.Fprintf(stderr, "status failed: %v\n", statusErr)
+			return 1
+		}
+		s := statusResp.Status
+		now := time.Now()
+		dt := now.Sub(prevTime).Seconds()
+		var rateBps float64
+		if dt > 0 {
+			rateBps = float64(s.DoneSize-prevDoneSize) / dt
+		}
+		prevDoneSize = s.DoneSize
+		prevTime = now
+
+		etaPart := ""
+		if rateBps > 0 && s.TotalSize > s.DoneSize {
+			remaining := float64(s.TotalSize - s.DoneSize)
+			etaSec := remaining / rateBps
+			etaPart = fmt.Sprintf(" eta=%s", (time.Duration(etaSec * float64(time.Second))).Round(time.Second))
+		}
+		fmt.Fprintf(
+			stdout,
+			"server: files=[%d/%d](%.1f%%) bytes=[%s/%s](%.1f%%) rate=%s%s\n",
+			s.Done, s.NumFiles, s.PercentFiles,
+			encoding.HumanBytes(s.DoneSize), encoding.HumanBytes(s.TotalSize),
+			s.PercentBytes,
+			encoding.HumanRate(rateBps), etaPart,
+		)
+		if hasLocal {
+			localDoneFiles, localTotalFiles, localDoneBytes, localTotalBytes := computeLocalProgress(manifest, progressPath)
+			if localDoneFiles > peakLocalDoneFiles {
+				peakLocalDoneFiles = localDoneFiles
+			}
+			if localDoneBytes > peakLocalDoneBytes {
+				peakLocalDoneBytes = localDoneBytes
+			}
+			// If the server is done, the client must be done too — the progress
+			// file may have already been cleaned up, so clamp peaks to totals.
+			if s.PercentBytes >= 100.0 {
+				peakLocalDoneFiles = localTotalFiles
+				peakLocalDoneBytes = localTotalBytes
+			}
+			var localPctFiles, localPctBytes float64
+			if localTotalFiles > 0 {
+				localPctFiles = float64(peakLocalDoneFiles) * 100.0 / float64(localTotalFiles)
+			}
+			if localTotalBytes > 0 {
+				localPctBytes = float64(peakLocalDoneBytes) * 100.0 / float64(localTotalBytes)
+			}
+			fmt.Fprintf(
+				stdout,
+				"client: files=[%d/%d](%.1f%%) bytes=[%s/%s](%.1f%%)\n",
+				peakLocalDoneFiles, localTotalFiles, localPctFiles,
+				encoding.HumanBytes(peakLocalDoneBytes), encoding.HumanBytes(localTotalBytes),
+				localPctBytes,
+			)
+		}
+
+		// Check for completion.
+		serverDone := s.PercentBytes >= 100.0
+		localDone := true
+		if hasLocal {
+			localDone = peakLocalDoneFiles >= totalFiles && peakLocalDoneBytes >= totalBytes
+		}
+		if serverDone && localDone {
+			elapsed := time.Since(startTime)
+			overallSpeed := 0.0
+			if elapsed.Seconds() > 0 {
+				overallSpeed = float64(s.TotalSize) / elapsed.Seconds()
+			}
+			fmt.Fprintf(
+				stdout,
+				"\ntransfer complete: tid=%s files=%d size=%s elapsed=%s speed=%s\n",
+				txferID,
+				s.NumFiles,
+				encoding.HumanBytes(s.TotalSize),
+				elapsed.Round(time.Millisecond),
+				encoding.HumanRate(overallSpeed),
+			)
+			return 0
+		}
+
+		<-ticker.C
+	}
 }
 
 func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
 	cf := newCLIFlags("get")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli get --fd <uint64> [-o <path|->] [flags] <target-dir>")
+		fmt.Fprintln(stderr, "usage: pinch filecli [addr] get [flags] REMOTE_PATH")
+		fmt.Fprintln(stderr)
+		fmt.Fprintln(stderr, "Download a single remote file. REMOTE_PATH must be an absolute path to a file")
+		fmt.Fprintln(stderr, "on the server. Output defaults to the file's basename in the current directory.")
+		fmt.Fprintln(stderr)
 		cf.PrintDefaults(stderr)
 	}
-	var fileIDRaw string
 	var outFile string
 	var encryptMode string
-	var loadStrategyRaw string
 	var compressRaw string
 	var ackEveryRaw string
 	var batchSizeRaw string
-	var noSync bool
+	var skipWrite bool
+	var skipFsync bool
+	var concurrency int
 	var verbose bool
+	var progress bool
+	var deadlineRaw string
 	var traceFile string
 	var progressFilePath string
 	var progressFileIntervalRaw string
-	cf.StringVar(&fileIDRaw, "", "fd", "", "file id to download")
-	cf.StringVar(&outFile, "o", "", "", "output file path, or '-' for stdout")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "encryption algorithm: none|age (default: none)")
-	cf.StringVar(&loadStrategyRaw, "", "load-strategy", LoadStrategyFast, "server load strategy (fast|gentle)")
-	cf.StringVar(&compressRaw, "", "compress", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
-	cf.BoolVar(&verbose, "v", "verbose", false, "per-file progress output")
-	cf.StringVar(&progressFilePath, "", "progress-file", "", "write integer % to this file/pipe")
-	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "progress write interval (e.g. 500ms, 10s)")
+	cf.StringVar(&outFile, "o", "", "", "Output file path, or '-' for stdout")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
+	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=auto)")
+	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not write the file; fetch to discard instead")
+	cf.BoolVar(&skipFsync, "", "skip-fsync", false, "Acknowledge writes without fdatasync")
+	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
+	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
+	cf.StringVar(&progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
+	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
-	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks; 1B, 4KiB, 8MiB")
-	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size / unit of work per concurrent request; 1B, 4KiB, 8MiB")
-	cf.BoolVar(&noSync, "", "no-sync", false, "ack without disk sync")
-	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
+	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
+	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "Parallel batch size / unit of work per concurrent request; 1B, 4KiB, 8MiB")
+	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
+	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -1229,17 +1417,13 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	}
 	stopTracing := startTracing(traceFile, stderr)
 	defer stopTracing()
-	if fileIDRaw == "" {
-		fmt.Fprintln(stderr, "get requires --fd")
-		return 2
-	}
 	if cf.NArg() != 1 {
-		fmt.Fprintln(stderr, "get requires exactly one positional argument: <target-dir>")
+		fmt.Fprintln(stderr, "get requires exactly one positional argument: REMOTE_PATH")
 		return 2
 	}
-	ps, err := newPinchState(cf.Arg(0))
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
+	remotePath := cf.Arg(0)
+	if !filepath.IsAbs(remotePath) {
+		fmt.Fprintln(stderr, "get requires REMOTE_PATH to be an absolute server path")
 		return 2
 	}
 	progressInterval, err := time.ParseDuration(progressFileIntervalRaw)
@@ -1248,21 +1432,13 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		return 2
 	}
 	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
-	if err != nil {
+	if err != nil || ackEvery <= 0 {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
 	}
-	if ackEvery <= 0 {
-		fmt.Fprintln(stderr, "--ack-every must be > 0")
-		return 2
-	}
 	batchSize, err := encoding.ParseByteSize(batchSizeRaw)
-	if err != nil {
+	if err != nil || batchSize <= 0 {
 		fmt.Fprintf(stderr, "invalid --batch-size: %v\n", err)
-		return 2
-	}
-	if batchSize <= 0 {
-		fmt.Fprintln(stderr, "--batch-size must be > 0")
 		return 2
 	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
@@ -1270,40 +1446,64 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
 	}
-	loadStrategy, err := resolveLoadStrategy(loadStrategyRaw)
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid --load-strategy: %v\n", err)
-		return 2
-	}
 	compress, err := resolveCompress(compressRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --compress: %v\n", err)
 		return 2
 	}
-	fileID, err := parseFileID(fileIDRaw)
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid --fd: %v\n", err)
-		return 2
+	var deadlineMS int64
+	if deadlineRaw != "" {
+		d, dErr := time.ParseDuration(deadlineRaw)
+		if dErr != nil || d <= 0 {
+			fmt.Fprintf(stderr, "invalid --deadline: %v\n", dErr)
+			return 2
+		}
+		deadlineMS = d.Milliseconds()
 	}
-	outRoot := ps.TargetDir
-	// get prefers the client-state manifest; falls back to the server manifest
-	// so it can be used right after transfer before start has run.
-	manifestFile := ps.ManifestPath
-	if _, err := os.Stat(manifestFile); os.IsNotExist(err) {
-		manifestFile = ps.ServerManifestPath
+
+	// Resolve output path: -o overrides, default is basename in cwd.
+	outputPath := strings.TrimSpace(outFile)
+	if outputPath == "" {
+		outputPath = filepath.Base(remotePath)
 	}
-	fmt.Fprintf(stderr, "state: %s\n", manifestFile)
-	manifest, err := LoadManifest(manifestFile)
+	if skipWrite {
+		outputPath = os.DevNull
+	}
+
+	effectiveConcurrency := DefaultClientConcurrency()
+	if concurrency > 0 {
+		effectiveConcurrency = concurrency
+	}
+
+	client := NewClient(serverURL, WithLoadStrategy(LoadStrategyFast), WithComp(compress), WithClientAgePublicKey(agePublicKey), WithClientAgeIdentity(ageIdentity))
+
+	// Fetch manifest for the single file (skip full probe).
+	fmt.Fprintf(stderr, "get(addr=[%s], path=[%s])\n", serverURL, remotePath)
+	manifestResp, err := client.GetManifest(context.Background(), GetManifestRequest{
+		Directory:   remotePath,
+		Mode:        LoadStrategyFast,
+		LinkMbps:    0,
+		Concurrency: effectiveConcurrency,
+		DeadlineMS:  deadlineMS,
+	})
 	if err != nil {
-		fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
+		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1
 	}
-	progressState, err := loadProgressState(ps.ProgressPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
+	manifest := manifestResp.Manifest
+	if len(manifest.Entries) != 1 {
+		fmt.Fprintf(stderr, "get failed: expected single file manifest, got %d entries\n", len(manifest.Entries))
 		return 1
 	}
-	applyProgressStateToManifest(manifest, progressState)
+	entry := manifest.Entries[0]
+	fmt.Fprintf(stderr, "get-manifest: tid=%s file=%s size=%s\n", manifest.TransferID, entry.Path, encoding.HumanBytes(entry.Size))
+
+	// Mini-probe to detect server send buffer.
+	if miniProbe, probeErr := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil && miniProbe.ServerSendBufBytes > 0 {
+		_ = miniProbe // buffer info used internally by client
+	}
+
+	start := time.Now()
 	progressUpdates := make(chan DownloadProgressUpdate, 128)
 	var onProgressUpdate func(DownloadProgressUpdate)
 	if verbose {
@@ -1316,41 +1516,24 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 			onProgressUpdate(update)
 		}
 	}
-	stopProgress, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, progressState, progressUpdates, forwardProgress, stderr)
-	markMetadataDone := func(fileID uint64) {
-		markManifestEntryMetadataDone(manifest, fileID)
-		markMetadataDonePersisted(fileID)
-	}
-	defer stopProgress()
-
-	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(compress))
-	start := time.Now()
-	entry, ok := manifest.EntryByID(fileID)
-	if !ok {
-		fmt.Fprintf(stderr, "get failed: file id %d not in manifest\n", fileID)
-		return 1
-	}
-	progress := entry.Progress
-	if progress.AckBytes >= entry.Size {
-		if !progress.MetadataDone {
-			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, fileID, outRoot, outFile, agePublicKey, ageIdentity); err != nil {
-				fmt.Fprintf(stderr, "get metadata refresh failed: %v\n", err)
-				return 1
-			}
-			markMetadataDone(fileID)
-			fmt.Fprintf(stderr, "get metadata refreshed: fd=%d\n", fileID)
-			return 0
+	// Use a no-op progress writer (no .pinch state for single-file get).
+	go func() {
+		for update := range progressUpdates {
+			forwardProgress(update)
 		}
-		fmt.Fprintf(stderr, "get skipped: already complete fd=%d ack=%d\n", fileID, progress.AckBytes)
-		return 0
+	}()
+
+	var stopStatusPolling func()
+	if progress {
+		stopStatusPolling = startVerboseStatusPolling(manifest.TransferID, client, stderr)
+		defer stopStatusPolling()
 	}
-	outputPath := resolveDownloadDestinationPath(entry, outRoot, outFile)
+
 	var totalCopied atomic.Int64
 	outputWriter := func(me ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
-		destPath := resolveDownloadDestinationPath(me, outRoot, outFile)
-		w, syncFn, err := openDownloadOutput(me, offset, destPath, stdout, noSync)
-		if err != nil {
-			return nil, nil, err
+		w, syncFn, wErr := openDownloadOutput(me, offset, outputPath, stdout, skipFsync)
+		if wErr != nil {
+			return nil, nil, wErr
 		}
 		return &countingWriter{Writer: w, total: &totalCopied}, syncFn, nil
 	}
@@ -1368,13 +1551,12 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		})
 		defer func() { stopProgressFile(err == nil) }()
 	}
-	downloadBatchResp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+
+	downloadBatchResp, err := client.GetFiles(context.Background(), GetFilesRequest{
 		Manifest:        manifest,
-		FileIDs:         []uint64{fileID},
+		FileIDs:         []uint64{0},
 		BatchMaxBytes:   batchSize,
 		OutputWriter:    outputWriter,
-		AgePublicKey:    agePublicKey,
-		AgeIdentity:     ageIdentity,
 		ProgressUpdates: progressUpdates,
 	})
 	elapsed := time.Since(start)
@@ -1391,8 +1573,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1
 	}
-	markMetadataDone(fileID)
-	printFileMetrics(stdout, manifest.TransferID, fileID, outputPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
+	printFileMetrics(stdout, manifest.TransferID, 0, outputPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
 	return 0
 }
 
@@ -1417,23 +1598,23 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var traceFile string
 	var progressFilePath string
 	var progressFileIntervalRaw string
-	cf.StringVar(&sourceDir, "s", "source-directory", "", "absolute source directory on server (default: manifest root)")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "encryption algorithm: none|age (default: none)")
-	cf.StringVar(&compressRaw, "", "compress", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
-	cf.IntVar(&concurrency, "", "concurrency", 0, "parallel download workers (0=manifest default)")
-	cf.BoolVar(&yes, "y", "yes", false, "skip confirmation prompt")
-	cf.BoolVar(&verbose, "v", "verbose", false, "per-file progress output")
-	cf.StringVar(&progressFilePath, "", "progress-file", "", "write integer % to this file/pipe")
-	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "progress write interval (e.g. 500ms, 10s)")
+	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory on server (default: manifest root)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
+	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
+	cf.BoolVar(&yes, "y", "yes", false, "Skip confirmation prompt")
+	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
+	cf.StringVar(&progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
+	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
-	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks; 1B, 4KiB, 8MiB")
-	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size; 1B, 4KiB, 8MiB")
-	cf.BoolVar(&skipWrite, "", "skip-write", false, "do not mutate the target directory; fetch bodies to discard instead of writing them")
-	cf.BoolVar(&noSync, "", "skip-fsync", false, "ack without fdatasync")
-	cf.BoolVar(&noSync, "", "no-sync", false, "ack without fdatasync")
+	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; 1B, 4KiB, 8MiB")
+	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "Parallel batch size; 1B, 4KiB, 8MiB")
+	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not mutate the target directory; fetch bodies to discard instead of writing them")
+	cf.BoolVar(&noSync, "", "skip-fsync", false, "Ack without fdatasync")
+	cf.BoolVar(&noSync, "", "no-sync", false, "Ack without fdatasync")
 	probeSizeRaw = encoding.HumanBytes(defaultCLIProbeBytes)
-	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "probe payload size; 1B, 4KiB, 8MiB")
-	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
+	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "Probe payload size; 1B, 4KiB, 8MiB")
+	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -1554,13 +1735,11 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		}
 
 		// Probe link bandwidth.
-		client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress))
+		client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity))
 		probeResult, err := client.ProbeLink(context.Background(), ProbeRequest{
 			Samples:      3,
 			ProbeBytes:   cfg.probeBytes,
 			LoadStrategy: loadStrategy,
-			AgePublicKey: cfg.agePublicKey,
-			AgeIdentity:  cfg.ageIdentity,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "probe failed: %v\n", err)
@@ -1574,8 +1753,6 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			Mode:         loadStrategy,
 			LinkMbps:     probeResult.LinkMbps,
 			Concurrency:  probeResult.SuggestedConcurrency,
-			AgePublicKey: cfg.agePublicKey,
-			AgeIdentity:  cfg.ageIdentity,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "sync failed: %v\n", err)
@@ -1773,8 +1950,6 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			Manifest:        mergedManifest,
 			Entries:         pendingEntries,
 			OutputWriter:    outputWriter,
-			AgePublicKey:    cfg.agePublicKey,
-			AgeIdentity:     cfg.ageIdentity,
 			Concurrency:     effectiveConcurrency,
 			BatchMaxBytes:   cfg.batchSize,
 			ProgressUpdates: progressUpdates,
@@ -1860,23 +2035,23 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var deadlineRaw string
 	var progressFilePath string
 	var progressFileIntervalRaw string
-	cf.StringVar(&encryptMode, "", "encrypt", "", "encryption algorithm: none|age (default: none)")
-	cf.BoolVar(&progress, "", "progress", true, "show transfer progress every 2s")
-	cf.BoolVar(&verbose, "v", "verbose", false, "per-file progress output")
-	cf.StringVar(&progressFilePath, "", "progress-file", "", "write integer % to this file/pipe")
-	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "progress write interval (e.g. 500ms, 10s)")
-	cf.BoolVar(&discard, "", "skip-write", false, "discard downloaded file contents instead of writing to the target directory")
-	cf.BoolVar(&discard, "", "discard", false, "discard downloaded file contents instead of writing to the target directory")
-	cf.IntVar(&concurrency, "", "concurrency", 0, "parallel download workers (0=manifest default)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
+	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
+	cf.StringVar(&progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
+	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
+	cf.BoolVar(&discard, "", "skip-write", false, "Discard downloaded file contents instead of writing to the target directory")
+	cf.BoolVar(&discard, "", "discard", false, "Discard downloaded file contents instead of writing to the target directory")
+	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
-	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "bytes between progress acks; 1B, 4KiB, 8MiB")
-	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "parallel batch size / unit of work per concurrent request; 1B, 4KiB, 8MiB")
-	cf.StringVar(&compressRaw, "", "compress", "", "compression algorithm: adapt|none|lz4|zstd (default: adapt)")
-	cf.BoolVar(&noSync, "", "skip-fsync", false, "ack without fdatasync")
-	cf.BoolVar(&noSync, "", "no-sync", false, "ack without fdatasync")
-	cf.StringVar(&deadlineRaw, "", "deadline", "", "transfer deadline (e.g. 60s, 5m)")
+	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; 1B, 4KiB, 8MiB")
+	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "Parallel batch size / unit of work per concurrent request; 1B, 4KiB, 8MiB")
+	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
+	cf.BoolVar(&noSync, "", "skip-fsync", false, "Ack without fdatasync")
+	cf.BoolVar(&noSync, "", "no-sync", false, "Ack without fdatasync")
+	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
 	var traceFile string
-	cf.StringVar(&traceFile, "", "trace", "", "write runtime/trace output to this file")
+	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -2042,7 +2217,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			stopProgress()
 		}
 	}()
-	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress))
+	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity))
 	serverSendBufBytes := int64(utils.MaxSocketWriteBufferBytes())
 	if miniProbe, err := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); err == nil && miniProbe.ServerSendBufBytes > 0 {
 		serverSendBufBytes = miniProbe.ServerSendBufBytes
@@ -2084,7 +2259,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 				completed++
 				continue
 			}
-			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, "", cfg.agePublicKey, cfg.ageIdentity); err != nil {
+			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, ""); err != nil {
 				recordFailure(fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err))
 				continue
 			}
@@ -2124,8 +2299,6 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		Manifest:        manifest,
 		Entries:         pendingEntries,
 		OutputWriter:    outputWriter,
-		AgePublicKey:    cfg.agePublicKey,
-		AgeIdentity:     cfg.ageIdentity,
 		Concurrency:     effectiveConcurrency,
 		BatchMaxBytes:   cfg.batchSize,
 		ProgressUpdates: progressUpdates,
@@ -2252,7 +2425,7 @@ func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer)
 		var prevDoneSize int64
 		prevTime := time.Now()
 		for {
-			statusResp, statusErr := client.GetTransferStatus(ctx, GetTransferStatusRequest{
+			statusResp, statusErr := client.GetStatus(ctx, GetStatusRequest{
 				TransferID: txferID,
 			})
 			if statusErr != nil {
@@ -2639,7 +2812,7 @@ func startProgressWriter(progressPath string, initial map[uint64]ManifestProgres
 	return stop, markMetadataDone
 }
 
-func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest *Manifest, fileID uint64, outRoot string, outFile string, agePublicKey string, ageIdentity string) error {
+func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest *Manifest, fileID uint64, outRoot string, outFile string) error {
 	if manifest == nil {
 		return errors.New("nil manifest")
 	}
@@ -2661,7 +2834,7 @@ func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest 
 	if !filepath.IsAbs(serverPath) {
 		return fmt.Errorf("resolved file path is not absolute: %s", serverPath)
 	}
-	meta, err := fetchTerminalTrailerMetadataFromChecksum(ctx, client, manifest.TransferID, fileID, serverPath, entry.Size, agePublicKey, ageIdentity)
+	meta, err := fetchTerminalTrailerMetadataFromChecksum(ctx, client, manifest.TransferID, fileID, serverPath, entry.Size)
 	if err != nil {
 		return err
 	}
@@ -2671,18 +2844,16 @@ func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest 
 	return applyTrailerMetadataToPath(destPath, meta)
 }
 
-func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Client, transferID string, fileID uint64, serverPath string, fileSize int64, agePublicKey string, ageIdentity string) (*FileTrailerMetadata, error) {
-	resp, err := client.FetchChecksumStream(ctx, FetchChecksumStreamRequest{
+func fetchTerminalTrailerMetadataFromChecksum(ctx context.Context, client *Client, transferID string, fileID uint64, serverPath string, fileSize int64) (*FileTrailerMetadata, error) {
+	resp, err := client.GetChecksum(ctx, GetChecksumRequest{
 		TransferID: transferID,
-		Targets: []FetchChecksumTarget{{
+		Targets: []ChecksumTarget{{
 			FileID:   fileID,
 			FullPath: serverPath,
 			Offset:   0,
 			Size:     fileSize,
 			Algo:     "xxh128",
 		}},
-		AgePublicKey: agePublicKey,
-		AgeIdentity:  ageIdentity,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("checksum request failed: %w", err)

@@ -26,6 +26,7 @@ func (f fakeDeps) SetTransferHints(string, string, int64, int) bool { return tru
 func (f fakeDeps) GetTransfer(string) (Transfer, bool) {
 	return f.transfer, f.transferOK
 }
+func (f fakeDeps) ListTransfers() []Transfer { return nil }
 func (f fakeDeps) GetFile(string, uint64, string) (*os.File, FileRef, error) {
 	return nil, FileRef{}, nil
 }

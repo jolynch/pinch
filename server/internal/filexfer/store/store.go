@@ -1001,6 +1001,10 @@ func ListTransfersForTest() []Transfer {
 	return listTransfersForTest()
 }
 
+func ListTransfers() []Transfer {
+	return manager.listForTest()
+}
+
 func transferID() (string, error) {
 	buf := make([]byte, 4)
 	if _, err := rand.Read(buf); err != nil {

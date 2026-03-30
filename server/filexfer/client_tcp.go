@@ -173,10 +173,10 @@ func encodeAUTHBlobToken(blob []byte, encrypted bool) string {
 	return quoteToken(string(blob))
 }
 
-func (c *Client) resolveTCPAuthState(requestPub string, requestIdentity string) (tcpAuthState, error) {
+func (c *Client) resolveTCPAuthState() (tcpAuthState, error) {
 	state := tcpAuthState{}
-	requestPub = strings.TrimSpace(requestPub)
-	requestIdentity = strings.TrimSpace(requestIdentity)
+	requestPub := strings.TrimSpace(c.ClientAgePublicKey)
+	requestIdentity := strings.TrimSpace(c.ClientAgeIdentity)
 	serverPub := strings.TrimSpace(c.ServerAgePublicKey)
 
 	if serverPub != "" {
@@ -279,19 +279,19 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 	return decReader, nil
 }
 
-func (c *Client) fetchManifestTCP(ctx context.Context, request FetchManifestRequest) (FetchManifestResponse, error) {
-	state, err := c.resolveTCPAuthState(request.AgePublicKey, request.AgeIdentity)
+func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
+	state, err := c.resolveTCPAuthState()
 	if err != nil {
-		return FetchManifestResponse{}, err
+		return GetManifestResponse{}, err
 	}
 	conn, err := c.dialTCP(ctx)
 	if err != nil {
-		return FetchManifestResponse{}, fmt.Errorf("dial file listener: %w", err)
+		return GetManifestResponse{}, fmt.Errorf("dial file listener: %w", err)
 	}
 	defer conn.Close()
 
 	if err := c.sendTCPAuth(conn, state); err != nil {
-		return FetchManifestResponse{}, fmt.Errorf("send AUTH: %w", err)
+		return GetManifestResponse{}, fmt.Errorf("send AUTH: %w", err)
 	}
 	cmd := "TXFER " + makeLenToken(request.Directory)
 	if request.Verbose {
@@ -307,12 +307,12 @@ func (c *Client) fetchManifestTCP(ctx context.Context, request FetchManifestRequ
 		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
 	}
 	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
-		return FetchManifestResponse{}, fmt.Errorf("send TXFER: %w", err)
+		return GetManifestResponse{}, fmt.Errorf("send TXFER: %w", err)
 	}
 
 	responseReader, err := c.responseReaderForTCP(conn, state)
 	if err != nil {
-		return FetchManifestResponse{}, fmt.Errorf("initialize TXFER response stream: %w", err)
+		return GetManifestResponse{}, fmt.Errorf("initialize TXFER response stream: %w", err)
 	}
 	br := bufio.NewReader(responseReader)
 
@@ -321,18 +321,18 @@ func (c *Client) fetchManifestTCP(ctx context.Context, request FetchManifestRequ
 	for {
 		line, err := readTCPLine(br, maxTCPLineBytes)
 		if err != nil {
-			return FetchManifestResponse{}, fmt.Errorf("read TXFER response: %w", err)
+			return GetManifestResponse{}, fmt.Errorf("read TXFER response: %w", err)
 		}
 		if message, ok := parseOKStatusLine(line); ok {
 			_ = message
 			manifest, err := parseManifest(raw.Bytes())
 			if err != nil {
-				return FetchManifestResponse{}, err
+				return GetManifestResponse{}, err
 			}
-			return FetchManifestResponse{Manifest: manifest}, nil
+			return GetManifestResponse{Manifest: manifest}, nil
 		}
 		if err := parseErrControlFrame(line); err != nil {
-			return FetchManifestResponse{}, err
+			return GetManifestResponse{}, err
 		}
 		raw.WriteString(line)
 		raw.WriteByte('\n')
@@ -340,7 +340,7 @@ func (c *Client) fetchManifestTCP(ctx context.Context, request FetchManifestRequ
 }
 
 func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
-	state, err := c.resolveTCPAuthState(request.AgePublicKey, request.AgeIdentity)
+	state, err := c.resolveTCPAuthState()
 	if err != nil {
 		return SyncManifestResponse{}, err
 	}
@@ -437,8 +437,6 @@ func (c *Client) fetchFileWindowTCP(
 	txferID string,
 	fileID uint64,
 	fullPath string,
-	agePublicKey string,
-	ageIdentity string,
 	offset int64,
 	size int64,
 ) (io.ReadCloser, *FileFrameMeta, error) {
@@ -448,7 +446,7 @@ func (c *Client) fetchFileWindowTCP(
 	if fullPath == "" {
 		return nil, nil, errors.New("missing full path")
 	}
-	state, err := c.resolveTCPAuthState(agePublicKey, ageIdentity)
+	state, err := c.resolveTCPAuthState()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -530,8 +528,6 @@ func (c *Client) fetchFileBatchTCP(
 	ctx context.Context,
 	txferID string,
 	targets []FetchFileTarget,
-	agePublicKey string,
-	ageIdentity string,
 ) (io.ReadCloser, error) {
 	if txferID == "" {
 		return nil, errors.New("missing transfer id")
@@ -539,7 +535,7 @@ func (c *Client) fetchFileBatchTCP(
 	if len(targets) == 0 {
 		return nil, errors.New("missing file targets")
 	}
-	state, err := c.resolveTCPAuthState(agePublicKey, ageIdentity)
+	state, err := c.resolveTCPAuthState()
 	if err != nil {
 		return nil, err
 	}
@@ -627,11 +623,11 @@ func readTCPStatus(br *bufio.Reader) (string, error) {
 	return message, nil
 }
 
-func (c *Client) probeTCP(ctx context.Context, probeBytes int64, agePublicKey string, ageIdentity string) (probeResponse, error) {
+func (c *Client) probeTCP(ctx context.Context, probeBytes int64) (probeResponse, error) {
 	if probeBytes <= 0 {
 		return probeResponse{}, errors.New("probe bytes must be > 0")
 	}
-	state, err := c.resolveTCPAuthState(agePublicKey, ageIdentity)
+	state, err := c.resolveTCPAuthState()
 	if err != nil {
 		return probeResponse{}, err
 	}
@@ -788,7 +784,7 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	if txferID == "" {
 		return AcknowledgeFileProgressResponse{}, errors.New("missing transfer id")
 	}
-	state, err := c.resolveTCPAuthState("", "")
+	state, err := c.resolveTCPAuthState()
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, err
 	}
@@ -837,44 +833,90 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	return AcknowledgeFileProgressResponse{}, nil
 }
 
-func (c *Client) getTransferStatusTCP(ctx context.Context, request GetTransferStatusRequest) (GetTransferStatusResponse, error) {
-	state, err := c.resolveTCPAuthState("", "")
+func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (GetStatusResponse, error) {
+	state, err := c.resolveTCPAuthState()
 	if err != nil {
-		return GetTransferStatusResponse{}, err
+		return GetStatusResponse{}, err
 	}
 	conn, err := c.dialTCP(ctx)
 	if err != nil {
-		return GetTransferStatusResponse{}, fmt.Errorf("dial file listener: %w", err)
+		return GetStatusResponse{}, fmt.Errorf("dial file listener: %w", err)
 	}
 	defer conn.Close()
 	if err := c.sendTCPAuth(conn, state); err != nil {
-		return GetTransferStatusResponse{}, fmt.Errorf("send AUTH: %w", err)
+		return GetStatusResponse{}, fmt.Errorf("send AUTH: %w", err)
 	}
 
 	cmd := "STATUS " + request.TransferID
 	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
-		return GetTransferStatusResponse{}, fmt.Errorf("send STATUS: %w", err)
+		return GetStatusResponse{}, fmt.Errorf("send STATUS: %w", err)
 	}
 	responseReader, err := c.responseReaderForTCP(conn, state)
 	if err != nil {
-		return GetTransferStatusResponse{}, fmt.Errorf("initialize STATUS response stream: %w", err)
+		return GetStatusResponse{}, fmt.Errorf("initialize STATUS response stream: %w", err)
 	}
 	message, err := readTCPStatus(bufio.NewReader(responseReader))
 	if err != nil {
-		return GetTransferStatusResponse{}, fmt.Errorf("read STATUS response: %w", err)
+		return GetStatusResponse{}, fmt.Errorf("read STATUS response: %w", err)
 	}
 	if strings.TrimSpace(message) == "" {
-		return GetTransferStatusResponse{}, errors.New("missing STATUS JSON payload")
+		return GetStatusResponse{}, errors.New("missing STATUS JSON payload")
 	}
 	var status TransferStatus
 	if err := json.NewDecoder(strings.NewReader(message)).Decode(&status); err != nil {
-		return GetTransferStatusResponse{}, fmt.Errorf("decode transfer status: %w", err)
+		return GetStatusResponse{}, fmt.Errorf("decode transfer status: %w", err)
 	}
-	return GetTransferStatusResponse{Status: &status}, nil
+	return GetStatusResponse{Status: &status}, nil
 }
 
-func (c *Client) fetchChecksumStreamTCP(ctx context.Context, request FetchChecksumStreamRequest) (io.ReadCloser, error) {
-	state, err := c.resolveTCPAuthState(request.AgePublicKey, request.AgeIdentity)
+func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesRequest) (ListStatusesResponse, error) {
+	state, err := c.resolveTCPAuthState()
+	if err != nil {
+		return ListStatusesResponse{}, err
+	}
+	conn, err := c.dialTCP(ctx)
+	if err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("dial file listener: %w", err)
+	}
+	defer conn.Close()
+	if err := c.sendTCPAuth(conn, state); err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("send AUTH: %w", err)
+	}
+
+	cmd := "STATUS"
+	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("send STATUS: %w", err)
+	}
+	responseReader, err := c.responseReaderForTCP(conn, state)
+	if err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("initialize STATUS response stream: %w", err)
+	}
+	br := bufio.NewReader(responseReader)
+	countLine, err := readTCPStatus(br)
+	if err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("read STATUS response: %w", err)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(countLine))
+	if err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("parse STATUS count %q: %w", countLine, err)
+	}
+	statuses := make([]TransferStatus, 0, count)
+	for i := 0; i < count; i++ {
+		line, lineErr := readTCPLine(br, maxTCPLineBytes)
+		if lineErr != nil {
+			return ListStatusesResponse{}, fmt.Errorf("read STATUS entry %d: %w", i, lineErr)
+		}
+		var s TransferStatus
+		if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(line)), &s); jsonErr != nil {
+			return ListStatusesResponse{}, fmt.Errorf("decode STATUS entry %d: %w", i, jsonErr)
+		}
+		statuses = append(statuses, s)
+	}
+	return ListStatusesResponse{Statuses: statuses}, nil
+}
+
+func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest) (io.ReadCloser, error) {
+	state, err := c.resolveTCPAuthState()
 	if err != nil {
 		return nil, err
 	}

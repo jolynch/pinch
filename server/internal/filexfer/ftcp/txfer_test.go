@@ -35,6 +35,7 @@ func (d *txferTestDeps) RegisterTransferFileState(string, <-chan TransferFileSta
 func (d *txferTestDeps) ClipTransfer(string) bool { return true }
 
 func (d *txferTestDeps) GetTransfer(string) (Transfer, bool) { return Transfer{}, false }
+func (d *txferTestDeps) ListTransfers() []Transfer              { return nil }
 
 func (d *txferTestDeps) SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
 	d.setHintsCalls++
