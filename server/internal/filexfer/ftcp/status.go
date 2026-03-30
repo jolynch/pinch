@@ -3,6 +3,7 @@ package ftcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 )
 
@@ -37,24 +38,12 @@ func parseSTATUSRequest(req Request) (statusRequest, error) {
 		return statusRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid STATUS arguments"}
 	}
 	txferID := req.Params[0]["txferid"]
-	if txferID == "" {
-		return statusRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
-	}
 	return statusRequest{TransferID: txferID}, nil
 }
 
-func handleSTATUS(_ context.Context, req Request, out io.Writer, deps Deps) error {
-	parsed, err := parseSTATUSRequest(req)
-	if err != nil {
-		return err
-	}
-	transfer, ok := deps.GetTransfer(parsed.TransferID)
-	if !ok {
-		return protocolErr{code: "NOT_FOUND", message: "transfer not found"}
-	}
-
+func transferToStatus(id string, transfer Transfer) TransferStatus {
 	status := TransferStatus{
-		TransferID: parsed.TransferID,
+		TransferID: id,
 		Directory:  transfer.Directory,
 		NumFiles:   transfer.NumFiles,
 		TotalSize:  transfer.TotalSize,
@@ -79,7 +68,39 @@ func handleSTATUS(_ context.Context, req Request, out io.Writer, deps Deps) erro
 			status.DownloadStatus.Missing++
 		}
 	}
+	return status
+}
 
+func handleSTATUS(_ context.Context, req Request, out io.Writer, deps Deps) error {
+	parsed, err := parseSTATUSRequest(req)
+	if err != nil {
+		return err
+	}
+
+	if parsed.TransferID == "" {
+		// List all active transfers: write count header then one JSON line per transfer.
+		transfers := deps.ListTransfers()
+		if _, err := fmt.Fprintf(out, "OK %d\r\n", len(transfers)); err != nil {
+			return err
+		}
+		for _, t := range transfers {
+			payload, err := json.Marshal(transferToStatus(t.ID, t))
+			if err != nil {
+				return protocolErr{code: "INTERNAL", message: "failed to encode status"}
+			}
+			if _, err := fmt.Fprintf(out, "%s\r\n", payload); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	transfer, ok := deps.GetTransfer(parsed.TransferID)
+	if !ok {
+		return protocolErr{code: "NOT_FOUND", message: "transfer not found"}
+	}
+
+	status := transferToStatus(parsed.TransferID, transfer)
 	payload, err := json.Marshal(status)
 	if err != nil {
 		return protocolErr{code: "INTERNAL", message: "failed to encode status"}

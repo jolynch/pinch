@@ -340,10 +340,8 @@ type singleDownloadRequest struct {
 	FileID          uint64
 	OutRoot         string
 	OutFile         string
-	Stdout          io.Writer
-	AgePublicKey    string
-	AgeIdentity     string
-	AckEveryBytes   int64
+	Stdout        io.Writer
+	AckEveryBytes int64
 	ResumeFromBytes int64
 	NoSync          bool
 	ProgressUpdates chan<- DownloadProgressUpdate
@@ -362,7 +360,7 @@ func downloadSingle(ctx context.Context, client *Client, req singleDownloadReque
 	if req.ResumeFromBytes != 0 {
 		// Keep helper signature stable; resume is sourced from entry progress.
 	}
-	resp, err := client.DownloadFilesFromManifestBatch(ctx, DownloadBatchRequest{
+	resp, err := client.GetFiles(ctx, GetFilesRequest{
 		Manifest: req.Manifest,
 		FileIDs:  []uint64{req.FileID},
 		OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
@@ -426,8 +424,6 @@ func downloadSingle(ctx context.Context, client *Client, req singleDownloadReque
 			}
 			return fd, syncOutput, nil
 		},
-		AgePublicKey:    req.AgePublicKey,
-		AgeIdentity:     req.AgeIdentity,
 		ProgressUpdates: req.ProgressUpdates,
 	})
 	if err != nil {
@@ -557,504 +553,6 @@ func TestFileStreamBufferHint(t *testing.T) {
 	}
 }
 
-func TestFetchFileWindowHonorsSizeHint(t *testing.T) {
-	logical := []byte("hello")
-	frame := buildFXFrame(t, 7, "none", 0, logical, nil)
-	expectedSize := int64(len(logical))
-
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		if req.Verb != intftcp.VerbSEND {
-			return fmt.Errorf("expected SEND, got %v", req.Verb)
-		}
-		if len(req.Params) < 2 || req.Params[1]["size"] != strconv.FormatInt(expectedSize, 10) {
-			return fmt.Errorf("expected size=%d, got %q", expectedSize, req.Params[1]["size"])
-		}
-		_, err := io.WriteString(out, frame)
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	stream, meta, err := client.fetchFileWindow(context.Background(), "tx", 7, "/root/a.txt", "", "", 0, expectedSize)
-	if err != nil {
-		t.Fatalf("fetchFileWindow failed: %v", err)
-	}
-	body, err := readAndClose(t, stream)
-	if err != nil {
-		t.Fatalf("read stream failed: %v", err)
-	}
-	if !bytes.Equal(body, logical) {
-		t.Fatalf("unexpected body: %q", body)
-	}
-	if meta.FileID != 7 {
-		t.Fatalf("unexpected file id: %d", meta.FileID)
-	}
-	if meta.Size != expectedSize {
-		t.Fatalf("unexpected logical size: %d", meta.Size)
-	}
-}
-
-func TestParseManifestSingleChunk(t *testing.T) {
-	raw := strings.Join([]string{
-		"FM/1 tx123 5:/root mode=fast link-mbps=1000 concurrency=8",
-		"0 5 0:100 0644 0:5:a.txt",
-		"1 7 2:1 0600 0:9:dir/b.txt",
-		"",
-	}, "\n")
-
-	manifest, err := parseManifest([]byte(raw))
-	if err != nil {
-		t.Fatalf("parseManifest failed: %v", err)
-	}
-	if manifest.TransferID != "tx123" {
-		t.Fatalf("unexpected transfer id: %q", manifest.TransferID)
-	}
-	if manifest.Root != "/root" {
-		t.Fatalf("unexpected root: %q", manifest.Root)
-	}
-	if len(manifest.Entries) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(manifest.Entries))
-	}
-	if manifest.Entries[1].Mtime != 101 {
-		t.Fatalf("expected decoded mtime 101, got %d", manifest.Entries[1].Mtime)
-	}
-	if manifest.Entries[1].Mode != 0o600 {
-		t.Fatalf("expected parsed mode 0600, got %04o", manifest.Entries[1].Mode)
-	}
-}
-
-func TestParseManifestMultiChunk(t *testing.T) {
-	raw := strings.Join([]string{
-		"FM/1 tx456 6:/root2 mode=gentle link-mbps=500 concurrency=4",
-		"0 5 0:100 0644 0:5:a.txt",
-		"",
-		"FM/1 tx456 6:/root2 mode=gentle link-mbps=500 concurrency=4",
-		"1 3 0:200 0600 0:5:b.txt",
-		"",
-	}, "\n")
-
-	manifest, err := parseManifest([]byte(raw))
-	if err != nil {
-		t.Fatalf("parseManifest failed: %v", err)
-	}
-	if len(manifest.Entries) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(manifest.Entries))
-	}
-}
-
-func TestMarshalManifestRoundTrip(t *testing.T) {
-	manifest := &Manifest{
-		TransferID:  "txrt",
-		Root:        "/root",
-		Mode:        LoadStrategyFast,
-		LinkMbps:    900,
-		Concurrency: 12,
-		Entries: []ManifestEntry{
-			{ID: 1, Size: 5, Mtime: 100, Mode: 0o644, Path: "a.txt"},
-			{ID: 2, Size: 9, Mtime: 100, Mode: 0o600, Path: "dir/b.txt"},
-		},
-	}
-	raw, err := MarshalManifest(manifest)
-	if err != nil {
-		t.Fatalf("MarshalManifest failed: %v", err)
-	}
-	parsed, err := parseManifest(raw)
-	if err != nil {
-		t.Fatalf("parseManifest failed: %v", err)
-	}
-	if parsed.TransferID != manifest.TransferID {
-		t.Fatalf("transfer id mismatch: got=%q want=%q", parsed.TransferID, manifest.TransferID)
-	}
-	if parsed.Root != manifest.Root {
-		t.Fatalf("root mismatch: got=%q want=%q", parsed.Root, manifest.Root)
-	}
-	if parsed.Mode != manifest.Mode {
-		t.Fatalf("mode mismatch: got=%q want=%q", parsed.Mode, manifest.Mode)
-	}
-	if parsed.LinkMbps != manifest.LinkMbps {
-		t.Fatalf("link mismatch: got=%d want=%d", parsed.LinkMbps, manifest.LinkMbps)
-	}
-	if parsed.Concurrency != manifest.Concurrency {
-		t.Fatalf("concurrency mismatch: got=%d want=%d", parsed.Concurrency, manifest.Concurrency)
-	}
-	if len(parsed.Entries) != len(manifest.Entries) {
-		t.Fatalf("entry count mismatch: got=%d want=%d", len(parsed.Entries), len(manifest.Entries))
-	}
-	for i := range parsed.Entries {
-		if parsed.Entries[i] != manifest.Entries[i] {
-			t.Fatalf("entry %d mismatch: got=%+v want=%+v", i, parsed.Entries[i], manifest.Entries[i])
-		}
-	}
-}
-
-func TestParseManifestMalformed(t *testing.T) {
-	raw := strings.Join([]string{
-		"FM/1 tx789 5:/root mode=fast link-mbps=1000 concurrency=8",
-		"0 5 0:abc 0644 0:5:a.txt",
-		"",
-	}, "\n")
-	if _, err := parseManifest([]byte(raw)); err == nil {
-		t.Fatalf("expected parseManifest error")
-	}
-}
-
-func TestParseManifestLegacyEntryRejected(t *testing.T) {
-	raw := strings.Join([]string{
-		"FM/1 tx789 5:/root mode=fast link-mbps=1000 concurrency=8",
-		"0 5 0:100 0:5:a.txt",
-		"",
-	}, "\n")
-	if _, err := parseManifest([]byte(raw)); err == nil {
-		t.Fatalf("expected legacy manifest format to be rejected")
-	}
-}
-
-func TestFetchManifestEncryptedWithAge(t *testing.T) {
-	identity, err := age.GenerateX25519Identity()
-	if err != nil {
-		t.Fatalf("generate age identity: %v", err)
-	}
-	recipient := identity.Recipient().String()
-	manifestRaw := strings.Join([]string{
-		"FM/1 txenc 5:/root mode=fast link-mbps=1000 concurrency=8",
-		"0 5 0:100 0644 0:5:a.txt",
-		"",
-	}, "\n")
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		if req.Verb != intftcp.VerbTXFER {
-			return fmt.Errorf("expected TXFER, got %v", req.Verb)
-		}
-		if got := req.Params[0]["directory"]; got != "/root" {
-			return fmt.Errorf("expected TXFER directory /root, got %q", got)
-		}
-		if _, err := io.WriteString(out, manifestRaw); err != nil {
-			return err
-		}
-		_, err := io.WriteString(out, "OK\r\n")
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	resp, err := client.FetchManifest(context.Background(), FetchManifestRequest{
-		Directory:    "/root",
-		Mode:         LoadStrategyFast,
-		LinkMbps:     1000,
-		Concurrency:  8,
-		AgePublicKey: recipient,
-		AgeIdentity:  identity.String(),
-	})
-	if err != nil {
-		t.Fatalf("FetchManifest failed: %v", err)
-	}
-	if resp.Manifest.TransferID != "txenc" || len(resp.Manifest.Entries) != 1 {
-		t.Fatalf("unexpected manifest: %+v", resp.Manifest)
-	}
-}
-
-func TestFetchFileDecodesByHeaderComp(t *testing.T) {
-	logical := []byte("hello world")
-	for _, comp := range []string{"none", EncodingZstd, EncodingLz4} {
-		comp := comp
-		t.Run(comp, func(t *testing.T) {
-			frame := buildFXFrame(t, 7, comp, 0, logical, nil)
-
-			srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-				if req.Verb != intftcp.VerbSEND {
-					return fmt.Errorf("expected SEND, got %v", req.Verb)
-				}
-				if _, err := io.WriteString(out, frame); err != nil {
-					return err
-				}
-				return nil
-			})
-			defer srv.Close()
-
-			client := NewClient(srv.URL)
-			resp, err := client.FetchFile(context.Background(), FetchFileRequest{
-				TransferID: "tx",
-				Files: []FetchFileTarget{{
-					FileID:   7,
-					FullPath: "/root/a.txt",
-				}},
-				AckBytes: -1,
-			})
-			if err != nil {
-				t.Fatalf("FetchFile failed: %v", err)
-			}
-			got, err := readAndClose(t, resp.Reader)
-			if err != nil {
-				t.Fatalf("FetchFile read failed: %v", err)
-			}
-			if !bytes.Equal(got, logical) {
-				t.Fatalf("unexpected logical bytes: %q", got)
-			}
-			if resp.Meta.Comp != comp {
-				t.Fatalf("expected comp %q, got %q", comp, resp.Meta.Comp)
-			}
-		})
-	}
-}
-
-func TestFetchFileIncludesSendMode(t *testing.T) {
-	logical := []byte("hello")
-	frame := buildFXFrame(t, 7, "none", 0, logical, nil)
-
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		if req.Verb != intftcp.VerbSEND {
-			return fmt.Errorf("expected SEND, got %v", req.Verb)
-		}
-		if got := req.Params[1]["mode"]; got != LoadStrategyGentle {
-			return fmt.Errorf("expected mode=%s, got %q", LoadStrategyGentle, got)
-		}
-		_, err := io.WriteString(out, frame)
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL, WithLoadStrategy(LoadStrategyGentle))
-	resp, err := client.FetchFile(context.Background(), FetchFileRequest{
-		TransferID: "tx",
-		Files: []FetchFileTarget{{
-			FileID:   7,
-			FullPath: "/root/a.txt",
-		}},
-		AckBytes: -1,
-	})
-	if err != nil {
-		t.Fatalf("FetchFile failed: %v", err)
-	}
-	got, err := readAndClose(t, resp.Reader)
-	if err != nil {
-		t.Fatalf("FetchFile read failed: %v", err)
-	}
-	if !bytes.Equal(got, logical) {
-		t.Fatalf("unexpected logical bytes: %q", got)
-	}
-}
-
-func TestFetchFileDecryptsWholeResponseWithAge(t *testing.T) {
-	identity, err := age.GenerateX25519Identity()
-	if err != nil {
-		t.Fatalf("generate age identity: %v", err)
-	}
-	recipient := identity.Recipient().String()
-	logical := []byte("hello world")
-	frame := buildFXFrame(t, 7, "none", 0, logical, nil)
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		if req.Verb != intftcp.VerbSEND {
-			return fmt.Errorf("expected SEND, got %v", req.Verb)
-		}
-		if _, err := io.WriteString(out, frame); err != nil {
-			return err
-		}
-		return nil
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	resp, err := client.FetchFile(context.Background(), FetchFileRequest{
-		TransferID: "tx",
-		Files: []FetchFileTarget{{
-			FileID:   7,
-			FullPath: "/root/a.txt",
-		}},
-		AgePublicKey: recipient,
-		AgeIdentity:  identity.String(),
-		AckBytes:     -1,
-	})
-	if err != nil {
-		t.Fatalf("FetchFile failed: %v", err)
-	}
-	got, err := readAndClose(t, resp.Reader)
-	if err != nil {
-		t.Fatalf("FetchFile read failed: %v", err)
-	}
-	if !bytes.Equal(got, logical) {
-		t.Fatalf("unexpected logical bytes: %q", got)
-	}
-}
-
-func TestFetchFileIgnoresPerFrameChecksumMismatch(t *testing.T) {
-	logical := []byte("hello")
-	payload, err := encodeSingleFramePayload(logical, "none")
-	if err != nil {
-		t.Fatalf("encode payload: %v", err)
-	}
-	frame := fmt.Sprintf(
-		"FX/1 0 offset=0 size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n",
-		len(logical),
-		len(payload),
-		"00000000000000000000000000000000",
-	)
-	trailerPrefix := "FXT/1 0 status=ok ts=1001"
-	badHash := "xxh64:0000000000000000"
-	frame += string(payload) + trailerPrefix + " hash=" + badHash + "\n"
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		_, err := io.WriteString(out, frame)
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", Files: []FetchFileTarget{{FileID: 0, FullPath: "/root/a.txt"}}, AckBytes: -1})
-	if err != nil {
-		t.Fatalf("FetchFile setup failed: %v", err)
-	}
-	got, err := readAndClose(t, resp.Reader)
-	if err != nil {
-		t.Fatalf("expected per-frame checksum mismatch to be ignored, got %v", err)
-	}
-	if string(got) != "hello" {
-		t.Fatalf("unexpected payload %q", got)
-	}
-}
-
-func TestFetchFileRejectsMalformedTrailer(t *testing.T) {
-	logical := []byte("hello")
-	frame := fmt.Sprintf(
-		"FX/1 0 offset=0 size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n%sFXT/1 0 ts=1001 next=0\n",
-		len(logical),
-		len(logical),
-		xxh128HexTest(logical),
-		string(logical),
-	)
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		_, err := io.WriteString(out, frame)
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", Files: []FetchFileTarget{{FileID: 0, FullPath: "/root/a.txt"}}, AckBytes: -1})
-	if err != nil {
-		t.Fatalf("FetchFile setup failed: %v", err)
-	}
-	if _, err := readAndClose(t, resp.Reader); err == nil {
-		t.Fatalf("expected malformed trailer error")
-	}
-}
-
-func TestFetchFileRejectsPayloadLengthMismatch(t *testing.T) {
-	header := "FX/1 0 offset=0 size=5 wsize=8 comp=none enc=none hash=xxh128:00000000000000000000000000000000 ts=1000\n"
-	payload := []byte("hello")
-	trailerPrefix := "FXT/1 0 status=ok ts=1001"
-	frame := header + string(payload) + trailerPrefix + " hash=" + frameHash64Token(header, payload, trailerPrefix) + "\n"
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		_, err := io.WriteString(out, frame)
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", Files: []FetchFileTarget{{FileID: 0, FullPath: "/root/a.txt"}}, AckBytes: -1})
-	if err != nil {
-		t.Fatalf("FetchFile setup failed: %v", err)
-	}
-	if _, err := readAndClose(t, resp.Reader); err == nil {
-		t.Fatalf("expected payload length error")
-	}
-}
-
-func TestFetchFileRejectsUnsupportedEnc(t *testing.T) {
-	logical := []byte("hello")
-	header := fmt.Sprintf(
-		"FX/1 0 offset=0 size=%d wsize=%d comp=none enc=age hash=xxh128:%s ts=1000\n",
-		len(logical),
-		len(logical),
-		xxh128HexTest(logical),
-	)
-	trailerPrefix := "FXT/1 0 status=ok ts=1001"
-	frame := header + string(logical) + trailerPrefix + " hash=" + frameHash64Token(header, logical, trailerPrefix) + "\n"
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		_, err := io.WriteString(out, frame)
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	if _, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", Files: []FetchFileTarget{{FileID: 0, FullPath: "/root/a.txt"}}, AckBytes: -1}); err == nil {
-		t.Fatalf("expected unsupported enc error")
-	}
-}
-
-func TestFetchFileDecodesMultiFrameSequence(t *testing.T) {
-	var body strings.Builder
-	next := int64(5)
-	body.WriteString(buildFXFrame(t, 0, "none", 0, []byte("hello"), &next))
-	body.WriteString(buildFXFrame(t, 0, "none", 5, []byte(" world"), nil))
-
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		_, err := io.WriteString(out, body.String())
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", Files: []FetchFileTarget{{FileID: 0, FullPath: "/root/a.txt"}}, AckBytes: -1})
-	if err != nil {
-		t.Fatalf("FetchFile failed: %v", err)
-	}
-	got, err := readAndClose(t, resp.Reader)
-	if err != nil {
-		t.Fatalf("read stream failed: %v", err)
-	}
-	if string(got) != "hello world" {
-		t.Fatalf("unexpected stream body: %q", got)
-	}
-	if resp.Meta.Size != int64(len(got)) {
-		t.Fatalf("expected aggregated logical size %d, got %d", len(got), resp.Meta.Size)
-	}
-	if resp.Meta.HeaderTS <= 0 || resp.Meta.TrailerTS <= 0 {
-		t.Fatalf("expected parsed frame timestamps, got header=%d trailer=%d", resp.Meta.HeaderTS, resp.Meta.TrailerTS)
-	}
-	if resp.Meta.HashToken == "" {
-		t.Fatalf("expected parsed hash token")
-	}
-}
-
-func TestFetchFileRejectsMissingNextFrame(t *testing.T) {
-	next := int64(5)
-	frame := buildFXFrame(t, 0, "none", 0, []byte("hello"), &next)
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		_, err := io.WriteString(out, frame)
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", Files: []FetchFileTarget{{FileID: 0, FullPath: "/root/a.txt"}}, AckBytes: -1})
-	if err != nil {
-		t.Fatalf("FetchFile setup failed: %v", err)
-	}
-	_, err = readAndClose(t, resp.Reader)
-	if err == nil || !strings.Contains(err.Error(), "missing next frame") {
-		t.Fatalf("expected missing next frame error, got %v", err)
-	}
-}
-
-func TestFetchFileRejectsNonContiguousFrameOffsets(t *testing.T) {
-	var body strings.Builder
-	next := int64(5)
-	body.WriteString(buildFXFrame(t, 0, "none", 0, []byte("hello"), &next))
-	body.WriteString(buildFXFrame(t, 0, "none", 6, []byte("world"), nil))
-
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		_, err := io.WriteString(out, body.String())
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	resp, err := client.FetchFile(context.Background(), FetchFileRequest{TransferID: "tx", Files: []FetchFileTarget{{FileID: 0, FullPath: "/root/a.txt"}}, AckBytes: -1})
-	if err != nil {
-		t.Fatalf("FetchFile setup failed: %v", err)
-	}
-	_, err = readAndClose(t, resp.Reader)
-	if err == nil || !strings.Contains(err.Error(), "non-contiguous frame offset") {
-		t.Fatalf("expected non-contiguous frame offset error, got %v", err)
-	}
-}
 
 func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 	outRoot := t.TempDir()
@@ -1454,8 +952,6 @@ func TestDownloadFileFromManifestResumesFromOffsetWithoutTruncatingTail(t *testi
 		AckEveryBytes:   1,
 		NoSync:          true,
 		ProgressUpdates: make(chan DownloadProgressUpdate, 1),
-		AgePublicKey:    "",
-		AgeIdentity:     "",
 	})
 	if err != nil {
 		t.Fatalf("DownloadFileFromManifest failed: %v", err)
@@ -1476,7 +972,7 @@ func TestDownloadFileFromManifestResumesFromOffsetWithoutTruncatingTail(t *testi
 	}
 }
 
-func TestDownloadFilesFromManifestBatchSplitsLargeSingleFileWindows(t *testing.T) {
+func TestGetFilesSplitsLargeSingleFileWindows(t *testing.T) {
 	outRoot := t.TempDir()
 	destPath := filepath.Join(outRoot, "big.bin")
 	if err := os.WriteFile(destPath, nil, 0o644); err != nil {
@@ -1555,12 +1051,12 @@ func TestDownloadFilesFromManifestBatchSplitsLargeSingleFileWindows(t *testing.T
 
 	done := make(chan struct{})
 	var (
-		resp DownloadBatchResponse
+		resp GetFilesResponse
 		err  error
 	)
 	go func() {
 		defer close(done)
-		resp, err = client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+		resp, err = client.GetFiles(context.Background(), GetFilesRequest{
 			Manifest:      manifest,
 			FileIDs:       []uint64{0},
 			BatchMaxBytes: 4,
@@ -1589,7 +1085,7 @@ func TestDownloadFilesFromManifestBatchSplitsLargeSingleFileWindows(t *testing.T
 	}
 
 	if err != nil {
-		t.Fatalf("DownloadFilesFromManifestBatch failed: %v", err)
+		t.Fatalf("GetFiles failed: %v", err)
 	}
 	if len(resp.Files) != 1 {
 		t.Fatalf("expected one aggregated file result, got %d", len(resp.Files))
@@ -1657,7 +1153,7 @@ func TestDownloadFilesFromManifestBatchSplitsLargeSingleFileWindows(t *testing.T
 	}
 }
 
-func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
+func TestGetFilesUsesMultiACK(t *testing.T) {
 	outRoot := t.TempDir()
 	manifest := &Manifest{
 		TransferID: "txbatchack",
@@ -1716,7 +1212,7 @@ func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	resp, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+	resp, err := client.GetFiles(context.Background(), GetFilesRequest{
 		Manifest: manifest,
 		FileIDs:  []uint64{0, 1},
 		OutputWriter: func(entry ManifestEntry, _ int64) (io.WriteCloser, func() error, error) {
@@ -1733,7 +1229,7 @@ func TestDownloadFilesFromManifestBatchUsesMultiACK(t *testing.T) {
 		ProgressUpdates: progressUpdates,
 	})
 	if err != nil {
-		t.Fatalf("DownloadFilesFromManifestBatch failed: %v", err)
+		t.Fatalf("GetFiles failed: %v", err)
 	}
 	if len(resp.Files) != 2 {
 		t.Fatalf("expected two downloaded files, got %d", len(resp.Files))
@@ -2042,7 +1538,7 @@ func TestDownloadFileFromManifestWritesToStdout(t *testing.T) {
 	}
 }
 
-func TestDownloadFilesFromManifestBatchRequiresOutputWriter(t *testing.T) {
+func TestGetFilesRequiresOutputWriter(t *testing.T) {
 	manifest := &Manifest{
 		TransferID: "txmissingwriter",
 		Root:       "/remote",
@@ -2051,7 +1547,7 @@ func TestDownloadFilesFromManifestBatchRequiresOutputWriter(t *testing.T) {
 		},
 	}
 	client := NewClient("127.0.0.1:1")
-	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+	_, err := client.GetFiles(context.Background(), GetFilesRequest{
 		Manifest: manifest,
 		FileIDs:  []uint64{0},
 	})
@@ -2060,7 +1556,7 @@ func TestDownloadFilesFromManifestBatchRequiresOutputWriter(t *testing.T) {
 	}
 }
 
-func TestDownloadFilesFromManifestBatchRejectsNilWriterFromCallback(t *testing.T) {
+func TestGetFilesRejectsNilWriterFromCallback(t *testing.T) {
 	manifest := &Manifest{
 		TransferID: "txnilwriter",
 		Root:       "/remote",
@@ -2082,7 +1578,7 @@ func TestDownloadFilesFromManifestBatchRejectsNilWriterFromCallback(t *testing.T
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+	_, err := client.GetFiles(context.Background(), GetFilesRequest{
 		Manifest: manifest,
 		FileIDs:  []uint64{0},
 		OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
@@ -2094,7 +1590,7 @@ func TestDownloadFilesFromManifestBatchRejectsNilWriterFromCallback(t *testing.T
 	}
 }
 
-func TestDownloadFilesFromManifestBatchPropagatesSyncError(t *testing.T) {
+func TestGetFilesPropagatesSyncError(t *testing.T) {
 	manifest := &Manifest{
 		TransferID: "txsyncerr",
 		Root:       "/remote",
@@ -2119,7 +1615,7 @@ func TestDownloadFilesFromManifestBatchPropagatesSyncError(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+	_, err := client.GetFiles(context.Background(), GetFilesRequest{
 		Manifest: manifest,
 		FileIDs:  []uint64{0},
 		OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
@@ -2134,7 +1630,7 @@ func TestDownloadFilesFromManifestBatchPropagatesSyncError(t *testing.T) {
 	}
 }
 
-func TestDownloadFilesFromManifestBatchPropagatesCloseError(t *testing.T) {
+func TestGetFilesPropagatesCloseError(t *testing.T) {
 	manifest := &Manifest{
 		TransferID: "txcloseerr",
 		Root:       "/remote",
@@ -2159,7 +1655,7 @@ func TestDownloadFilesFromManifestBatchPropagatesCloseError(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	_, err := client.DownloadFilesFromManifestBatch(context.Background(), DownloadBatchRequest{
+	_, err := client.GetFiles(context.Background(), GetFilesRequest{
 		Manifest: manifest,
 		FileIDs:  []uint64{0},
 		OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
@@ -2174,7 +1670,7 @@ func TestDownloadFilesFromManifestBatchPropagatesCloseError(t *testing.T) {
 	}
 }
 
-func TestGetTransferStatus(t *testing.T) {
+func TestGetStatus(t *testing.T) {
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		if req.Verb != intftcp.VerbSTATUS {
 			return fmt.Errorf("expected STATUS, got %v", req.Verb)
@@ -2188,11 +1684,11 @@ func TestGetTransferStatus(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	statusResp, err := client.GetTransferStatus(context.Background(), GetTransferStatusRequest{
+	statusResp, err := client.GetStatus(context.Background(), GetStatusRequest{
 		TransferID: "tx123",
 	})
 	if err != nil {
-		t.Fatalf("GetTransferStatus failed: %v", err)
+		t.Fatalf("GetStatus failed: %v", err)
 	}
 	status := statusResp.Status
 	if status.TransferID != "tx123" || status.DownloadStatus.Running != 2 {
@@ -2228,9 +1724,9 @@ func TestClientUsesInjectedDialContext(t *testing.T) {
 	}
 	client := NewClient("ignored:0", WithContextDialer(dialContext), WithServerAgePublicKey(""))
 
-	resp, err := client.GetTransferStatus(context.Background(), GetTransferStatusRequest{TransferID: "tx123"})
+	resp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
 	if err != nil {
-		t.Fatalf("GetTransferStatus failed: %v", err)
+		t.Fatalf("GetStatus failed: %v", err)
 	}
 	if !called {
 		t.Fatalf("expected injected DialContext to be used")
@@ -2240,54 +1736,3 @@ func TestClientUsesInjectedDialContext(t *testing.T) {
 	}
 }
 
-func TestFetchFileMissingDoesNotAckInline(t *testing.T) {
-	var requests int
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		requests++
-		_, err := io.WriteString(out, "ERR NOT_FOUND file not found\r\n")
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	_, err := client.FetchFile(context.Background(), FetchFileRequest{
-		TransferID: "tx",
-		Files: []FetchFileTarget{{
-			FileID:   0,
-			FullPath: "/root/missing.txt",
-		}},
-		AckBytes: -1,
-	})
-	if err == nil || !errors.Is(err, ErrFileMissing) {
-		t.Fatalf("expected ErrFileMissing, got %v", err)
-	}
-	if requests != 1 {
-		t.Fatalf("expected one request, got %d", requests)
-	}
-}
-
-func TestFetchFileTransferNotFoundDoesNotAckMissing(t *testing.T) {
-	var requests int
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		requests++
-		_, err := io.WriteString(out, "ERR NOT_FOUND transfer not found\r\n")
-		return err
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	_, err := client.FetchFile(context.Background(), FetchFileRequest{
-		TransferID: "tx",
-		Files: []FetchFileTarget{{
-			FileID:   0,
-			FullPath: "/root/missing.txt",
-		}},
-		AckBytes: -1,
-	})
-	if err == nil || !errors.Is(err, ErrFileMissing) {
-		t.Fatalf("expected ErrFileMissing, got %v", err)
-	}
-	if requests != 1 {
-		t.Fatalf("expected only one request without missing-ack retry, got %d", requests)
-	}
-}

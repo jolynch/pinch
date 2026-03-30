@@ -90,8 +90,12 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		return err
 	}
 	parsed.Directory = filepath.Join(deps.Root(), parsed.Directory)
-	if err := validateDirectory(parsed.Directory); err != nil {
+	isDir, err := validatePath(parsed.Directory)
+	if err != nil {
 		return protocolErr{code: "UNPROCESSABLE", message: err.Error()}
+	}
+	if !isDir {
+		return protocolErr{code: "UNPROCESSABLE", message: "sync requires a directory, not a file"}
 	}
 
 	root := filepath.Clean(parsed.Directory)

@@ -30,6 +30,7 @@ type Deps interface {
 	ClipTransfer(txferID string) bool
 
 	GetTransfer(txferID string) (Transfer, bool)
+	ListTransfers() []Transfer
 	SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool
 	GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error)
 	GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error)
@@ -81,6 +82,10 @@ func (runtimeDeps) ClipTransfer(txferID string) bool {
 
 func (runtimeDeps) GetTransfer(txferID string) (Transfer, bool) {
 	return intstore.GetTransfer(txferID)
+}
+
+func (runtimeDeps) ListTransfers() []Transfer {
+	return intstore.ListTransfers()
 }
 
 func (runtimeDeps) SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {

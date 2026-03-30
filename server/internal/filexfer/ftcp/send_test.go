@@ -41,6 +41,7 @@ func (d *sendTestDeps) RegisterTransferFileState(string, <-chan TransferFileStat
 func (d *sendTestDeps) ClipTransfer(string) bool { return false }
 
 func (d *sendTestDeps) GetTransfer(string) (Transfer, bool) { return Transfer{}, false }
+func (d *sendTestDeps) ListTransfers() []Transfer              { return nil }
 
 func (d *sendTestDeps) SetTransferHints(string, string, int64, int) bool { return true }
 

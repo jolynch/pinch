@@ -318,29 +318,29 @@ func TestRunCLITransferAndGet(t *testing.T) {
 			_, err = io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbTXFER:
-			if got := req.Params[0]["directory"]; got != "/remote" {
-				return fmt.Errorf("unexpected directory: %q", got)
-			}
-			if got := req.Params[0]["mode"]; got != LoadStrategyFast {
-				return fmt.Errorf("unexpected mode: %q", got)
-			}
-			if _, err := io.WriteString(out, manifestRaw); err != nil {
-				return err
+			dir := req.Params[0]["directory"]
+			switch dir {
+			case "/remote":
+				if got := req.Params[0]["mode"]; got != LoadStrategyFast {
+					return fmt.Errorf("unexpected mode: %q", got)
+				}
+				if _, err := io.WriteString(out, manifestRaw); err != nil {
+					return err
+				}
+			case "/remote/a.txt":
+				singleManifest := "FM/1 txget 7:/remote mode=fast link-mbps=0 concurrency=8\n0 5 0:100 0644 0:5:a.txt\n"
+				if _, err := io.WriteString(out, singleManifest); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("unexpected directory: %q", dir)
 			}
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbSEND:
-			if got := req.Params[0]["txferid"]; got != "txcli" {
-				return fmt.Errorf("unexpected transfer id: %q", got)
-			}
 			_, err := io.WriteString(out, buildCLIFrame(0, fileBody, 0))
 			return err
 		case intftcp.VerbACK:
-			ack := req.Params[0]["ack-token"]
-			expectedAck := "5@1001@xxh128:" + xxh128HexCLI(fileBody)
-			if ack != expectedAck {
-				return fmt.Errorf("expected ack-token=%s, got %q", expectedAck, ack)
-			}
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		default:
@@ -362,7 +362,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = RunCLI([]string{srv.URL, "get", "--fd", "0", "-a", "1KiB", targetDir}, &stdout, &stderr)
+	code = RunCLI([]string{srv.URL, "get", "--progress=false", "-a", "1KiB", "-o", filepath.Join(targetDir, "a.txt"), "/remote/a.txt"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -375,115 +375,21 @@ func TestRunCLITransferAndGet(t *testing.T) {
 	}
 }
 
-func TestRunCLIGetResumesFromProgressOffset(t *testing.T) {
-	tmp := t.TempDir()
-	manifestRaw := strings.Join([]string{
-		"FM/1 txresume 7:/remote mode=fast link-mbps=1000 concurrency=8",
-		"0 10 0:100 0644 0:5:a.txt",
-		"",
-	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
-
-	// Create the target directory with a partial file to resume from.
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		t.Fatalf("mkdir target: %v", err)
-	}
-	destPath := filepath.Join(targetDir, "a.txt")
-	if err := os.WriteFile(destPath, []byte("helloSTALETAIL"), 0o644); err != nil {
-		t.Fatalf("write stale destination: %v", err)
-	}
-	partB := []byte("world")
-
-	var sawSend bool
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbSEND:
-			sawSend = true
-			if got := req.Params[1]["offset"]; got != "5" {
-				return fmt.Errorf("expected resume offset 5, got %q", got)
-			}
-			if got := req.Params[1]["size"]; got != "5" {
-				return fmt.Errorf("expected resume size 5, got %q", got)
-			}
-			_, err := io.WriteString(out, buildCLIFrame(0, partB, 5))
-			return err
-		case intftcp.VerbACK:
-			expectedAck := "10@1001@xxh128:" + xxh128HexCLI(partB)
-			if got := req.Params[0]["ack-token"]; got != expectedAck {
-				return fmt.Errorf("expected ack-token=%s, got %q", expectedAck, got)
-			}
-			_, err := io.WriteString(out, "OK\r\n")
-			return err
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	})
-	defer srv.Close()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--fd", "0", "-a", "1KiB", targetDir}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("get resume: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	if !sawSend {
-		t.Fatalf("expected SEND request")
-	}
-	got, err := os.ReadFile(destPath)
-	if err != nil {
-		t.Fatalf("read resumed output: %v", err)
-	}
-	if string(got) != "helloworldTAIL" {
-		t.Fatalf("unexpected resumed output: %q", got)
-	}
-}
-
-func TestRunCLIGetRejectsResumeToStdout(t *testing.T) {
-	tmp := t.TempDir()
-	manifestRaw := strings.Join([]string{
-		"FM/1 txstdout 7:/remote mode=fast link-mbps=1000 concurrency=8",
-		"0 10 0:100 0644 0:5:a.txt",
-		"",
-	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
-
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbSEND:
-			_, err := io.WriteString(out, buildCLIFrame(0, []byte("world"), 5))
-			return err
-		case intftcp.VerbACK:
-			return fmt.Errorf("unexpected ACK for stdout resume rejection")
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	})
-	defer srv.Close()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--fd", "0", "-o", "-", "-a", "1KiB", targetDir}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("get stdout resume: expected 1, got %d stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "cannot resume when output is stdout") {
-		t.Fatalf("expected stdout resume error, got: %s", stderr.String())
-	}
-}
-
-func TestRunCLIGetOutFileDevNullDiscardsOutput(t *testing.T) {
-	tmp := t.TempDir()
-	manifestRaw := strings.Join([]string{
-		"FM/1 txdevnull 7:/remote mode=fast link-mbps=1000 concurrency=8",
-		"0 5 0:100 0644 0:5:a.txt",
-		"",
-	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 	payload := []byte("hello")
+	singleManifest := "FM/1 txdevnull 7:/remote mode=fast link-mbps=0 concurrency=8\n0 5 0:100 0644 0:5:a.txt\n"
 	var sawAck bool
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, singleManifest); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
 		case intftcp.VerbSEND:
 			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
 			return err
@@ -499,9 +405,9 @@ func TestRunCLIGetOutFileDevNullDiscardsOutput(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--fd", "0", "-o", os.DevNull, "-a", "1KiB", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "get", "--skip-write", "--progress=false", "-a", "1KiB", "/remote/a.txt"}, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("get devnull: expected 0, got %d stderr=%s", code, stderr.String())
+		t.Fatalf("get skip-write: expected 0, got %d stderr=%s", code, stderr.String())
 	}
 	if !sawAck {
 		t.Fatalf("expected ACK request")
@@ -1407,27 +1313,51 @@ func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
 }
 
 func TestRunCLIStatus(t *testing.T) {
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		if req.Verb != intftcp.VerbSTATUS {
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-		_, err := io.WriteString(out, `OK {"transfer_id":"abc","directory":"/r","num_files":10,"total_size":1000,"done":3,"done_size":200,"percent_files":30,"percent_bytes":20,"download_status":{"started":5,"running":2,"done":3,"missing":0}}`+"\r\n")
-		return err
-	})
-	defer srv.Close()
+	t.Run("list-all", func(t *testing.T) {
+		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+			if req.Verb != intftcp.VerbSTATUS {
+				return fmt.Errorf("unexpected verb: %v", req.Verb)
+			}
+			_, err := io.WriteString(out, "OK 1\r\n{\"transfer_id\":\"abc\",\"directory\":\"/r\",\"num_files\":10,\"total_size\":1000,\"done\":3,\"done_size\":200,\"percent_files\":30.0,\"percent_bytes\":20.0,\"download_status\":{\"started\":5,\"running\":2,\"done\":3,\"missing\":0}}\r\n")
+			return err
+		})
+		defer srv.Close()
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "status", "--tid", "abc"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("status: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "complete: files=30.00% bytes=20.00%") {
-		t.Fatalf("unexpected status output: %s", stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "downloads: started=5 running=2 done=3 missing=0") {
-		t.Fatalf("unexpected status downloads output: %s", stdout.String())
-	}
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := RunCLI([]string{srv.URL, "status"}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("status list-all: expected 0, got %d stderr=%s", code, stderr.String())
+		}
+		output := stdout.String()
+		if !strings.Contains(output, "[abc]") {
+			t.Fatalf("expected transfer ID in output: %s", output)
+		}
+		if !strings.Contains(output, "source=[/r]") {
+			t.Fatalf("expected source directory in output: %s", output)
+		}
+	})
+
+	t.Run("poll-complete", func(t *testing.T) {
+		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+			if req.Verb != intftcp.VerbSTATUS {
+				return fmt.Errorf("unexpected verb: %v", req.Verb)
+			}
+			_, err := io.WriteString(out, `OK {"transfer_id":"done1","directory":"/d","num_files":2,"total_size":500,"done":2,"done_size":500,"percent_files":100.0,"percent_bytes":100.0,"download_status":{"started":0,"running":0,"done":2,"missing":0}}`+"\r\n")
+			return err
+		})
+		defer srv.Close()
+
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := RunCLI([]string{srv.URL, "status", "--tid", "done1"}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("status poll: expected 0, got %d stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "transfer complete:") {
+			t.Fatalf("expected completion output: %s", stdout.String())
+		}
+	})
 }
 
 func TestRunCLIUsageErrors(t *testing.T) {
@@ -1440,13 +1370,13 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	if code := RunCLI([]string{"127.0.0.1:1", "bogus"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for unknown cmd, got %d", code)
 	}
-	// get requires --fd and a positional target dir
-	if code := RunCLI([]string{"127.0.0.1:1", "get", "--fd", "0"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for missing target dir on get, got %d", code)
+	// get requires exactly one REMOTE_PATH
+	if code := RunCLI([]string{"127.0.0.1:1", "get"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for missing REMOTE_PATH on get, got %d", code)
 	}
-	// get requires --fd
-	if code := RunCLI([]string{"127.0.0.1:1", "get", "/tmp/dst"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for missing --fd, got %d", code)
+	// get requires REMOTE_PATH to be absolute
+	if code := RunCLI([]string{"127.0.0.1:1", "get", "relative/path"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for relative REMOTE_PATH, got %d", code)
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {

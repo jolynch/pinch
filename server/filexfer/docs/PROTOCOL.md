@@ -169,18 +169,22 @@ Streams checksum frames for one or more requested file ranges.
 
 ## STATUS
 
-Returns transfer status JSON.
+Returns transfer status JSON. Two forms:
+
+- `STATUS <txferid>` — single transfer lookup
+- `STATUS` (no argument) — list all active transfers
 
 ### Request
 
-`STATUS <txferid>`
+`STATUS [<txferid>]`
 
 ### Response
 
-- success: `OK <json>`
 - failure: `ERR <code> <message>`
 
-JSON schema:
+**Single transfer** (`STATUS <txferid>`):
+
+- success: `OK <json>`
 
 ```json
 {
@@ -200,6 +204,10 @@ JSON schema:
   }
 }
 ```
+
+**List all** (`STATUS`):
+
+- success: `OK <count>` followed by `<count>` lines, each containing one transfer status JSON object (same schema above). Count may be `0` with no following lines.
 
 ## PROBE
 
