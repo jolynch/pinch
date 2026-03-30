@@ -142,10 +142,10 @@ func parseSENDRequest(req Request) (sendRequest, error) {
 }
 
 func handleSEND(ctx context.Context, req Request, out io.Writer, deps Deps) error {
-	return handleSENDWithOptions(ctx, req, out, deps, nil)
+	return handleSENDWithOptions(ctx, req, out, deps, nil, false)
 }
 
-func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps Deps, limiter *limit.Limiter) error {
+func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps Deps, limiter *limit.Limiter, disableZeroCopy bool) error {
 	parsed, err := parseSENDRequest(req)
 	if err != nil {
 		return err
@@ -174,7 +174,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps
 				itemOut = limiter.WrapRateLimitedWriter(itemOut, ctx)
 			}
 		}
-		if err := streamSendItem(ctx, itemOut, deps, parsed.TransferID, item); err != nil {
+		if err := streamSendItem(ctx, itemOut, deps, parsed.TransferID, item, disableZeroCopy); err != nil {
 			return err
 		}
 	}
@@ -209,7 +209,7 @@ func checkTransferDeadline(deps Deps, txferID string, transfer Transfer) error {
 	return nil
 }
 
-func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID string, item sendItem) error {
+func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID string, item sendItem, disableZeroCopy bool) error {
 	ctx, windowTask := trace.NewTask(ctx, "send-window")
 	defer windowTask.End()
 	fd, fileRef, usedDirectOpen, err := openSendFile(deps, txferID, item)
@@ -336,7 +336,7 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 
 		frameOffset := cursor
 		var stats frameStreamStats
-		if canZeroCopy(frameArgs) {
+		if !disableZeroCopy && canZeroCopy(frameArgs) {
 			stats, err = streamFramePayloadZeroCopy(fd, &frameOffset, frameArgs)
 		} else {
 			stats, err = streamFramePayloadBuffered(fd, &frameOffset, frameArgs)

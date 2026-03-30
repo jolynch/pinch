@@ -828,6 +828,7 @@ Options:
       --trace string          write runtime/trace to this file
       --progress-path string           write transfer % to this file/pipe
       --progress-path-interval string  progress write interval (default "1s")
+      --disable-zero-copy              force buffered send path (for benchmarking)
 `)
 	}
 	fs.StringVar(&fileListener, "listen", fileListener, "")
@@ -841,6 +842,7 @@ Options:
 	fs.StringVar(&keysDir, "keys", keysDir, "")
 	fs.StringVar(&keysDir, "k", keysDir, "")
 	requireAuth := fs.Bool("require-auth", false, "")
+	disableZeroCopy := fs.Bool("disable-zero-copy", false, "")
 	traceFile := fs.String("trace", "", "")
 	var progressFilePath string
 	var progressIntervalRaw string
@@ -905,6 +907,7 @@ Options:
 		RootDir:                chroot,
 		ProgressPath:           progressFilePath,
 		ProgressInterval:       progressInterval,
+		DisableZeroCopy:        *disableZeroCopy,
 	}); serveErr != nil {
 		log.Fatalf("File transfer listener stopped: %v", serveErr)
 	}

@@ -893,7 +893,7 @@ func (c *Client) downloadManifestGroupSequential(
 				return nil, nil, nil, fmt.Errorf("decode payload reader: %w", decodeErr)
 			}
 			frameStartOffset := offset
-			copyErr := copyStreamWithProgress(newParallelMultiWriter(writer, windowHasher), logicalReader, frameBuf, func(written int64) error {
+			copyErr := copyStreamWithProgress(io.MultiWriter(writer, windowHasher), logicalReader, frameBuf, func(written int64) error {
 				emitProgressUpdate(DownloadProgressUpdate{
 					TransferID:  req.Manifest.TransferID,
 					FileID:      plan.entry.ID,
@@ -1404,7 +1404,7 @@ func (c *Client) downloadSplitWindow(
 	defer releaseFrameBuf()
 
 	windowHasher := xxh3.New128()
-	copyErr := copyStreamWithProgress(newParallelMultiWriter(writer, windowHasher), reader, frameBuf, func(written int64) error {
+	copyErr := copyStreamWithProgress(io.MultiWriter(writer, windowHasher), reader, frameBuf, func(written int64) error {
 		emitProgressUpdate(DownloadProgressUpdate{
 			TransferID:  req.Manifest.TransferID,
 			FileID:      plan.entry.ID,
@@ -1875,39 +1875,6 @@ func mergeCompCounts(dst map[string]uint64, src map[string]uint64) {
 	}
 }
 
-// parallelMultiWriter writes to primary in the calling goroutine and to each
-// secondary concurrently, joining all before returning from Write.
-// The buffer passed to Write must not be modified until Write returns.
-type parallelMultiWriter struct {
-	primary     io.Writer
-	secondaries []io.Writer
-}
-
-func newParallelMultiWriter(primary io.Writer, secondaries ...io.Writer) io.Writer {
-	if len(secondaries) == 0 {
-		return primary
-	}
-	return &parallelMultiWriter{primary: primary, secondaries: secondaries}
-}
-
-func (w *parallelMultiWriter) Write(p []byte) (int, error) {
-	errs := make([]chan error, len(w.secondaries))
-	for i, s := range w.secondaries {
-		ch := make(chan error, 1)
-		errs[i] = ch
-		go func(s io.Writer) {
-			_, err := s.Write(p)
-			ch <- err
-		}(s)
-	}
-	n, err := w.primary.Write(p)
-	for _, ch := range errs {
-		if sErr := <-ch; sErr != nil && err == nil {
-			err = sErr
-		}
-	}
-	return n, err
-}
 
 func copyStreamWithProgress(dst io.Writer, src io.Reader, buf []byte, onWrite func(written int64) error) error {
 	var written int64
