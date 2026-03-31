@@ -30,6 +30,7 @@ type ServerOptions struct {
 	ProgressPath           string        // write transfer % to this file/pipe
 	ProgressInterval       time.Duration // tick interval for progress writes (default 1s)
 	DisableZeroCopy        bool          // force buffered send path even when zero-copy is available
+	TargetIODepth          int           // target IO depth per CPU advertised in PROBE (default 8)
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -103,6 +104,7 @@ type connSession struct {
 	socketWriteBufferBytes int
 	syncTimeout            time.Duration
 	disableZeroCopy        bool
+	targetIODepth          int
 	respOut                io.Writer
 	closeResp              func() error
 	wroteBytes             bool
@@ -120,6 +122,7 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated 
 		socketWriteBufferBytes: opts.SocketWriteBufferBytes,
 		syncTimeout:            opts.SyncTimeout,
 		disableZeroCopy:        opts.DisableZeroCopy,
+		targetIODepth:          opts.TargetIODepth,
 		respOut:                conn,
 		closeResp:              func() error { return nil },
 		onTransferCreated:      onTransferCreated,
@@ -210,7 +213,7 @@ func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Read
 		return handleSENDWithOptions(ctx, req, out, s.deps, s.limiter, s.disableZeroCopy)
 	}
 	if req.Verb == VerbPROBE {
-		return handlePROBEWithInput(ctx, req, in, out, s.deps)
+		return handlePROBEWithInput(ctx, req, in, out, s.deps, s.targetIODepth)
 	}
 	if req.Verb == VerbSYNC {
 		if s.syncTimeout > 0 {

@@ -31,6 +31,7 @@ type tcpAuthState struct {
 
 type probeResponse struct {
 	ServerCPU       int
+	ServerIODepth   int
 	CTS0            int64
 	CTS1            int64
 	STS0            int64
@@ -756,12 +757,17 @@ func parseProbeResponseLine(line string) (probeResponse, error) {
 	if err != nil || probeBytes < 0 {
 		return probeResponse{}, errors.New("invalid PROBE response probe-bytes")
 	}
+	ioDepth, _ := strconv.Atoi(strings.TrimSpace(p["io-depth"]))
+	if ioDepth <= 0 {
+		ioDepth = 1
+	}
 	wmemBytes, _ := strconv.ParseInt(strings.TrimSpace(p["wmem"]), 10, 64)
 	if wmemBytes < 0 {
 		wmemBytes = 0
 	}
 	return probeResponse{
 		ServerCPU:       serverCPU,
+		ServerIODepth:   ioDepth,
 		CTS0:            cts0,
 		STS0:            sts0,
 		STS1:            sts1,

@@ -342,7 +342,6 @@ type copyCLIConfig struct {
 	modeRaw                 string
 	concurrency             int
 	ackEveryRaw             string
-	batchSizeRaw            string
 	probeSizeRaw            string
 	deadlineRaw             string
 	traceFile               string
@@ -379,7 +378,6 @@ type syncArgs struct {
 	concurrency         int
 	concurrencyExplicit bool
 	ackEvery            int64
-	batchSize           int64
 	compress            string
 	noSync              bool
 	skipWrite           bool
@@ -399,7 +397,6 @@ type startArgs struct {
 	concurrency         int
 	concurrencyExplicit bool
 	ackEvery            int64
-	batchSize           int64
 	compress            string
 	noSync              bool
 	discard             bool
@@ -448,7 +445,6 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	}
 	cfg := copyCLIConfig{
 		ackEveryRaw:             encoding.HumanBytes(defaultCLIAckEveryBytes),
-		batchSizeRaw:            encoding.HumanBytes(defaultCLIAckEveryBytes),
 		probeSizeRaw:            encoding.HumanBytes(defaultCLIProbeBytes),
 		progressFileIntervalRaw: "1s",
 		progress:                true,
@@ -469,7 +465,6 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.StringVar(&cfg.progressFileIntervalRaw, "", "progress-file-interval", cfg.progressFileIntervalRaw, "Progress write interval (e.g. 500ms, 10s)")
 	cf.BoolVar(&cfg.yes, "y", "yes", false, "Skip confirmation prompt on sync paths")
 	cf.StringVar(&cfg.ackEveryRaw, "a", "ack-every", cfg.ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
-	cf.StringVar(&cfg.batchSizeRaw, "b", "batch-size", cfg.batchSizeRaw, "Parallel batch size / unit of work per concurrent request; 1B, 4KiB, 8MiB")
 	cf.StringVar(&cfg.probeSizeRaw, "", "probe-size", cfg.probeSizeRaw, "Probe payload size; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&cfg.deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
 	cf.StringVar(&cfg.traceFile, "", "trace", "", "Write runtime/trace output to this file")
@@ -527,11 +522,6 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	ackEvery, err := encoding.ParseByteSize(cfg.ackEveryRaw)
 	if err != nil || ackEvery <= 0 {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
-		return 2
-	}
-	batchSize, err := encoding.ParseByteSize(cfg.batchSizeRaw)
-	if err != nil || batchSize <= 0 {
-		fmt.Fprintf(stderr, "invalid --batch-size: %v\n", err)
 		return 2
 	}
 	progressInterval, err := time.ParseDuration(cfg.progressFileIntervalRaw)
@@ -597,7 +587,6 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			concurrency:         cfg.concurrency,
 			concurrencyExplicit: cfg.concurrency > 0,
 			ackEvery:            ackEvery,
-			batchSize:           batchSize,
 			compress:            compress,
 			noSync:              cfg.skipFsync,
 			skipWrite:           cfg.skipWrite,
@@ -626,7 +615,6 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			concurrency:         cfg.concurrency,
 			concurrencyExplicit: cfg.concurrency > 0,
 			ackEvery:            ackEvery,
-			batchSize:           batchSize,
 			compress:            compress,
 			noSync:              cfg.skipFsync,
 			discard:             cfg.skipWrite,
@@ -1099,12 +1087,11 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	}
 	fmt.Fprintf(
 		stdout,
-		"transfer-probe : strategy=%s server_cpu=%d avg_ms=%d est_link=%dMbps concurrency=%d\n",
+		"transfer-probe : strategy=%s avg_ms=%d est_link=%dMbps srv-conc=(%d cpu * %d io = %d)\n",
 		cfg.loadStrategy,
-		probeResult.ServerCPU,
 		probeResult.AvgLatencyMS,
 		probeResult.LinkMbps,
-		probeResult.SuggestedConcurrency,
+		probeResult.ServerCPU, probeResult.ServerIODepth, probeResult.SuggestedConcurrency,
 	)
 	manifestResp, err := client.GetManifest(context.Background(), GetManifestRequest{
 		Directory:    cfg.sourceDir,
@@ -1384,7 +1371,6 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var encryptMode string
 	var compressRaw string
 	var ackEveryRaw string
-	var batchSizeRaw string
 	var skipWrite bool
 	var skipFsync bool
 	var concurrency int
@@ -1406,7 +1392,6 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
-	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "Parallel batch size / unit of work per concurrent request; 1B, 4KiB, 8MiB")
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
@@ -1434,11 +1419,6 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
 	if err != nil || ackEvery <= 0 {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
-		return 2
-	}
-	batchSize, err := encoding.ParseByteSize(batchSizeRaw)
-	if err != nil || batchSize <= 0 {
-		fmt.Fprintf(stderr, "invalid --batch-size: %v\n", err)
 		return 2
 	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
@@ -1498,10 +1478,17 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	entry := manifest.Entries[0]
 	fmt.Fprintf(stderr, "get-manifest: tid=%s file=%s size=%s\n", manifest.TransferID, entry.Path, encoding.HumanBytes(entry.Size))
 
-	// Mini-probe to detect server send buffer.
-	if miniProbe, probeErr := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil && miniProbe.ServerSendBufBytes > 0 {
-		_ = miniProbe // buffer info used internally by client
+	// Mini-probe to detect server send buffer and compute batch size.
+	var miniProbe ProbeResponse
+	if probe, probeErr := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil {
+		miniProbe = probe
 	}
+	batchSize := SuggestBatchMaxBytes(
+		miniProbe.SuggestedConcurrency,
+		client.WindowConcurrency,
+		client.FileRequestWindowBytes,
+		miniProbe.ServerSendBufBytes,
+	)
 
 	start := time.Now()
 	progressUpdates := make(chan DownloadProgressUpdate, 128)
@@ -1588,7 +1575,6 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var encryptMode string
 	var concurrency int
 	var ackEveryRaw string
-	var batchSizeRaw string
 	var compressRaw string
 	var noSync bool
 	var skipWrite bool
@@ -1608,7 +1594,6 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; 1B, 4KiB, 8MiB")
-	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "Parallel batch size; 1B, 4KiB, 8MiB")
 	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not mutate the target directory; fetch bodies to discard instead of writing them")
 	cf.BoolVar(&noSync, "", "skip-fsync", false, "Ack without fdatasync")
 	cf.BoolVar(&noSync, "", "no-sync", false, "Ack without fdatasync")
@@ -1633,11 +1618,6 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
 	if err != nil || ackEvery <= 0 {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
-		return 2
-	}
-	batchSize, err := encoding.ParseByteSize(batchSizeRaw)
-	if err != nil || batchSize <= 0 {
-		fmt.Fprintf(stderr, "invalid --batch-size: %v\n", err)
 		return 2
 	}
 	probeBytes, err := encoding.ParseByteSize(probeSizeRaw)
@@ -1673,7 +1653,6 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		concurrency:         concurrency,
 		concurrencyExplicit: concurrencyExplicit,
 		ackEvery:            ackEvery,
-		batchSize:           batchSize,
 		compress:            compress,
 		noSync:              noSync,
 		skipWrite:           skipWrite,
@@ -1745,6 +1724,12 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			fmt.Fprintf(stderr, "probe failed: %v\n", err)
 			return 1
 		}
+		batchSize := SuggestBatchMaxBytes(
+			probeResult.SuggestedConcurrency,
+			client.WindowConcurrency,
+			client.FileRequestWindowBytes,
+			probeResult.ServerSendBufBytes,
+		)
 
 		// SYNC: send old manifest, receive new manifest + removed paths.
 		syncResp, err := client.SyncManifest(context.Background(), SyncManifestRequest{
@@ -1788,14 +1773,15 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		rmCount := encoding.HumanCount(uint64(len(rmPaths)), 6)
 
 		fmt.Fprintf(stdout,
-			"sync-delta[%d]: new[%s (%s)] stale[%s (%s)] same[%s] rm[%s] link=%dMbps conc=%d\n",
+			"sync-delta[%d]: new[%s (%s)] stale[%s (%s)] same[%s] rm[%s] link=%dMbps srv-conc=(%d cpu * %d io = %d) batch=%s\n",
 			round,
 			newCount, encoding.HumanBytes(newBytes),
 			staleCount, encoding.HumanBytes(staleBytes),
 			unchangedCount,
 			rmCount,
 			probeResult.LinkMbps,
-			probeResult.SuggestedConcurrency,
+			probeResult.ServerCPU, probeResult.ServerIODepth, probeResult.SuggestedConcurrency,
+			encoding.HumanBytes(batchSize),
 		)
 
 		if len(newFiles) == 0 && len(staleFiles) == 0 && len(rmPaths) == 0 {
@@ -1951,7 +1937,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			Entries:         pendingEntries,
 			OutputWriter:    outputWriter,
 			Concurrency:     effectiveConcurrency,
-			BatchMaxBytes:   cfg.batchSize,
+			BatchMaxBytes:   batchSize,
 			ProgressUpdates: progressUpdates,
 			OnFileDone: func(evt StartFileDoneEvent) {
 				entry, ok := mergedManifest.EntryByID(evt.File.Meta.FileID)
@@ -2026,7 +2012,6 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var encryptMode string
 	var concurrency int
 	var ackEveryRaw string
-	var batchSizeRaw string
 	var compressRaw string
 	var noSync bool
 	var verbose bool
@@ -2045,7 +2030,6 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; 1B, 4KiB, 8MiB")
-	cf.StringVar(&batchSizeRaw, "b", "batch-size", ackEveryRaw, "Parallel batch size / unit of work per concurrent request; 1B, 4KiB, 8MiB")
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.BoolVar(&noSync, "", "skip-fsync", false, "Ack without fdatasync")
 	cf.BoolVar(&noSync, "", "no-sync", false, "Ack without fdatasync")
@@ -2105,15 +2089,6 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
 		return 2
 	}
-	batchSize, err := encoding.ParseByteSize(batchSizeRaw)
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid --batch-size: %v\n", err)
-		return 2
-	}
-	if batchSize <= 0 {
-		fmt.Fprintln(stderr, "--batch-size must be > 0")
-		return 2
-	}
 	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
@@ -2132,7 +2107,6 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		concurrency:         concurrency,
 		concurrencyExplicit: concurrencyExplicit,
 		ackEvery:            ackEvery,
-		batchSize:           batchSize,
 		compress:            compress,
 		noSync:              noSync,
 		discard:             discard,
@@ -2218,18 +2192,25 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		}
 	}()
 	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity))
-	serverSendBufBytes := int64(utils.MaxSocketWriteBufferBytes())
-	if miniProbe, err := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); err == nil && miniProbe.ServerSendBufBytes > 0 {
-		serverSendBufBytes = miniProbe.ServerSendBufBytes
+	var miniProbe ProbeResponse
+	if probe, probeErr := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil {
+		miniProbe = probe
 	}
+	batchSize := SuggestBatchMaxBytes(
+		miniProbe.SuggestedConcurrency,
+		client.WindowConcurrency,
+		client.FileRequestWindowBytes,
+		miniProbe.ServerSendBufBytes,
+	)
 	fmt.Fprintf(
 		stdout,
-		"start-plan: strategy=%s link=%dMbps conc=%d (srv-conc=%d) cli-sendbuf=%s srv-recvbuf=%s\n",
+		"start-plan: strategy=%s link=%dMbps conc=%d srv-conc=(%d cpu * %d io = %d) batch=%s cli-sendbuf=%s srv-recvbuf=%s\n",
 		loadStrategy,
 		manifest.LinkMbps,
 		effectiveConcurrency,
-		manifestConcurrency,
-		encoding.HumanBytes(serverSendBufBytes),
+		miniProbe.ServerCPU, miniProbe.ServerIODepth, miniProbe.SuggestedConcurrency,
+		encoding.HumanBytes(batchSize),
+		encoding.HumanBytes(miniProbe.ServerSendBufBytes),
 		encoding.HumanBytes(int64(utils.MaxSocketReadBufferBytes())),
 	)
 
@@ -2300,7 +2281,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		Entries:         pendingEntries,
 		OutputWriter:    outputWriter,
 		Concurrency:     effectiveConcurrency,
-		BatchMaxBytes:   cfg.batchSize,
+		BatchMaxBytes:   batchSize,
 		ProgressUpdates: progressUpdates,
 		OnFileDone: func(evt StartFileDoneEvent) {
 			entry, ok := manifest.EntryByID(evt.File.Meta.FileID)
