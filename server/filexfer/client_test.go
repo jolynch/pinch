@@ -22,6 +22,7 @@ import (
 	"filippo.io/age"
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
+	"github.com/jolynch/pinch/utils"
 	"github.com/zeebo/xxh3"
 )
 
@@ -218,11 +219,11 @@ func TestSummarizeProbeResultsAndConcurrency(t *testing.T) {
 	if summary.LinkMbps <= 0 {
 		t.Fatalf("expected rounded mbps > 0, got %d", summary.LinkMbps)
 	}
-	if got := suggestedConcurrencyFromProbe(24, LoadStrategyGentle); got != 6 {
+	if got := suggestedConcurrencyFromProbe(24, 8, LoadStrategyGentle); got != 6 {
 		t.Fatalf("expected gentle concurrency 6, got %d", got)
 	}
-	if got := suggestedConcurrencyFromProbe(24, LoadStrategyFast); got != 48 {
-		t.Fatalf("expected fast concurrency 48, got %d", got)
+	if got := suggestedConcurrencyFromProbe(24, 8, LoadStrategyFast); got != 192 {
+		t.Fatalf("expected fast concurrency 192, got %d", got)
 	}
 }
 
@@ -1734,5 +1735,106 @@ func TestClientUsesInjectedDialContext(t *testing.T) {
 	if resp.Status == nil || resp.Status.TransferID != "tx123" {
 		t.Fatalf("unexpected status response: %+v", resp.Status)
 	}
+}
+
+func TestSuggestBatchMaxBytes(t *testing.T) {
+	const mib = int64(1 << 20)
+	clientRmem := int64(utils.MaxSocketReadBufferBytes())
+
+	tests := []struct {
+		name                 string
+		conc, winConc        int
+		windowBytes, srvWmem int64
+		want                 int64
+	}{
+		// Fast mode: 24 cpu * 8 io = 192 conc, winConc=4, perFile=48
+		// 1GiB/48 ≈ 21.3 MiB → ceil pow2 = 32 MiB
+		{"fast 24cpu*8io", 192, 4, 1 << 30, 4 * mib, 32 * mib},
+
+		// Fast mode: 2 cpu * 8 io = 16, winConc=4, perFile=4
+		// 1GiB/4 = 256 MiB
+		{"fast 2cpu*8io", 16, 4, 1 << 30, 4 * mib, 256 * mib},
+
+		// Gentle 24 cpu: conc=6, 6/4=1 < 2 → winConc=6, perFile=1
+		// batch = 1 GiB (capped at window)
+		{"gentle 24cpu conc=6", 6, 4, 1 << 30, 4 * mib, 1 << 30},
+
+		// Gentle 32 cpu: conc=8, 8/4=2 → perFile=2
+		// 1GiB/2 = 512 MiB
+		{"gentle 32cpu conc=8", 8, 4, 1 << 30, 4 * mib, 512 * mib},
+
+		// Zero concurrency defaults to 1
+		{"zero conc defaults", 0, 0, 1 << 30, 4 * mib, 1 << 30},
+
+		// Negative values default safely
+		{"negative conc", -5, -2, 1 << 30, 4 * mib, 1 << 30},
+
+		// Socket buffer floor: 192 conc → 48 perFile → 1MiB batch
+		// but floor at max(4MiB, clientRmem)
+		{"batch floors at socket buf", 192, 4, 32 * mib, 4 * mib, max(4*mib, clientRmem)},
+
+		// Batch caps at window
+		{"batch caps at window", 2, 1, 8 * mib, 4 * mib, 8 * mib},
+
+		// Small window (< 1 MiB) returns window directly
+		{"sub-MiB window", 100, 4, 512 * 1024, 4 * mib, 512 * 1024},
+
+		// High CPU fast mode: 256 cpu * 8 io = 2048 conc, winConc=4, perFile=512
+		// 1GiB/512 = 2 MiB
+		{"256 cpus fast", 2048, 4, 1 << 30, 4 * mib, max(4*mib, clientRmem)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SuggestBatchMaxBytes(tt.conc, tt.winConc, tt.windowBytes, tt.srvWmem)
+			if got != tt.want {
+				t.Fatalf("SuggestBatchMaxBytes(%d, %d, %d, %d) = %d, want %d",
+					tt.conc, tt.winConc, tt.windowBytes, tt.srvWmem, got, tt.want)
+			}
+		})
+	}
+}
+
+func FuzzSuggestBatchMaxBytes(f *testing.F) {
+	f.Add(192, 4, int64(1<<30), int64(4<<20))
+	f.Add(0, 0, int64(1<<30), int64(4<<20))
+	f.Add(-10, -5, int64(1<<20), int64(0))
+	f.Add(256, 128, int64(512<<20), int64(16<<20))
+	f.Add(6, 4, int64(1<<30), int64(4<<20))
+	f.Add(8, 4, int64(1<<30), int64(4<<20))
+	f.Add(1, 1, int64(1), int64(0))
+	f.Add(2048, 4, int64(1<<30), int64(4<<20))
+	f.Fuzz(func(t *testing.T, conc int, winConc int, windowBytes int64, serverWmem int64) {
+		if windowBytes <= 0 {
+			return
+		}
+		if serverWmem < 0 {
+			serverWmem = 0
+		}
+		got := SuggestBatchMaxBytes(conc, winConc, windowBytes, serverWmem)
+		const mib = int64(1 << 20)
+
+		// Property 1: power of 2 MiB (when result >= 1 MiB)
+		if got >= mib {
+			if got%mib != 0 {
+				t.Fatalf("not MiB-aligned: %d", got)
+			}
+			mibUnits := got / mib
+			if mibUnits&(mibUnits-1) != 0 {
+				t.Fatalf("not power-of-2 MiB: %d (%d MiB units)", got, mibUnits)
+			}
+		}
+
+		// Property 2: <= windowBytes
+		if got > windowBytes {
+			t.Fatalf("exceeds window: %d > %d", got, windowBytes)
+		}
+
+		// Property 3: >= socket buffer floor (when floor <= window)
+		clientRmem := int64(utils.MaxSocketReadBufferBytes())
+		floor := max(serverWmem, clientRmem)
+		if floor <= windowBytes && got < floor {
+			t.Fatalf("below socket floor: %d < %d (serverWmem=%d clientRmem=%d)", got, floor, serverWmem, clientRmem)
+		}
+	})
 }
 

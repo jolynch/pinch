@@ -23,9 +23,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const defaultFileFrameLogicalSize int64 = 8 * 1024 * 1024
+const defaultFileFrameLogicalSize int64 = 4 * 1024 * 1024
+const defaultCompressedFrameBufferBytes = 4 * 1024 * 1024
 const defaultMaxLinuxPipeSizeBytes int64 = 1 * 1024 * 1024
-const defaultCompressedFrameBufferBytes = 8 * 1024 * 1024
 const maxCompressedFrameBufferPoolBytes = 32 * 1024 * 1024
 const placeholderHeaderHashToken = "xxh128:00000000000000000000000000000000"
 const loadStrategyFast = "fast"

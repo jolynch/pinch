@@ -52,13 +52,16 @@ func parsePROBERequest(req Request) (probeRequest, error) {
 	return probeRequest{ClientCPU: clientCPU, ProbeBytes: probeBytes, ClientTS0: clientTS0}, nil
 }
 
-func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, _ Deps) error {
+func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, _ Deps, ioDepth int) error {
 	parsed, err := parsePROBERequest(req)
 	if err != nil {
 		return err
 	}
 	if in == nil {
 		return protocolErr{code: "BAD_REQUEST", message: "missing PROBE payload stream"}
+	}
+	if ioDepth <= 0 {
+		ioDepth = 8
 	}
 	sts0 := time.Now().UnixMilli()
 	if parsed.ProbeBytes > 0 {
@@ -68,8 +71,9 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 	}
 	sts1 := time.Now().UnixMilli()
 	respLine := fmt.Sprintf(
-		"PROBE cpu=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d wmem=%d\n",
+		"PROBE cpu=%d io-depth=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d wmem=%d\n",
 		runtime.NumCPU(),
+		ioDepth,
 		parsed.ClientTS0,
 		sts0,
 		sts1,

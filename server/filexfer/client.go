@@ -162,6 +162,7 @@ type Client struct {
 	MaxFrameReadBufferBytes int
 	AckRequestTimeout       time.Duration
 	SocketReadBufferBytes   int
+	WindowConcurrency       int
 	LoadStrategy            string
 	Comp                    string // adapt|none|lz4|zstd; empty means server default (adapt)
 	ClientAgePublicKey      string
@@ -310,6 +311,7 @@ type ProbeRequest struct {
 
 type ProbeResponse struct {
 	ServerCPU            int
+	ServerIODepth        int
 	AvgLatencyMS         int64
 	LinkMbps             int64
 	SuggestedConcurrency int
@@ -403,7 +405,7 @@ const (
 	// the unit of parallel work. parallelism = window / batch.
 	defaultClientRequestWindowBytes      int64 = 1024 * 1024 * 1024
 	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024
-	defaultClientBatchMaxBytes           int64 = 128 * 1024 * 1024
+	defaultClientBatchMaxBytes           int64 = 64 * 1024 * 1024
 
 	// Frame read-buffer bounds, scaled per stream based on file/frame size.
 	defaultClientFrameBufferBytes int = 8 * 1024 * 1024
@@ -1648,19 +1650,91 @@ func (c *Client) effectiveBatchMaxBytes(reqBatchMaxBytes int64) int64 {
 	return defaultClientBatchMaxBytes
 }
 
-func suggestedConcurrencyFromProbe(serverCPU int, strategy string) int {
+// SuggestBatchMaxBytes computes the batch size (unit of parallel TCP work per file)
+// from the probe-derived suggested concurrency and the client's window parameters.
+//
+// The goal is to keep enough batches in flight to saturate the server:
+//
+//	perFileWorkers = suggestedConcurrency / windowConcurrency
+//	rawBatch       = windowBytes / perFileWorkers
+//
+// When the suggested concurrency is too low to support both the default window
+// concurrency and per-file parallelism (i.e. suggestedConcurrency / windowConcurrency < 2),
+// window concurrency is reduced to suggestedConcurrency so all slots go to
+// concurrent file downloads rather than per-file splitting. This happens
+// naturally in gentle mode where total concurrency = ceil(cpu/4).
+//
+//	Example (gentle, 24 cpu):  conc=6, winConc reduced to 6, perFile=1 → batch = windowBytes
+//	Example (gentle, 32 cpu):  conc=8, winConc=4, perFile=2 → batch = windowBytes/2
+//	Example (fast, 24 cpu, io=8): conc=192, winConc=4, perFile=48 → batch ≈ 32 MiB
+//
+// The result is rounded up to the nearest power-of-2 MiB boundary for alignment,
+// then clamped:
+//   - Floor: max(serverWmemBytes, clientRmemBytes). A single batch becomes one TCP
+//     SEND request, so there is no benefit in making it smaller than the socket
+//     buffer the OS has already allocated for the connection.
+//   - Ceiling: windowBytes. A batch larger than the window cannot be scheduled.
+func SuggestBatchMaxBytes(suggestedConcurrency int, windowConcurrency int, windowBytes int64, serverWmemBytes int64) int64 {
+	if windowBytes <= 0 {
+		return defaultClientBatchMaxBytes
+	}
+	if windowConcurrency <= 0 {
+		windowConcurrency = 4
+	}
+	if suggestedConcurrency <= 0 {
+		suggestedConcurrency = 1
+	}
+
+	// Auto-range window concurrency: if there isn't enough total concurrency
+	// to give each window at least 2 per-file workers, reduce window concurrency
+	// to match the total so all slots are used for parallel file downloads.
+	if suggestedConcurrency/windowConcurrency < 2 {
+		windowConcurrency = suggestedConcurrency
+	}
+	perFileWorkers := max(1, suggestedConcurrency/windowConcurrency)
+	raw := windowBytes / int64(perFileWorkers)
+
+	// Round up to the nearest power-of-2 MiB.
+	const mib = int64(1 << 20)
+	if windowBytes < mib {
+		return windowBytes
+	}
+	mibCount := max(int64(1), (raw+mib-1)/mib)
+	pow2 := int64(1)
+	for pow2 < mibCount {
+		pow2 <<= 1
+	}
+	batch := pow2 * mib
+
+	// Floor: a batch is one TCP SEND, so it should not be smaller than the
+	// socket buffer the OS allocated — sending less wastes a round-trip for
+	// data that would have fit in a single write/read cycle.
+	floor := max(serverWmemBytes, int64(utils.MaxSocketReadBufferBytes()))
+	batch = max(batch, floor)
+
+	// Ceiling: a batch larger than the transfer window is meaningless.
+	return min(batch, windowBytes)
+}
+
+func suggestedConcurrencyFromProbe(serverCPU int, ioDepth int, strategy string) int {
 	if serverCPU <= 0 {
 		serverCPU = runtime.NumCPU()
 	}
+	if ioDepth <= 0 {
+		ioDepth = 1
+	}
 	strategy = normalizeLoadStrategy(strategy)
 	if strategy == LoadStrategyGentle {
+		// Gentle: 25% of available CPUs, io-depth is ignored —
+		// window concurrency and per-file parallelism are auto-ranged
+		// in SuggestBatchMaxBytes to fill this budget.
 		value := serverCPU / 4
 		if serverCPU%4 != 0 {
 			value++
 		}
 		return value
 	}
-	return serverCPU * 2
+	return serverCPU * ioDepth
 }
 
 func clampConcurrency(v int) int {
@@ -1702,7 +1776,7 @@ func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse
 		probeResults = append(probeResults, result)
 	}
 	response := summarizeProbeSamples(probeResults, probeBytes)
-	response.SuggestedConcurrency = clampConcurrency(suggestedConcurrencyFromProbe(response.ServerCPU, loadStrategy))
+	response.SuggestedConcurrency = clampConcurrency(suggestedConcurrencyFromProbe(response.ServerCPU, response.ServerIODepth, loadStrategy))
 	return response, nil
 }
 
@@ -1712,9 +1786,11 @@ func summarizeProbeSamples(results []probeResponse, probeBytes int64) ProbeRespo
 	}
 	totalIntervalMS := int64(0)
 	serverCPU := 0
+	serverIODepth := 0
 	serverSendBufBytes := int64(0)
 	for _, result := range results {
 		serverCPU = result.ServerCPU
+		serverIODepth = result.ServerIODepth
 		serverSendBufBytes = result.ServerWmemBytes
 		intervalMS := max(int64(1), (result.CTS1-result.CTS0)-(result.STS1-result.STS0))
 		totalIntervalMS += intervalMS
@@ -1724,6 +1800,7 @@ func summarizeProbeSamples(results []probeResponse, probeBytes int64) ProbeRespo
 	roundedMbps := ((mbps + 50) / 100) * 100
 	return ProbeResponse{
 		ServerCPU:          serverCPU,
+		ServerIODepth:      serverIODepth,
 		AvgLatencyMS:       avgMS,
 		LinkMbps:           roundedMbps,
 		ServerSendBufBytes: serverSendBufBytes,

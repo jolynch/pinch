@@ -254,7 +254,7 @@ func ParseRequest(payload []byte) (Request, error) {
 				return Request{}, protocolErr{code: "BAD_REQUEST", message: "invalid PROBE arguments"}
 			}
 			switch key {
-			case "cpu", "probe-bytes", "cts0", "sts0", "sts1":
+			case "cpu", "io-depth", "probe-bytes", "cts0", "sts0", "sts1", "wmem":
 				param[key] = val
 			default:
 				// Unknown keys are ignored for forward compatibility.

@@ -825,6 +825,7 @@ Options:
   -c, --chroot string         server root directory (default "/")
   -k, --keys string           age keys directory (default "/var/lib/pinch/keys")
       --require-auth          require AUTH before commands
+      --target-io-depth int   target IO depth per CPU advertised in PROBE (default 8)
       --trace string          write runtime/trace to this file
       --progress-path string           write transfer % to this file/pipe
       --progress-path-interval string  progress write interval (default "1s")
@@ -842,6 +843,7 @@ Options:
 	fs.StringVar(&keysDir, "keys", keysDir, "")
 	fs.StringVar(&keysDir, "k", keysDir, "")
 	requireAuth := fs.Bool("require-auth", false, "")
+	targetIODepth := fs.Int("target-io-depth", 8, "")
 	disableZeroCopy := fs.Bool("disable-zero-copy", false, "")
 	traceFile := fs.String("trace", "", "")
 	var progressFilePath string
@@ -908,6 +910,7 @@ Options:
 		ProgressPath:           progressFilePath,
 		ProgressInterval:       progressInterval,
 		DisableZeroCopy:        *disableZeroCopy,
+		TargetIODepth:          *targetIODepth,
 	}); serveErr != nil {
 		log.Fatalf("File transfer listener stopped: %v", serveErr)
 	}

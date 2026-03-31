@@ -484,6 +484,8 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbSEND:
 			for _, p := range req.Params[1:] {
 				if got := p["mode"]; got != LoadStrategyGentle {
@@ -521,7 +523,8 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "start-plan: strategy=gentle link=700Mbps conc=2 (srv-conc=3)") {
+	if !strings.Contains(stdout.String(), "start-plan: strategy=gentle link=700Mbps conc=2") ||
+		!strings.Contains(stdout.String(), "srv-conc=(24 cpu * 1 io = 6)") {
 		t.Fatalf("missing start plan line: %s", stdout.String())
 	}
 	// After start, staging dir is renamed to target dir.
@@ -543,6 +546,8 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbSEND:
 			if got := req.Params[1]["mode"]; got != LoadStrategyFast {
 				return fmt.Errorf("expected SEND mode=%s, got %q", LoadStrategyFast, got)
@@ -567,7 +572,8 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "start-plan: strategy=fast link=1200Mbps conc=5 (srv-conc=5)") {
+	if !strings.Contains(stdout.String(), "start-plan: strategy=fast link=1200Mbps conc=5") ||
+		!strings.Contains(stdout.String(), "srv-conc=(24 cpu * 1 io = 24)") {
 		t.Fatalf("missing default start plan line: %s", stdout.String())
 	}
 }
@@ -636,10 +642,12 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 
 func TestRunCLIStartDiscardKeepsProgressOnFailure(t *testing.T) {
 	tmp := t.TempDir()
+	payloadA := bytes.Repeat([]byte("a"), 10<<20)
+	payloadB := bytes.Repeat([]byte("b"), 10<<20)
 	manifestRaw := strings.Join([]string{
 		"FM/1 txdiscardfail 7:/remote mode=fast link-mbps=700 concurrency=1",
-		"0 5 0:100 0644 0:5:a.txt",
-		"1 4 0:101 0644 0:5:b.txt",
+		fmt.Sprintf("0 %d 0:100 0644 0:5:a.txt", len(payloadA)),
+		fmt.Sprintf("1 %d 0:101 0644 0:5:b.txt", len(payloadB)),
 		"",
 	}, "\n")
 	targetDir := setupPinchState(t, tmp, manifestRaw, "")
@@ -650,15 +658,31 @@ func TestRunCLIStartDiscardKeepsProgressOnFailure(t *testing.T) {
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
+		case intftcp.VerbPROBE:
+			cts0 := req.Params[0]["cts0"]
+			n, err := strconv.Atoi(req.Params[0]["probe-bytes"])
+			if err != nil || n < 0 {
+				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
+			}
+			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=256 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+				return err
+			}
+			if n > 0 {
+				if _, err := out.Write(make([]byte, n)); err != nil {
+					return err
+				}
+			}
+			_, err = io.WriteString(out, "OK\r\n")
+			return err
 		case intftcp.VerbSEND:
 			for _, p := range req.Params[1:] {
 				switch p["fid"] {
 				case "0":
-					if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+					if _, err := io.WriteString(out, buildCLIFrame(0, payloadA, 0)); err != nil {
 						return err
 					}
 				case "1":
-					if _, err := io.WriteString(out, buildCLIFrame(1, []byte("test"), 0)); err != nil {
+					if _, err := io.WriteString(out, buildCLIFrame(1, payloadB, 0)); err != nil {
 						return err
 					}
 				default:
@@ -687,7 +711,6 @@ func TestRunCLIStartDiscardKeepsProgressOnFailure(t *testing.T) {
 		"--progress=false",
 		"--concurrency", "1",
 		"--ack-every", "1KiB",
-		"--batch-size", "5B",
 		targetDir,
 	}, &stdout, &stderr)
 	if code != 1 {
@@ -698,7 +721,7 @@ func TestRunCLIStartDiscardKeepsProgressOnFailure(t *testing.T) {
 		t.Fatalf("read progress state: %v", err)
 	}
 	progressText := string(progressRaw)
-	if !strings.Contains(progressText, "0 5 ") && !strings.Contains(progressText, "1 4 ") {
+	if !strings.Contains(progressText, fmt.Sprintf(" %d 1", len(payloadA))) {
 		t.Fatalf("expected retained progress for completed file, got %q", string(progressRaw))
 	}
 	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "manifest")); !os.IsNotExist(err) {
