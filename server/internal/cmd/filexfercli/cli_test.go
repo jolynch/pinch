@@ -39,6 +39,10 @@ func (s *ftcpTestServer) Close() {
 }
 
 func newFTCPTestServer(t *testing.T, handler func(intftcp.Request, io.Writer) error) *ftcpTestServer {
+	return newFTCPTestServerWithEncryptMode(t, "", handler)
+}
+
+func newFTCPTestServerWithEncryptMode(t *testing.T, encryptMode string, handler func(intftcp.Request, io.Writer) error) *ftcpTestServer {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -57,14 +61,14 @@ func newFTCPTestServer(t *testing.T, handler func(intftcp.Request, io.Writer) er
 			go func(c net.Conn) {
 				defer s.wg.Done()
 				defer c.Close()
-				serveFTCPConn(c, handler)
+				serveFTCPConn(c, encryptMode, handler)
 			}(conn)
 		}
 	}()
 	return s
 }
 
-func serveFTCPConn(conn net.Conn, handler func(intftcp.Request, io.Writer) error) {
+func serveFTCPConn(conn net.Conn, encryptMode string, handler func(intftcp.Request, io.Writer) error) {
 	br := bufio.NewReader(conn)
 	firstLine, err := readFTCPLine(br)
 	if err != nil {
@@ -84,7 +88,14 @@ func serveFTCPConn(conn net.Conn, handler func(intftcp.Request, io.Writer) error
 			blob := strings.TrimSpace(req.Params[0]["blob"])
 			if blob != "" {
 				if recipient, parseErr := age.ParseX25519Recipient(blob); parseErr == nil {
-					ew, encErr := age.Encrypt(conn, recipient)
+					var ew io.WriteCloser
+					var encErr error
+					switch encryptMode {
+					case "aes":
+						ew, encErr = encoding.AESGCMEncrypt(conn, recipient, 0)
+					default:
+						ew, encErr = age.Encrypt(conn, recipient)
+					}
 					if encErr != nil {
 						return
 					}
@@ -459,6 +470,61 @@ func TestRunCLITransferWithEncryptAge(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	code := runTransferCLI(srv.URL, []string{"-s", "/remote", "--encrypt", "age", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	serverManifestPath := filepath.Join(tmp, ".pinch", "manifest.server")
+	raw, err := os.ReadFile(serverManifestPath)
+	if err != nil {
+		t.Fatalf("read manifest.server: %v", err)
+	}
+	if string(raw) != manifestRaw {
+		t.Fatalf("unexpected decrypted manifest: %q", string(raw))
+	}
+}
+
+func TestRunCLITransferWithEncryptAES(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := filepath.Join(tmp, "dst")
+	manifestRaw := strings.Join([]string{
+		"FM/1 txaescli 7:/remote mode=fast link-mbps=1000 concurrency=8",
+		"0 5 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+
+	srv := newFTCPTestServerWithEncryptMode(t, "aes", func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			cts0 := req.Params[0]["cts0"]
+			n, err := strconv.Atoi(req.Params[0]["probe-bytes"])
+			if err != nil || n < 0 {
+				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
+			}
+			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+				return err
+			}
+			if n > 0 {
+				if _, err := out.Write(make([]byte, n)); err != nil {
+					return err
+				}
+			}
+			_, err = io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runTransferCLI(srv.URL, []string{"-s", "/remote", "--encrypt", "aes", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}

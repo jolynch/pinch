@@ -296,19 +296,19 @@ Run 'pinch filecli <command> --help' for command-specific options.
 `, defaultFileListener)
 }
 
-func resolveEncryptionOptions(mode string) (string, string, error) {
+func resolveEncryptionOptions(mode string) (pubKey string, identity string, encMode string, err error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	switch mode {
 	case "", "none":
-		return "", "", nil
-	case "age":
-		identity, err := age.GenerateX25519Identity()
-		if err != nil {
-			return "", "", fmt.Errorf("generate age identity: %w", err)
+		return "", "", "", nil
+	case "age", "aes":
+		id, genErr := age.GenerateX25519Identity()
+		if genErr != nil {
+			return "", "", "", fmt.Errorf("generate age identity: %w", genErr)
 		}
-		return identity.Recipient().String(), identity.String(), nil
+		return id.Recipient().String(), id.String(), mode, nil
 	default:
-		return "", "", fmt.Errorf("unsupported --encrypt value %q (only \"age\" is supported)", mode)
+		return "", "", "", fmt.Errorf("unsupported --encrypt value %q (supported: none, age, aes)", mode)
 	}
 }
 
@@ -363,6 +363,7 @@ type transferArgs struct {
 	targetDir    string
 	agePublicKey string
 	ageIdentity  string
+	encMode      string
 	loadStrategy string
 	probeBytes   int64
 	verbose      bool
@@ -375,6 +376,7 @@ type syncArgs struct {
 	targetDir           string
 	agePublicKey        string
 	ageIdentity         string
+	encMode             string
 	concurrency         int
 	concurrencyExplicit bool
 	ackEvery            int64
@@ -393,6 +395,7 @@ type startArgs struct {
 	targetDir           string
 	agePublicKey        string
 	ageIdentity         string
+	encMode             string
 	verbosity           int
 	concurrency         int
 	concurrencyExplicit bool
@@ -456,7 +459,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.BoolVar(&cfg.verifyMeta, "", "verify-meta", false, "Run read-only metadata verification after copy; with --skip-fetch this is allowed only if LOCAL_DST already exists")
 	cf.IntVar(&cfg.verifyDataSamplePct, "", "verify-data-sample", 0, "Percent of frame slots to sample per file for data verification (0-100); implies --verify-meta; not allowed with --skip-fetch or --skip-write")
 	cf.StringVar(&cfg.modeRaw, "", "mode", LoadStrategyFast, "Server read strategy: fast|gentle")
-	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
 	cf.StringVar(&cfg.compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "Parallel download / verification workers (0=adapt from server)")
 	cf.BoolVar(&cfg.progress, "", "progress", true, "Show transfer progress every 2s")
@@ -499,7 +502,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintln(stderr, "--verify-meta cannot be used with --skip-write")
 		return 2
 	}
-	agePublicKey, ageIdentity, err := resolveEncryptionOptions(cfg.encryptMode)
+	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptions(cfg.encryptMode)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
@@ -561,6 +564,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		targetDir:    cfg.localDst,
 		agePublicKey: agePublicKey,
 		ageIdentity:  ageIdentity,
+		encMode:      encMode,
 		loadStrategy: loadStrategy,
 		probeBytes:   probeBytes,
 		verbose:      false,
@@ -584,6 +588,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			targetDir:           cfg.localDst,
 			agePublicKey:        agePublicKey,
 			ageIdentity:         ageIdentity,
+			encMode:             encMode,
 			concurrency:         cfg.concurrency,
 			concurrencyExplicit: cfg.concurrency > 0,
 			ackEvery:            ackEvery,
@@ -611,6 +616,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			targetDir:           cfg.localDst,
 			agePublicKey:        agePublicKey,
 			ageIdentity:         ageIdentity,
+			encMode:             encMode,
 			verbosity:           verbosity,
 			concurrency:         cfg.concurrency,
 			concurrencyExplicit: cfg.concurrency > 0,
@@ -741,7 +747,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *Manife
 	if manifest == nil {
 		return 0, 0, errors.New("missing manifest")
 	}
-	agePublicKey, ageIdentity, err := resolveEncryptionOptions(cfg.encryptMode)
+	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptions(cfg.encryptMode)
 	if err != nil {
 		return 0, 0, fmt.Errorf("invalid --encrypt: %w", err)
 	}
@@ -799,7 +805,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *Manife
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			client := NewClient(serverURL, WithClientAgePublicKey(agePublicKey), WithClientAgeIdentity(ageIdentity))
+			client := NewClient(serverURL, WithClientAgePublicKey(agePublicKey), WithClientAgeIdentity(ageIdentity), WithEncryptMode(encMode))
 			for task := range taskCh {
 				if err := verifySampleTaskData(ctx, client, manifest.TransferID, task); err != nil {
 					select {
@@ -990,7 +996,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	var maxChunk int
 	var deadlineRaw string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory to transfer")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
 	cf.StringVar(&loadStrategyRaw, "", "load-strategy", LoadStrategyFast, "Server load strategy (fast|gentle)")
 	probeSizeRaw = encoding.HumanBytes(defaultCLIProbeBytes)
 	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "Probe payload size for transfer metadata; 1B, 4KiB, 8MiB")
@@ -1029,7 +1035,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		fmt.Fprintf(stderr, "invalid --load-strategy: %v\n", err)
 		return 2
 	}
-	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
+	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptions(encryptMode)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
@@ -1052,6 +1058,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		targetDir:    cf.Arg(0),
 		agePublicKey: agePublicKey,
 		ageIdentity:  ageIdentity,
+		encMode:      resolvedEncMode,
 		loadStrategy: loadStrategy,
 		probeBytes:   probeBytes,
 		verbose:      verbose,
@@ -1074,7 +1081,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 
 	fmt.Fprintf(stderr, "transfer(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
-	client := NewClient(serverURL, WithLoadStrategy(cfg.loadStrategy), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity))
+	client := NewClient(serverURL, WithLoadStrategy(cfg.loadStrategy), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity), WithEncryptMode(cfg.encMode))
 	start := time.Now()
 	probeResult, err := client.ProbeLink(context.Background(), ProbeRequest{
 		Samples:      3,
@@ -1381,7 +1388,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var progressFilePath string
 	var progressFileIntervalRaw string
 	cf.StringVar(&outFile, "o", "", "", "Output file path, or '-' for stdout")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=auto)")
 	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not write the file; fetch to discard instead")
@@ -1421,7 +1428,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
 	}
-	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
+	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptions(encryptMode)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
@@ -1455,7 +1462,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		effectiveConcurrency = concurrency
 	}
 
-	client := NewClient(serverURL, WithLoadStrategy(LoadStrategyFast), WithComp(compress), WithClientAgePublicKey(agePublicKey), WithClientAgeIdentity(ageIdentity))
+	client := NewClient(serverURL, WithLoadStrategy(LoadStrategyFast), WithComp(compress), WithClientAgePublicKey(agePublicKey), WithClientAgeIdentity(ageIdentity), WithEncryptMode(resolvedEncMode))
 
 	// Fetch manifest for the single file (skip full probe).
 	fmt.Fprintf(stderr, "get(addr=[%s], path=[%s])\n", serverURL, remotePath)
@@ -1585,7 +1592,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var progressFilePath string
 	var progressFileIntervalRaw string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory on server (default: manifest root)")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
 	cf.BoolVar(&yes, "y", "yes", false, "Skip confirmation prompt")
@@ -1625,7 +1632,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintf(stderr, "invalid --probe-size: %v\n", err)
 		return 2
 	}
-	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
+	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptions(encryptMode)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
@@ -1650,6 +1657,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		targetDir:           cf.Arg(0),
 		agePublicKey:        agePublicKey,
 		ageIdentity:         ageIdentity,
+		encMode:             resolvedEncMode,
 		concurrency:         concurrency,
 		concurrencyExplicit: concurrencyExplicit,
 		ackEvery:            ackEvery,
@@ -1714,7 +1722,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		}
 
 		// Probe link bandwidth.
-		client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity))
+		client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity), WithEncryptMode(cfg.encMode))
 		probeResult, err := client.ProbeLink(context.Background(), ProbeRequest{
 			Samples:      3,
 			ProbeBytes:   cfg.probeBytes,
@@ -2020,7 +2028,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var deadlineRaw string
 	var progressFilePath string
 	var progressFileIntervalRaw string
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age (default: none)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
 	cf.StringVar(&progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
@@ -2089,7 +2097,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
 		return 2
 	}
-	agePublicKey, ageIdentity, err := resolveEncryptionOptions(encryptMode)
+	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptions(encryptMode)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
 		return 2
@@ -2103,6 +2111,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		targetDir:           cf.Arg(0),
 		agePublicKey:        agePublicKey,
 		ageIdentity:         ageIdentity,
+		encMode:             resolvedEncMode,
 		verbosity:           verbosity,
 		concurrency:         concurrency,
 		concurrencyExplicit: concurrencyExplicit,
@@ -2191,7 +2200,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			stopProgress()
 		}
 	}()
-	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity))
+	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity), WithEncryptMode(cfg.encMode))
 	var miniProbe ProbeResponse
 	if probe, probeErr := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil {
 		miniProbe = probe
