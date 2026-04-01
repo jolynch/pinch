@@ -138,6 +138,12 @@ func WithClientAgeIdentity(identity string) ClientOption {
 	})
 }
 
+func WithEncryptMode(mode string) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.EncryptMode = strings.ToLower(strings.TrimSpace(mode))
+	})
+}
+
 func normalizeComp(comp string) string {
 	switch strings.ToLower(strings.TrimSpace(comp)) {
 	case EncodingLz4:
@@ -167,6 +173,7 @@ type Client struct {
 	Comp                    string // adapt|none|lz4|zstd; empty means server default (adapt)
 	ClientAgePublicKey      string
 	ClientAgeIdentity       string
+	EncryptMode             string // "age" (default) or "aes" — selects post-AUTH stream cipher
 
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
@@ -323,12 +330,12 @@ type GetManifestResponse struct {
 }
 
 type SyncManifestRequest struct {
-	Directory    string
-	OldManifest  *Manifest
-	Mode         string
-	LinkMbps     int64
-	Concurrency  int
-	DeadlineMS   int64
+	Directory   string
+	OldManifest *Manifest
+	Mode        string
+	LinkMbps    int64
+	Concurrency int
+	DeadlineMS  int64
 }
 
 type SyncManifestResponse struct {
@@ -1952,7 +1959,6 @@ func mergeCompCounts(dst map[string]uint64, src map[string]uint64) {
 	}
 }
 
-
 func copyStreamWithProgress(dst io.Writer, src io.Reader, buf []byte, onWrite func(written int64) error) error {
 	var written int64
 	for {
@@ -2842,6 +2848,15 @@ func decodePayloadReader(payload io.Reader, comp string, enc string, identity ag
 			return nil, errors.New("missing age identity for encrypted frame")
 		}
 		decrypted, err := age.Decrypt(payload, identity)
+		if err != nil {
+			return nil, err
+		}
+		return decodePayloadReaderByComp(decrypted, comp)
+	case "aes":
+		if identity == nil {
+			return nil, errors.New("missing identity for AES encrypted frame")
+		}
+		decrypted, err := intencoding.AESGCMDecrypt(payload, identity, 0)
 		if err != nil {
 			return nil, err
 		}

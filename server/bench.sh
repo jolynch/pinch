@@ -22,7 +22,7 @@ Options:
   --skip-fsync               Skip fdatasync after each file/window (passed to copy).
   --no-sync                  Alias for --skip-fsync.
   --concurrency N            Copy command concurrency (default: 128).
-  --encrypt MODE             Encryption mode passed to CLI (supported: age).
+  --encrypt MODE             Encryption mode passed to CLI (supported: age|aes).
   --compress MODE            Compression mode passed to copy (adapt|none|lz4|zstd).
   --disable-zero-copy        Force server to use buffered send path (no tee/splice).
   --freq HZ                  perf sample frequency (default: 199).
@@ -209,8 +209,8 @@ require_cmd go
 require_cmd rm
 require_cmd time
 
-if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "age" ]]; then
-  echo "unsupported --encrypt value: ${ENCRYPT_MODE} (only 'age' is supported)" >&2
+if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "age" && "${ENCRYPT_MODE}" != "aes" ]]; then
+  echo "unsupported --encrypt value: ${ENCRYPT_MODE} (supported: age, aes)" >&2
   exit 2
 fi
 if [[ "${RSYNC}" == "true" && "${SKIP_WRITE}" == "true" ]]; then
@@ -306,6 +306,9 @@ start_server() {
   mkdir -p "${SERVER_IN}" "${SERVER_OUT}" "${SERVER_KEYS}"
   echo "Starting server in background..."
   local server_args=(filesrv -l "${SERVER_URL}" -k "${SERVER_KEYS}")
+  if [[ -n "${ENCRYPT_MODE}" ]]; then
+    server_args+=(--encrypt "${ENCRYPT_MODE}")
+  fi
   if [[ "${TRACE}" == "true" ]]; then
     server_args+=(--trace "${SERVER_TRACE}")
   fi

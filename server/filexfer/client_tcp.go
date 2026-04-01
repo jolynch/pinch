@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 	ftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 )
 
@@ -27,6 +28,7 @@ type tcpAuthState struct {
 	parsedIdentity  age.Identity
 	hasAuth         bool
 	encryptCommands bool
+	encMode         string // "age" (default) or "aes"
 }
 
 type probeResponse struct {
@@ -175,7 +177,10 @@ func encodeAUTHBlobToken(blob []byte, encrypted bool) string {
 }
 
 func (c *Client) resolveTCPAuthState() (tcpAuthState, error) {
-	state := tcpAuthState{}
+	state := tcpAuthState{encMode: c.EncryptMode}
+	if state.encMode == "" {
+		state.encMode = "age"
+	}
 	requestPub := strings.TrimSpace(c.ClientAgePublicKey)
 	requestIdentity := strings.TrimSpace(c.ClientAgeIdentity)
 	serverPub := strings.TrimSpace(c.ServerAgePublicKey)
@@ -255,7 +260,13 @@ func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload strin
 	if err != nil {
 		return err
 	}
-	ew, err := age.Encrypt(conn, recipient)
+	var ew io.WriteCloser
+	switch state.encMode {
+	case "aes":
+		ew, err = intencoding.AESGCMEncrypt(conn, recipient, 0)
+	default:
+		ew, err = age.Encrypt(conn, recipient)
+	}
 	if err != nil {
 		return err
 	}
@@ -273,11 +284,20 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 	if identity == nil {
 		return nil, errors.New("missing age identity for encrypted response")
 	}
-	decReader, err := age.Decrypt(conn, identity)
-	if err != nil {
-		return nil, err
+	switch state.encMode {
+	case "aes":
+		decReader, err := intencoding.AESGCMDecrypt(conn, identity, 0)
+		if err != nil {
+			return nil, fmt.Errorf("decryption failed: ensure client and server use the same --encrypt mode (age or aes): %w", err)
+		}
+		return decReader, nil
+	default:
+		decReader, err := age.Decrypt(conn, identity)
+		if err != nil {
+			return nil, err
+		}
+		return decReader, nil
 	}
-	return decReader, nil
 }
 
 func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
@@ -693,7 +713,13 @@ func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, pro
 	if err != nil {
 		return err
 	}
-	ew, err := age.Encrypt(conn, recipient)
+	var ew io.WriteCloser
+	switch state.encMode {
+	case "aes":
+		ew, err = intencoding.AESGCMEncrypt(conn, recipient, 0)
+	default:
+		ew, err = age.Encrypt(conn, recipient)
+	}
 	if err != nil {
 		return err
 	}

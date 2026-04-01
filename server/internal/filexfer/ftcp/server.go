@@ -12,6 +12,7 @@ import (
 
 	"filippo.io/age"
 	"github.com/jolynch/pinch/internal/filexfer"
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/jolynch/pinch/internal/filexfer/limit"
 )
 
@@ -31,6 +32,7 @@ type ServerOptions struct {
 	ProgressInterval       time.Duration // tick interval for progress writes (default 1s)
 	DisableZeroCopy        bool          // force buffered send path even when zero-copy is available
 	TargetIODepth          int           // target IO depth per CPU advertised in PROBE (default 8)
+	EncryptMode            string        // "age" (default) or "aes" — selects post-AUTH stream cipher
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -105,6 +107,7 @@ type connSession struct {
 	syncTimeout            time.Duration
 	disableZeroCopy        bool
 	targetIODepth          int
+	encryptMode            string
 	respOut                io.Writer
 	closeResp              func() error
 	wroteBytes             bool
@@ -123,6 +126,7 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated 
 		syncTimeout:            opts.SyncTimeout,
 		disableZeroCopy:        opts.DisableZeroCopy,
 		targetIODepth:          opts.TargetIODepth,
+		encryptMode:            opts.EncryptMode,
 		respOut:                conn,
 		closeResp:              func() error { return nil },
 		onTransferCreated:      onTransferCreated,
@@ -161,22 +165,41 @@ func (s *connSession) run() error {
 			return authErr
 		}
 		if authRes.recipient != nil {
-			encOut, encErr := age.Encrypt(s.conn, authRes.recipient)
-			if encErr != nil {
-				return encErr
+			switch s.encryptMode {
+			case "aes":
+				encOut, encErr := encoding.AESGCMEncrypt(s.conn, authRes.recipient, 0)
+				if encErr != nil {
+					return encErr
+				}
+				s.respOut = encOut
+				s.closeResp = encOut.Close
+			default:
+				encOut, encErr := age.Encrypt(s.conn, authRes.recipient)
+				if encErr != nil {
+					return encErr
+				}
+				s.respOut = encOut
+				s.closeResp = encOut.Close
 			}
-			s.respOut = encOut
-			s.closeResp = encOut.Close
 		}
 		if authRes.encryptedRequests {
 			if s.serverID == nil {
 				return protocolErr{code: "NOT_AUTHORIZED", message: "server auth key unavailable"}
 			}
-			decIn, decErr := age.Decrypt(br, s.serverID)
-			if decErr != nil {
-				return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed"}
+			switch s.encryptMode {
+			case "aes":
+				decIn, decErr := encoding.AESGCMDecrypt(br, s.serverID, 0)
+				if decErr != nil {
+					return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed: ensure client and server use the same --encrypt mode (age or aes)"}
+				}
+				cmdReader = bufio.NewReader(decIn)
+			default:
+				decIn, decErr := age.Decrypt(br, s.serverID)
+				if decErr != nil {
+					return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed"}
+				}
+				cmdReader = bufio.NewReader(decIn)
 			}
-			cmdReader = bufio.NewReader(decIn)
 		}
 
 		cmdPayload, cmdErr := readCommandLine(cmdReader, maxCommandLineBytes)
