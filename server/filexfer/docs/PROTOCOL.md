@@ -52,28 +52,34 @@ For this line protocol, token bytes cannot span command newlines.
 
 ### Request
 
-- `AUTH`
-- `AUTH <blob>`
+Three forms:
 
-`<blob>` can be quoted or length-prefixed.
+- `AUTH key` — key exchange: server returns its age public key.
+- `AUTH age <blob>` — age encryption: blob is the client's age public key encrypted with age to the server's public key.
+- `AUTH aes <blob>` — AES-GCM encryption: blob is the client's age public key encrypted with AES-GCM to the server's public key.
 
-### Behavior
+`<blob>` is length-prefixed (`<len>:<bytes>`).
 
-When `-fs-require-auth=true`:
+### Key Exchange Flow
 
-- blob must decode to age ciphertext decryptable by server identity.
-- decrypted plaintext must be client age recipient string.
-- if valid:
-  - subsequent response bytes are age-encrypted to client recipient.
-  - subsequent command line must be age-encrypted to server identity.
-- if invalid: `ERR NOT_AUTHORIZED authorization failed`.
+1. Client sends `AUTH key\r\n`.
+2. Server responds `OK <server-age-public-key>\r\n` and closes the connection.
+3. Client opens a new connection and sends `AUTH age <blob>\r\n` or `AUTH aes <blob>\r\n`.
 
-When `-fs-require-auth=false`:
+### Encrypted Connection Flow
 
-- empty `AUTH` is accepted (no encryption).
-- non-empty blob must be a plaintext age recipient string.
-- server encrypts responses to that recipient.
-- command line remains plaintext.
+After `AUTH age <blob>` or `AUTH aes <blob>`:
+
+- Server decrypts blob using its identity to recover the client's age public key.
+- If valid:
+  - subsequent response bytes are encrypted to the client's public key using the selected cipher (age or AES-GCM).
+  - subsequent command bytes from the client must be encrypted to the server's public key using the same cipher.
+- If invalid: `ERR NOT_AUTHORIZED authorization failed`.
+
+### Unencrypted Connection Flow
+
+When no encryption is desired, the client omits AUTH entirely and sends the
+command directly.
 
 ## TXFER
 

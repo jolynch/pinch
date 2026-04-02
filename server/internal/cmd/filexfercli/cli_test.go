@@ -3,6 +3,7 @@ package filexfercli
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -39,10 +40,10 @@ func (s *ftcpTestServer) Close() {
 }
 
 func newFTCPTestServer(t *testing.T, handler func(intftcp.Request, io.Writer) error) *ftcpTestServer {
-	return newFTCPTestServerWithEncryptMode(t, "", handler)
+	return newFTCPTestServerWithIdentity(t, nil, handler)
 }
 
-func newFTCPTestServerWithEncryptMode(t *testing.T, encryptMode string, handler func(intftcp.Request, io.Writer) error) *ftcpTestServer {
+func newFTCPTestServerWithIdentity(t *testing.T, serverID *age.X25519Identity, handler func(intftcp.Request, io.Writer) error) *ftcpTestServer {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -61,14 +62,14 @@ func newFTCPTestServerWithEncryptMode(t *testing.T, encryptMode string, handler 
 			go func(c net.Conn) {
 				defer s.wg.Done()
 				defer c.Close()
-				serveFTCPConn(c, encryptMode, handler)
+				serveFTCPConn(c, serverID, handler)
 			}(conn)
 		}
 	}()
 	return s
 }
 
-func serveFTCPConn(conn net.Conn, encryptMode string, handler func(intftcp.Request, io.Writer) error) {
+func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(intftcp.Request, io.Writer) error) {
 	br := bufio.NewReader(conn)
 	firstLine, err := readFTCPLine(br)
 	if err != nil {
@@ -84,26 +85,90 @@ func serveFTCPConn(conn net.Conn, encryptMode string, handler func(intftcp.Reque
 	closeOut := func() error { return nil }
 	cmdReq := req
 	if req.Verb == intftcp.VerbAUTH {
-		if len(req.Params) > 0 {
-			blob := strings.TrimSpace(req.Params[0]["blob"])
-			if blob != "" {
-				if recipient, parseErr := age.ParseX25519Recipient(blob); parseErr == nil {
-					var ew io.WriteCloser
-					var encErr error
-					switch encryptMode {
-					case "aes":
-						ew, encErr = encoding.AESGCMEncrypt(conn, recipient, 0)
-					default:
-						ew, encErr = age.Encrypt(conn, recipient)
-					}
-					if encErr != nil {
-						return
-					}
-					out = ew
-					closeOut = ew.Close
-				}
-			}
+		if len(req.Params) == 0 {
+			_, _ = io.WriteString(conn, "ERR BAD_AUTH missing protocol\r\n")
+			return
 		}
+		protocol := req.Params[0]["protocol"]
+
+		if protocol == "key" {
+			// Key exchange: return server public key and close.
+			if serverID == nil {
+				_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED no server identity\r\n")
+				return
+			}
+			_, _ = io.WriteString(conn, "OK "+serverID.Recipient().String()+"\r\n")
+			return
+		}
+
+		// age or aes: decode and decrypt the blob to get the client's public key.
+		blobRaw := req.Params[0]["blob"]
+		if blobRaw == "" || serverID == nil {
+			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+			return
+		}
+		blobBytes, b64Err := base64.StdEncoding.DecodeString(strings.TrimSpace(blobRaw))
+		if b64Err != nil {
+			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED bad base64\r\n")
+			return
+		}
+		var plain []byte
+		switch protocol {
+		case "aes":
+			dec, decErr := encoding.AESGCMDecrypt(bytes.NewReader(blobBytes), serverID)
+			if decErr != nil {
+				_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+				return
+			}
+			plain, err = io.ReadAll(dec)
+		default:
+			dec, decErr := age.Decrypt(bytes.NewReader(blobBytes), serverID)
+			if decErr != nil {
+				_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+				return
+			}
+			plain, err = io.ReadAll(dec)
+		}
+		if err != nil {
+			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+			return
+		}
+		recipient, parseErr := age.ParseX25519Recipient(strings.TrimSpace(string(plain)))
+		if parseErr != nil {
+			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+			return
+		}
+
+		// Encrypt responses to client.
+		var ew io.WriteCloser
+		var encErr error
+		switch protocol {
+		case "aes":
+			ew, encErr = encoding.AESGCMEncrypt(conn, recipient, 0)
+		default:
+			ew, encErr = age.Encrypt(conn, recipient)
+		}
+		if encErr != nil {
+			return
+		}
+		out = ew
+		closeOut = ew.Close
+
+		// Decrypt the command from client.
+		var cmdReader io.Reader
+		switch protocol {
+		case "aes":
+			cmdReader, err = encoding.AESGCMDecrypt(br, serverID)
+		default:
+			cmdReader, err = age.Decrypt(br, serverID)
+		}
+		if err != nil {
+			_, _ = io.WriteString(out, "ERR NOT_AUTHORIZED request decryption failed\r\n")
+			_ = closeOut()
+			return
+		}
+		br = bufio.NewReader(cmdReader)
+
 		cmdLine, cmdErr := readFTCPLine(br)
 		if cmdErr != nil {
 			_, _ = io.WriteString(out, "ERR BAD_REQUEST missing command\r\n")
@@ -437,7 +502,11 @@ func TestRunCLITransferWithEncryptAge(t *testing.T) {
 		"",
 	}, "\n")
 
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+	serverID, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate server identity: %v", err)
+	}
+	srv := newFTCPTestServerWithIdentity(t, serverID, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbPROBE:
 			cts0 := req.Params[0]["cts0"]
@@ -492,7 +561,11 @@ func TestRunCLITransferWithEncryptAES(t *testing.T) {
 		"",
 	}, "\n")
 
-	srv := newFTCPTestServerWithEncryptMode(t, "aes", func(req intftcp.Request, out io.Writer) error {
+	serverID, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate server identity: %v", err)
+	}
+	srv := newFTCPTestServerWithIdentity(t, serverID, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbPROBE:
 			cts0 := req.Params[0]["cts0"]

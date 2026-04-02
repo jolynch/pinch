@@ -148,12 +148,10 @@ func readCompatLine(br *bufio.Reader) (string, error) {
 }
 
 func TestNewClientOptions(t *testing.T) {
-	t.Setenv("PINCH_FILE_SERVER_AGE_PUBLIC_KEY", "age1envvalue")
 	dialer := func(context.Context, string) (net.Conn, error) { return nil, errors.New("unused") }
 
 	client := NewClient(
 		" 127.0.0.1:3453 ",
-		WithServerAgePublicKey(""),
 		WithFileRequestWindowBytes(123),
 		WithFrameBufferBytes(456),
 		WithMaxFrameReadBufferBytes(789),
@@ -164,9 +162,6 @@ func TestNewClientOptions(t *testing.T) {
 
 	if client.FileAddr != "127.0.0.1:3453" {
 		t.Fatalf("unexpected file addr: %q", client.FileAddr)
-	}
-	if client.ServerAgePublicKey != "" {
-		t.Fatalf("expected option to override env, got %q", client.ServerAgePublicKey)
 	}
 	if client.FileRequestWindowBytes != 123 {
 		t.Fatalf("unexpected file request window bytes: %d", client.FileRequestWindowBytes)
@@ -1723,7 +1718,7 @@ func TestClientUsesInjectedDialContext(t *testing.T) {
 		}()
 		return clientConn, nil
 	}
-	client := NewClient("ignored:0", WithContextDialer(dialContext), WithServerAgePublicKey(""))
+	client := NewClient("ignored:0", WithContextDialer(dialContext))
 
 	resp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
 	if err != nil {

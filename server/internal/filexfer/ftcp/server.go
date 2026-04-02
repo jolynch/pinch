@@ -32,7 +32,6 @@ type ServerOptions struct {
 	ProgressInterval       time.Duration // tick interval for progress writes (default 1s)
 	DisableZeroCopy        bool          // force buffered send path even when zero-copy is available
 	TargetIODepth          int           // target IO depth per CPU advertised in PROBE (default 8)
-	EncryptMode            string        // "age" (default) or "aes" — selects post-AUTH stream cipher
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -107,7 +106,6 @@ type connSession struct {
 	syncTimeout            time.Duration
 	disableZeroCopy        bool
 	targetIODepth          int
-	encryptMode            string
 	respOut                io.Writer
 	closeResp              func() error
 	wroteBytes             bool
@@ -126,7 +124,6 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated 
 		syncTimeout:            opts.SyncTimeout,
 		disableZeroCopy:        opts.DisableZeroCopy,
 		targetIODepth:          opts.TargetIODepth,
-		encryptMode:            opts.EncryptMode,
 		respOut:                conn,
 		closeResp:              func() error { return nil },
 		onTransferCreated:      onTransferCreated,
@@ -157,15 +154,19 @@ func (s *connSession) run() error {
 	cmdReq := firstReq
 	cmdReader := br
 	if firstReq.Verb == VerbAUTH {
-		authRes, authErr := processAUTHRequest(firstReq, s.requireAuth, s.serverID)
+		authRes, authErr := processAUTHRequest(firstReq, s.serverID)
 		if authErr != nil {
 			if errors.Is(authErr, errNotAuthorized) {
 				return protocolErr{code: "NOT_AUTHORIZED", message: "authorization failed"}
 			}
 			return authErr
 		}
+		if authRes.keyExchange {
+			// AUTH key — return the server's public key and close.
+			return writeOKLine(s.respOut, s.serverID.Recipient().String())
+		}
 		if authRes.recipient != nil {
-			switch s.encryptMode {
+			switch authRes.encryptMode {
 			case "aes":
 				encOut, encErr := encoding.AESGCMEncrypt(s.conn, authRes.recipient, 0)
 				if encErr != nil {
@@ -186,11 +187,11 @@ func (s *connSession) run() error {
 			if s.serverID == nil {
 				return protocolErr{code: "NOT_AUTHORIZED", message: "server auth key unavailable"}
 			}
-			switch s.encryptMode {
+			switch authRes.encryptMode {
 			case "aes":
-				decIn, decErr := encoding.AESGCMDecrypt(br, s.serverID, 0)
+				decIn, decErr := encoding.AESGCMDecrypt(br, s.serverID)
 				if decErr != nil {
-					return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed: ensure client and server use the same --encrypt mode (age or aes)"}
+					return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed"}
 				}
 				cmdReader = bufio.NewReader(decIn)
 			default:
