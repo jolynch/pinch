@@ -26,9 +26,11 @@ const (
 	aeadVersion      = 0x01
 )
 
+const aeadMaxAADChunkCount = ^uint64(0) >> 1
+
 var aeadBufferPools sync.Map // map[int]*sync.Pool
 
-// AESGCMEncrypt creates a streaming AES-256-GCM encrypted writer. It performs
+// AESGCMEncrypt creates a streaming AES-GCM encrypted writer. It performs
 // X25519 key exchange via the recipient's Wrap method (compatible with
 // age.X25519Recipient), writes a binary key-exchange header to dst, then
 // returns a WriteCloser that encrypts data in fixed-size chunks.
@@ -58,7 +60,9 @@ func AESGCMEncrypt(dst io.Writer, recipient age.Recipient, chunkSize int) (io.Wr
 		return nil, fmt.Errorf("expected 1 stanza from Wrap, got %d", len(stanzas))
 	}
 
-	if err := writeStanzaHeader(dst, stanzas[0]); err != nil {
+	chunkSize = normalizeAEADChunkSize(chunkSize)
+
+	if err := writeStanzaHeader(dst, stanzas[0], chunkSize); err != nil {
 		return nil, fmt.Errorf("write stanza header: %w", err)
 	}
 
@@ -81,15 +85,13 @@ func AESGCMEncrypt(dst io.Writer, recipient age.Recipient, chunkSize int) (io.Wr
 	}, nil
 }
 
-// AESGCMDecrypt creates a streaming AES-256-GCM decrypting reader. It reads
+// AESGCMDecrypt creates a streaming AES-GCM decrypting reader. It reads
 // the key-exchange header from src, recovers the file key via the identity's
 // Unwrap method (compatible with age.X25519Identity), then returns a Reader
 // that decrypts chunks on the fly.
 //
-// chunkSize is the plaintext chunk size in bytes. A non-positive value uses the
-// default size. Values smaller than 1 KiB are clamped upward.
 // Not goroutine-safe.
-func AESGCMDecrypt(src io.Reader, identity age.Identity, chunkSize int) (io.Reader, error) {
+func AESGCMDecrypt(src io.Reader, identity age.Identity) (io.Reader, error) {
 	if src == nil {
 		return nil, errors.New("nil source reader")
 	}
@@ -97,7 +99,7 @@ func AESGCMDecrypt(src io.Reader, identity age.Identity, chunkSize int) (io.Read
 		return nil, errors.New("nil identity")
 	}
 
-	stanza, err := readStanzaHeader(src)
+	stanza, chunkSize, err := readStanzaHeader(src)
 	if err != nil {
 		return nil, fmt.Errorf("read stanza header: %w", err)
 	}
@@ -126,7 +128,7 @@ func AESGCMDecrypt(src io.Reader, identity age.Identity, chunkSize int) (io.Read
 	}, nil
 }
 
-// newGCM derives an AES-256 key from the file key via HKDF-SHA256 and
+// newGCM derives an AES-256 key from the age file key via HKDF-SHA256 and
 // returns a GCM cipher instance.
 func newGCM(fileKey []byte) (cipher.AEAD, error) {
 	hk := hkdf.New(sha256.New, fileKey, nil, []byte(aeadHKDFInfo))
@@ -155,6 +157,20 @@ func acquireAEADBuffer(chunkSize int) ([]byte, int, func()) {
 		clear(buf)
 		pool.Put(buf[:bufSize])
 	}
+}
+
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		p = p[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func normalizeAEADChunkSize(chunkSize int) int {
@@ -189,9 +205,10 @@ func aeadBufferPool(size int) *sync.Pool {
 //   [2 bytes BE: num_args]
 //     per arg: [2 bytes BE: arg_len][arg_len bytes: arg]
 //   [2 bytes BE: body_len][body_len bytes: Stanza.Body]
+//   [4 bytes BE: chunk_size]
 
-func writeStanzaHeader(w io.Writer, s *age.Stanza) error {
-	if _, err := w.Write([]byte{aeadVersion}); err != nil {
+func writeStanzaHeader(w io.Writer, s *age.Stanza, chunkSize int) error {
+	if err := writeFull(w, []byte{aeadVersion}); err != nil {
 		return err
 	}
 	if err := writeU16Prefixed(w, []byte(s.Type)); err != nil {
@@ -199,7 +216,7 @@ func writeStanzaHeader(w io.Writer, s *age.Stanza) error {
 	}
 	var numArgs [2]byte
 	binary.BigEndian.PutUint16(numArgs[:], uint16(len(s.Args)))
-	if _, err := w.Write(numArgs[:]); err != nil {
+	if err := writeFull(w, numArgs[:]); err != nil {
 		return err
 	}
 	for _, arg := range s.Args {
@@ -207,46 +224,60 @@ func writeStanzaHeader(w io.Writer, s *age.Stanza) error {
 			return err
 		}
 	}
-	return writeU16Prefixed(w, s.Body)
+	if err := writeU16Prefixed(w, s.Body); err != nil {
+		return err
+	}
+	var chunkSizeBuf [4]byte
+	binary.BigEndian.PutUint32(chunkSizeBuf[:], uint32(chunkSize))
+	return writeFull(w, chunkSizeBuf[:])
 }
 
-func readStanzaHeader(r io.Reader) (*age.Stanza, error) {
+func readStanzaHeader(r io.Reader) (*age.Stanza, int, error) {
 	var ver [1]byte
 	if _, err := io.ReadFull(r, ver[:]); err != nil {
-		return nil, fmt.Errorf("read version: %w", err)
+		return nil, 0, fmt.Errorf("read version: %w", err)
 	}
 	if ver[0] != aeadVersion {
-		return nil, fmt.Errorf("unsupported AEAD version: %d", ver[0])
+		return nil, 0, fmt.Errorf("unsupported AEAD version: %d", ver[0])
 	}
 
 	typ, err := readU16Prefixed(r)
 	if err != nil {
-		return nil, fmt.Errorf("read stanza type: %w", err)
+		return nil, 0, fmt.Errorf("read stanza type: %w", err)
 	}
 	if string(typ) != "X25519" {
-		return nil, fmt.Errorf("unsupported stanza type: %q", string(typ))
+		return nil, 0, fmt.Errorf("unsupported stanza type: %q", string(typ))
 	}
 
 	var numArgsBuf [2]byte
 	if _, err := io.ReadFull(r, numArgsBuf[:]); err != nil {
-		return nil, fmt.Errorf("read num_args: %w", err)
+		return nil, 0, fmt.Errorf("read num_args: %w", err)
 	}
 	numArgs := int(binary.BigEndian.Uint16(numArgsBuf[:]))
 	args := make([]string, numArgs)
 	for i := range args {
 		a, err := readU16Prefixed(r)
 		if err != nil {
-			return nil, fmt.Errorf("read arg %d: %w", i, err)
+			return nil, 0, fmt.Errorf("read arg %d: %w", i, err)
 		}
 		args[i] = string(a)
 	}
 
 	body, err := readU16Prefixed(r)
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, 0, fmt.Errorf("read body: %w", err)
 	}
 
-	return &age.Stanza{Type: string(typ), Args: args, Body: body}, nil
+	var chunkSizeBuf [4]byte
+	if _, err := io.ReadFull(r, chunkSizeBuf[:]); err != nil {
+		return nil, 0, fmt.Errorf("read chunk size: %w", err)
+	}
+	chunkSize := int(binary.BigEndian.Uint32(chunkSizeBuf[:]))
+	if chunkSize < aeadMinChunkSize {
+		return nil, 0, fmt.Errorf("invalid AEAD chunk size: %d", chunkSize)
+	}
+
+	return &age.Stanza{Type: string(typ), Args: args, Body: body}, chunkSize, nil
 }
 
 func writeU16Prefixed(w io.Writer, data []byte) error {
@@ -255,12 +286,11 @@ func writeU16Prefixed(w io.Writer, data []byte) error {
 	}
 	var buf [2]byte
 	binary.BigEndian.PutUint16(buf[:], uint16(len(data)))
-	if _, err := w.Write(buf[:]); err != nil {
+	if err := writeFull(w, buf[:]); err != nil {
 		return err
 	}
 	if len(data) > 0 {
-		_, err := w.Write(data)
-		return err
+		return writeFull(w, data)
 	}
 	return nil
 }
@@ -284,8 +314,8 @@ func readU16Prefixed(r io.Reader) ([]byte, error) {
 // ---------------------------------------------------------------------------
 //
 // Nonce layout (12 bytes):
-//   bytes 0–2:  zero (high bits of counter, never reached in practice)
-//   bytes 3–10: big-endian uint64 counter
+//   bytes 0–2:  zero (high bits of chunk count, never reached in practice)
+//   bytes 3–10: big-endian uint64 chunk count
 //   byte 11:    0x00 = non-final chunk, 0x01 = final chunk
 
 type aesgcmWriter struct {
@@ -298,7 +328,7 @@ type aesgcmWriter struct {
 	plainN     int // bytes currently in plainBuf
 	chunkSize  int
 	nonce      [aeadNonceSize]byte
-	counter    uint64
+	chunkCount uint64
 	err        error
 	closed     bool
 }
@@ -343,17 +373,21 @@ func (w *aesgcmWriter) Close() error {
 
 func (w *aesgcmWriter) flushChunk(last bool) error {
 	w.buildNonce(last)
-	sealed := w.gcm.Seal(w.sealBuf[:0], w.nonce[:], w.plainBuf[:w.plainN], nil)
-	if _, err := w.dst.Write(sealed); err != nil {
+	aad, err := buildChunkAAD(w.chunkSize, w.chunkCount, last)
+	if err != nil {
+		return err
+	}
+	sealed := w.gcm.Seal(w.sealBuf[:0], w.nonce[:], w.plainBuf[:w.plainN], aad[:])
+	if err := writeFull(w.dst, sealed); err != nil {
 		return err
 	}
 	w.plainN = 0
-	w.counter++
+	w.chunkCount++
 	return nil
 }
 
 func (w *aesgcmWriter) buildNonce(last bool) {
-	binary.BigEndian.PutUint64(w.nonce[3:11], w.counter)
+	binary.BigEndian.PutUint64(w.nonce[3:11], w.chunkCount)
 	if last {
 		w.nonce[11] = 0x01
 	} else {
@@ -386,7 +420,7 @@ type aesgcmReader struct {
 	unread     []byte // unconsumed plaintext, subslice of plainBuf
 	chunkSize  int
 	nonce      [aeadNonceSize]byte
-	counter    uint64
+	chunkCount uint64
 	err        error
 	done       bool
 }
@@ -430,34 +464,46 @@ func (r *aesgcmReader) readChunk() error {
 	case err == nil:
 		// Full-size read. Try non-final nonce first.
 		r.buildNonce(false)
-		plaintext, openErr := r.gcm.Open(r.plainBuf[:0], r.nonce[:], r.cipherBuf[:n], nil)
+		aad, aadErr := buildChunkAAD(r.chunkSize, r.chunkCount, false)
+		if aadErr != nil {
+			return aadErr
+		}
+		plaintext, openErr := r.gcm.Open(r.plainBuf[:0], r.nonce[:], r.cipherBuf[:n], aad[:])
 		if openErr == nil {
 			r.unread = plaintext
-			r.counter++
+			r.chunkCount++
 			return nil
 		}
 		// Non-final failed — this may be a final chunk that happens to be
 		// exactly chunkSize bytes of plaintext.
 		r.buildNonce(true)
-		plaintext, openErr = r.gcm.Open(r.plainBuf[:0], r.nonce[:], r.cipherBuf[:n], nil)
+		aad, aadErr = buildChunkAAD(r.chunkSize, r.chunkCount, true)
+		if aadErr != nil {
+			return aadErr
+		}
+		plaintext, openErr = r.gcm.Open(r.plainBuf[:0], r.nonce[:], r.cipherBuf[:n], aad[:])
 		if openErr != nil {
 			return fmt.Errorf("AEAD authentication failed: %w", openErr)
 		}
 		r.unread = plaintext
 		r.done = true
-		r.counter++
+		r.chunkCount++
 		return nil
 
 	case errors.Is(err, io.ErrUnexpectedEOF) && n > 0:
 		// Short read — must be the final (possibly short) chunk.
 		r.buildNonce(true)
-		plaintext, openErr := r.gcm.Open(r.plainBuf[:0], r.nonce[:], r.cipherBuf[:n], nil)
+		aad, aadErr := buildChunkAAD(r.chunkSize, r.chunkCount, true)
+		if aadErr != nil {
+			return aadErr
+		}
+		plaintext, openErr := r.gcm.Open(r.plainBuf[:0], r.nonce[:], r.cipherBuf[:n], aad[:])
 		if openErr != nil {
 			return fmt.Errorf("AEAD authentication failed on final chunk: %w", openErr)
 		}
 		r.unread = plaintext
 		r.done = true
-		r.counter++
+		r.chunkCount++
 		return nil
 
 	case errors.Is(err, io.EOF) && n == 0:
@@ -470,7 +516,7 @@ func (r *aesgcmReader) readChunk() error {
 }
 
 func (r *aesgcmReader) buildNonce(last bool) {
-	binary.BigEndian.PutUint64(r.nonce[3:11], r.counter)
+	binary.BigEndian.PutUint64(r.nonce[3:11], r.chunkCount)
 	if last {
 		r.nonce[11] = 0x01
 	} else {
@@ -488,4 +534,19 @@ func (r *aesgcmReader) release() {
 	r.backingBuf = nil
 	r.cipherBuf = nil
 	r.plainBuf = nil
+}
+
+func buildChunkAAD(chunkSize int, chunkCount uint64, last bool) ([13]byte, error) {
+	var aad [13]byte
+	if chunkCount > aeadMaxAADChunkCount {
+		return aad, errors.New("AEAD chunk count exceeded int64 AAD range")
+	}
+	binary.BigEndian.PutUint32(aad[1:5], uint32(chunkSize))
+	signedChunkCount := int64(chunkCount)
+	if last {
+		signedChunkCount = ^signedChunkCount
+	}
+	aad[0] = aeadVersion
+	binary.BigEndian.PutUint64(aad[5:13], uint64(signedChunkCount))
+	return aad, nil
 }

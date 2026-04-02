@@ -23,12 +23,12 @@ import (
 const maxTCPLineBytes = 4 * 1024 * 1024
 
 type tcpAuthState struct {
-	publicKey       string
-	identity        string
-	parsedIdentity  age.Identity
-	hasAuth         bool
-	encryptCommands bool
-	encMode         string // "age" (default) or "aes"
+	publicKey      string // client's age public key
+	identity       string // client's age identity (private key)
+	parsedIdentity age.Identity
+	serverKey      string // server's age public key (discovered via AUTH key)
+	hasAuth        bool
+	encMode        string // "age" or "aes"
 }
 
 type probeResponse struct {
@@ -158,105 +158,139 @@ func writeTCPLine(w io.Writer, line string) error {
 	return err
 }
 
-func escapeQuoted(raw string) string {
-	raw = strings.ReplaceAll(raw, "\\", "\\\\")
-	raw = strings.ReplaceAll(raw, "\"", "\\\"")
-	return raw
-}
-
-func quoteToken(raw string) string {
-	return "\"" + escapeQuoted(raw) + "\""
-}
-
-func encodeAUTHBlobToken(blob []byte, encrypted bool) string {
-	if encrypted {
-		encoded := base64.StdEncoding.EncodeToString(blob)
-		return quoteToken("b64:" + encoded)
+func (c *Client) resolveTCPAuthState(ctx context.Context) (tcpAuthState, error) {
+	encMode := strings.ToLower(strings.TrimSpace(c.EncryptMode))
+	if encMode == "" || encMode == "none" {
+		return tcpAuthState{}, nil
 	}
-	return quoteToken(string(blob))
-}
-
-func (c *Client) resolveTCPAuthState() (tcpAuthState, error) {
-	state := tcpAuthState{encMode: c.EncryptMode}
-	if state.encMode == "" {
-		state.encMode = "age"
+	if encMode != "age" && encMode != "aes" {
+		return tcpAuthState{}, fmt.Errorf("unsupported encrypt mode: %s", encMode)
 	}
+
+	// Generate ephemeral client identity if not provided.
 	requestPub := strings.TrimSpace(c.ClientAgePublicKey)
 	requestIdentity := strings.TrimSpace(c.ClientAgeIdentity)
-	serverPub := strings.TrimSpace(c.ServerAgePublicKey)
-
-	if serverPub != "" {
-		state.hasAuth = true
-		state.encryptCommands = true
-		if requestPub == "" || requestIdentity == "" {
-			identity, err := age.GenerateX25519Identity()
-			if err != nil {
-				return tcpAuthState{}, fmt.Errorf("generate age identity: %w", err)
-			}
-			requestPub = identity.Recipient().String()
-			requestIdentity = identity.String()
-		}
-	}
-	if requestPub != "" {
-		state.hasAuth = true
-		state.publicKey = requestPub
-	}
-	if requestIdentity != "" {
-		state.identity = requestIdentity
-	}
-	if state.hasAuth && state.publicKey == "" {
-		state.publicKey = requestPub
-	}
-	if state.hasAuth && state.identity == "" {
-		return tcpAuthState{}, errors.New("missing age identity for authenticated response")
-	}
-	if state.hasAuth {
-		parsed, err := parseAgeIdentity(state.identity)
+	if requestPub == "" || requestIdentity == "" {
+		identity, err := age.GenerateX25519Identity()
 		if err != nil {
-			return tcpAuthState{}, err
+			return tcpAuthState{}, fmt.Errorf("generate age identity: %w", err)
 		}
-		state.parsedIdentity = parsed
+		requestPub = identity.Recipient().String()
+		requestIdentity = identity.String()
 	}
-	if state.encryptCommands {
-		if _, err := age.ParseX25519Recipient(serverPub); err != nil {
-			return tcpAuthState{}, fmt.Errorf("invalid PINCH_FILE_SERVER_AGE_PUBLIC_KEY: %w", err)
+
+	parsed, err := parseAgeIdentity(requestIdentity)
+	if err != nil {
+		return tcpAuthState{}, err
+	}
+
+	// Discover the server's public key via AUTH key.
+	serverKey, err := c.discoverServerKey(ctx)
+	if err != nil {
+		return tcpAuthState{}, fmt.Errorf("discover server key: %w", err)
+	}
+
+	return tcpAuthState{
+		publicKey:      requestPub,
+		identity:       requestIdentity,
+		parsedIdentity: parsed,
+		serverKey:      serverKey,
+		hasAuth:        true,
+		encMode:        encMode,
+	}, nil
+}
+
+// discoverServerKey sends AUTH key on a fresh connection and reads back the
+// server's age public key from the OK response.
+func (c *Client) discoverServerKey(ctx context.Context) (string, error) {
+	conn, err := c.dialTCP(ctx)
+	if err != nil {
+		return "", fmt.Errorf("dial for key exchange: %w", err)
+	}
+	defer conn.Close()
+	if err := writeTCPLine(conn, "AUTH key"); err != nil {
+		return "", err
+	}
+	br := bufio.NewReader(conn)
+	line, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return "", fmt.Errorf("read key exchange response: %w", err)
+	}
+	msg, ok := parseOKStatusLine(line)
+	if !ok {
+		if lineErr := parseErrControlFrame(line); lineErr != nil {
+			return "", lineErr
 		}
+		return "", fmt.Errorf("unexpected key exchange response: %s", line)
 	}
-	return state, nil
+	key := strings.TrimSpace(msg)
+	if key == "" {
+		return "", errors.New("server returned empty public key")
+	}
+	if _, err := age.ParseX25519Recipient(key); err != nil {
+		return "", fmt.Errorf("invalid server public key: %w", err)
+	}
+	return key, nil
 }
 
 func (c *Client) sendTCPAuth(conn net.Conn, state tcpAuthState) error {
 	if !state.hasAuth {
 		return nil
 	}
-	blob := []byte(state.publicKey)
-	if state.encryptCommands {
-		recipient, err := age.ParseX25519Recipient(strings.TrimSpace(c.ServerAgePublicKey))
-		if err != nil {
-			return err
+	recipient, err := age.ParseX25519Recipient(state.serverKey)
+	if err != nil {
+		return fmt.Errorf("parse server key: %w", err)
+	}
+	// Encrypt the client's public key to the server.
+	encrypted := c.acquireScratchBuffer(0)
+	defer c.releaseScratchBuffer(encrypted)
+	switch state.encMode {
+	case "aes":
+		ew, encErr := intencoding.AESGCMEncrypt(encrypted, recipient, 0)
+		if encErr != nil {
+			return encErr
 		}
-		encrypted := c.acquireScratchBuffer(0)
-		defer c.releaseScratchBuffer(encrypted)
-		ew, err := age.Encrypt(encrypted, recipient)
-		if err != nil {
-			return err
-		}
-		if _, err := ew.Write(blob); err != nil {
+		if _, err := ew.Write([]byte(state.publicKey)); err != nil {
 			return err
 		}
 		if err := ew.Close(); err != nil {
 			return err
 		}
-		blob = encrypted.Bytes()
+	default:
+		ew, encErr := age.Encrypt(encrypted, recipient)
+		if encErr != nil {
+			return encErr
+		}
+		if _, err := ew.Write([]byte(state.publicKey)); err != nil {
+			return err
+		}
+		if err := ew.Close(); err != nil {
+			return err
+		}
 	}
-	return writeTCPLine(conn, "AUTH "+encodeAUTHBlobToken(blob, state.encryptCommands))
+	encoded := base64.StdEncoding.EncodeToString(encrypted.Bytes())
+	return writeTCPLine(conn, "AUTH "+state.encMode+" "+encoded)
+}
+
+// halfCloseWrite sends TCP FIN for the write direction only, signaling EOF to
+// the remote reader while keeping the connection open for reading responses.
+// This is required for age-encrypted requests: age's DecryptReader performs an
+// extra Read after the final chunk to confirm EOF, which would deadlock on a
+// duplex connection that stays open.
+func halfCloseWrite(conn net.Conn) {
+	type writeHalfCloser interface {
+		CloseWrite() error
+	}
+	if wc, ok := conn.(writeHalfCloser); ok {
+		_ = wc.CloseWrite()
+	}
 }
 
 func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload string) error {
-	if !state.encryptCommands {
+	if !state.hasAuth {
 		return writeTCPLine(conn, payload)
 	}
-	recipient, err := age.ParseX25519Recipient(strings.TrimSpace(c.ServerAgePublicKey))
+	recipient, err := age.ParseX25519Recipient(state.serverKey)
 	if err != nil {
 		return err
 	}
@@ -271,9 +305,14 @@ func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload strin
 		return err
 	}
 	if err := writeTCPLine(ew, payload); err != nil {
+		_ = ew.Close()
 		return err
 	}
-	return ew.Close()
+	if err := ew.Close(); err != nil {
+		return err
+	}
+	halfCloseWrite(conn)
+	return nil
 }
 
 func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Reader, error) {
@@ -286,9 +325,9 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 	}
 	switch state.encMode {
 	case "aes":
-		decReader, err := intencoding.AESGCMDecrypt(conn, identity, 0)
+		decReader, err := intencoding.AESGCMDecrypt(conn, identity)
 		if err != nil {
-			return nil, fmt.Errorf("decryption failed: ensure client and server use the same --encrypt mode (age or aes): %w", err)
+			return nil, fmt.Errorf("aes decryption failed: %w", err)
 		}
 		return decReader, nil
 	default:
@@ -301,7 +340,7 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 }
 
 func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
-	state, err := c.resolveTCPAuthState()
+	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
 		return GetManifestResponse{}, err
 	}
@@ -361,7 +400,7 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 }
 
 func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
-	state, err := c.resolveTCPAuthState()
+	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
 		return SyncManifestResponse{}, err
 	}
@@ -467,7 +506,7 @@ func (c *Client) fetchFileWindowTCP(
 	if fullPath == "" {
 		return nil, nil, errors.New("missing full path")
 	}
-	state, err := c.resolveTCPAuthState()
+	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -556,7 +595,7 @@ func (c *Client) fetchFileBatchTCP(
 	if len(targets) == 0 {
 		return nil, errors.New("missing file targets")
 	}
-	state, err := c.resolveTCPAuthState()
+	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -648,7 +687,7 @@ func (c *Client) probeTCP(ctx context.Context, probeBytes int64) (probeResponse,
 	if probeBytes <= 0 {
 		return probeResponse{}, errors.New("probe bytes must be > 0")
 	}
-	state, err := c.resolveTCPAuthState()
+	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
 		return probeResponse{}, err
 	}
@@ -702,14 +741,14 @@ func (c *Client) probeTCP(ctx context.Context, probeBytes int64) (probeResponse,
 }
 
 func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, probeBytes int64) error {
-	if !state.encryptCommands {
+	if !state.hasAuth {
 		if err := writeTCPLine(conn, cmd); err != nil {
 			return err
 		}
 		_, err := io.CopyN(conn, rand.Reader, probeBytes)
 		return err
 	}
-	recipient, err := age.ParseX25519Recipient(strings.TrimSpace(c.ServerAgePublicKey))
+	recipient, err := age.ParseX25519Recipient(state.serverKey)
 	if err != nil {
 		return err
 	}
@@ -731,7 +770,11 @@ func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, pro
 		_ = ew.Close()
 		return err
 	}
-	return ew.Close()
+	if err := ew.Close(); err != nil {
+		return err
+	}
+	halfCloseWrite(conn)
+	return nil
 }
 
 type firstReadTimestampReader struct {
@@ -816,7 +859,7 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	if txferID == "" {
 		return AcknowledgeFileProgressResponse{}, errors.New("missing transfer id")
 	}
-	state, err := c.resolveTCPAuthState()
+	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, err
 	}
@@ -866,7 +909,7 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 }
 
 func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (GetStatusResponse, error) {
-	state, err := c.resolveTCPAuthState()
+	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
 		return GetStatusResponse{}, err
 	}
@@ -902,7 +945,7 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 }
 
 func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesRequest) (ListStatusesResponse, error) {
-	state, err := c.resolveTCPAuthState()
+	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
 		return ListStatusesResponse{}, err
 	}
@@ -948,7 +991,7 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 }
 
 func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest) (io.ReadCloser, error) {
-	state, err := c.resolveTCPAuthState()
+	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
 		return nil, err
 	}

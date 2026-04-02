@@ -72,12 +72,6 @@ func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) C
 	})
 }
 
-func WithServerAgePublicKey(publicKey string) ClientOption {
-	return clientOptionFunc(func(c *Client) {
-		c.ServerAgePublicKey = strings.TrimSpace(publicKey)
-	})
-}
-
 func WithFileRequestWindowBytes(windowBytes int64) ClientOption {
 	return clientOptionFunc(func(c *Client) {
 		c.FileRequestWindowBytes = windowBytes
@@ -161,7 +155,6 @@ func normalizeComp(comp string) string {
 
 type Client struct {
 	FileAddr                string
-	ServerAgePublicKey      string
 	FileRequestWindowBytes  int64
 	BatchMaxBytes           int64
 	FrameBufferBytes        int
@@ -441,7 +434,6 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 	trimmed := strings.TrimSpace(fileAddr)
 	c := &Client{
 		FileAddr:                trimmed,
-		ServerAgePublicKey:      strings.TrimSpace(os.Getenv("PINCH_FILE_SERVER_AGE_PUBLIC_KEY")),
 		FileRequestWindowBytes:  defaultClientRequestWindowBytes,
 		FrameBufferBytes:        defaultClientFrameBufferBytes,
 		MaxFrameReadBufferBytes: defaultClientMaxFrameReadBufferBytes,
@@ -2856,7 +2848,7 @@ func decodePayloadReader(payload io.Reader, comp string, enc string, identity ag
 		if identity == nil {
 			return nil, errors.New("missing identity for AES encrypted frame")
 		}
-		decrypted, err := intencoding.AESGCMDecrypt(payload, identity, 0)
+		decrypted, err := intencoding.AESGCMDecrypt(payload, identity)
 		if err != nil {
 			return nil, err
 		}

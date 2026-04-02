@@ -3,6 +3,7 @@ package encoding
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"testing"
 
@@ -34,7 +35,7 @@ func roundTrip(t testing.TB, plaintext []byte, chunkSize int) {
 		t.Fatalf("close: %v", err)
 	}
 
-	r, err := AESGCMDecrypt(&ciphertext, id, chunkSize)
+	r, err := AESGCMDecrypt(&ciphertext, id)
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
 	}
@@ -96,7 +97,7 @@ func TestAESGCMTampered(t *testing.T) {
 	}
 	raw[len(raw)-10] ^= 0x01
 
-	r, err := AESGCMDecrypt(bytes.NewReader(raw), id, 0)
+	r, err := AESGCMDecrypt(bytes.NewReader(raw), id)
 	if err != nil {
 		t.Fatalf("decrypt init: %v", err)
 	}
@@ -118,7 +119,7 @@ func TestAESGCMWrongKey(t *testing.T) {
 	w.Write(plaintext)
 	w.Close()
 
-	_, err = AESGCMDecrypt(&ciphertext, wrongID, 0)
+	_, err = AESGCMDecrypt(&ciphertext, wrongID)
 	if err == nil {
 		t.Fatal("expected error decrypting with wrong identity")
 	}
@@ -140,7 +141,7 @@ func TestAESGCMTruncated(t *testing.T) {
 
 	// Truncate to half the ciphertext.
 	truncated := ciphertext.Bytes()[:ciphertext.Len()/2]
-	r, err := AESGCMDecrypt(bytes.NewReader(truncated), id, 0)
+	r, err := AESGCMDecrypt(bytes.NewReader(truncated), id)
 	if err != nil {
 		t.Fatalf("decrypt init: %v", err)
 	}
@@ -153,6 +154,162 @@ func TestAESGCMDefaultChunkSize(t *testing.T) {
 	data := make([]byte, 100*1024)
 	rand.Read(data)
 	roundTrip(t, data, 0)
+}
+
+func TestAESGCMChunkSizeFromHeader(t *testing.T) {
+	data := make([]byte, 100*1024)
+	rand.Read(data)
+	roundTrip(t, data, 4*1024)
+}
+
+func TestAESGCMHeaderChunkSizeTamper(t *testing.T) {
+	id, recipient := generateTestIdentity(t)
+
+	var ciphertext bytes.Buffer
+	w, err := AESGCMEncrypt(&ciphertext, recipient, 4*1024)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if _, err := w.Write([]byte("tamper me")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	raw := ciphertext.Bytes()
+	offset := stanzaChunkSizeOffset(t, raw)
+	binary.BigEndian.PutUint32(raw[offset:offset+4], 8*1024)
+
+	r, err := AESGCMDecrypt(bytes.NewReader(raw), id)
+	if err != nil {
+		t.Fatalf("decrypt init: %v", err)
+	}
+	if _, err := io.ReadAll(r); err == nil {
+		t.Fatal("expected authentication error for tampered chunk size")
+	}
+}
+
+var aeadBenchSizes = []struct {
+	name string
+	n    int
+}{
+	{"64KiB", 64 << 10},
+	{"1MiB", 1 << 20},
+	{"4MiB", 4 << 20},
+	{"10MiB", 10 << 20},
+}
+
+func BenchmarkEncryptThroughput(b *testing.B) {
+	_, recipient := generateTestIdentity(b)
+	for _, sz := range aeadBenchSizes {
+		data := make([]byte, sz.n)
+		rand.Read(data)
+		b.Run(sz.name+"/aesgcm", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				w, err := AESGCMEncrypt(io.Discard, recipient, 0)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := w.Write(data); err != nil {
+					b.Fatal(err)
+				}
+				if err := w.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(b.N)*float64(sz.n)/b.Elapsed().Seconds()/1048576, "MiB/s")
+		})
+		b.Run(sz.name+"/age", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				w, err := age.Encrypt(io.Discard, recipient)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := w.Write(data); err != nil {
+					b.Fatal(err)
+				}
+				if err := w.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(b.N)*float64(sz.n)/b.Elapsed().Seconds()/1048576, "MiB/s")
+		})
+	}
+}
+
+func BenchmarkDecryptThroughput(b *testing.B) {
+	id, recipient := generateTestIdentity(b)
+	for _, sz := range aeadBenchSizes {
+		data := make([]byte, sz.n)
+		rand.Read(data)
+		aesCT := encryptAESForBench(b, data, recipient)
+		ageCT := encryptAgeForBench(b, data, recipient)
+		b.Run(sz.name+"/aesgcm", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				r, err := AESGCMDecrypt(bytes.NewReader(aesCT), id)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := io.Copy(io.Discard, r); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(b.N)*float64(sz.n)/b.Elapsed().Seconds()/1048576, "MiB/s")
+		})
+		b.Run(sz.name+"/age", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				r, err := age.Decrypt(bytes.NewReader(ageCT), id)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := io.Copy(io.Discard, r); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(b.N)*float64(sz.n)/b.Elapsed().Seconds()/1048576, "MiB/s")
+		})
+	}
+}
+
+func encryptAESForBench(b *testing.B, plaintext []byte, recipient *age.X25519Recipient) []byte {
+	b.Helper()
+	var buf bytes.Buffer
+	w, err := AESGCMEncrypt(&buf, recipient, 0)
+	if err != nil {
+		b.Fatalf("aes encrypt setup: %v", err)
+	}
+	if _, err := w.Write(plaintext); err != nil {
+		b.Fatalf("aes encrypt write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		b.Fatalf("aes encrypt close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func encryptAgeForBench(b *testing.B, plaintext []byte, recipient *age.X25519Recipient) []byte {
+	b.Helper()
+	var buf bytes.Buffer
+	w, err := age.Encrypt(&buf, recipient)
+	if err != nil {
+		b.Fatalf("age encrypt setup: %v", err)
+	}
+	if _, err := w.Write(plaintext); err != nil {
+		b.Fatalf("age encrypt write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		b.Fatalf("age encrypt close: %v", err)
+	}
+	return buf.Bytes()
 }
 
 func BenchmarkAESGCMEncrypt(b *testing.B) {
@@ -197,7 +354,7 @@ func BenchmarkAESGCMDecrypt(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		r, err := AESGCMDecrypt(bytes.NewReader(cipherBytes), id, aeadDefaultChunk)
+		r, err := AESGCMDecrypt(bytes.NewReader(cipherBytes), id)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -211,4 +368,44 @@ func BenchmarkAESGCMDecrypt(b *testing.B) {
 			}
 		}
 	}
+}
+
+func stanzaChunkSizeOffset(t testing.TB, ciphertext []byte) int {
+	t.Helper()
+	offset := 0
+	if len(ciphertext) < 1 {
+		t.Fatal("ciphertext too short")
+	}
+	offset++
+
+	readU16 := func() int {
+		if offset+2 > len(ciphertext) {
+			t.Fatal("ciphertext missing u16 field")
+		}
+		n := int(binary.BigEndian.Uint16(ciphertext[offset : offset+2]))
+		offset += 2
+		return n
+	}
+
+	typeLen := readU16()
+	offset += typeLen
+	if offset > len(ciphertext) {
+		t.Fatal("ciphertext missing stanza type")
+	}
+
+	numArgs := readU16()
+	for range numArgs {
+		argLen := readU16()
+		offset += argLen
+		if offset > len(ciphertext) {
+			t.Fatal("ciphertext missing stanza arg")
+		}
+	}
+
+	bodyLen := readU16()
+	offset += bodyLen
+	if offset+4 > len(ciphertext) {
+		t.Fatal("ciphertext missing chunk size")
+	}
+	return offset
 }

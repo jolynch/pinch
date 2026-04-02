@@ -830,7 +830,6 @@ Options:
       --progress-path string           write transfer % to this file/pipe
       --progress-path-interval string  progress write interval (default "1s")
       --disable-zero-copy              force buffered send path (for benchmarking)
-      --encrypt string              post-AUTH stream cipher: age|aes (default "age")
 `)
 	}
 	fs.StringVar(&fileListener, "listen", fileListener, "")
@@ -846,8 +845,6 @@ Options:
 	requireAuth := fs.Bool("require-auth", false, "")
 	targetIODepth := fs.Int("target-io-depth", 8, "")
 	disableZeroCopy := fs.Bool("disable-zero-copy", false, "")
-	var encryptMode string
-	fs.StringVar(&encryptMode, "encrypt", "age", "")
 	traceFile := fs.String("trace", "", "")
 	var progressFilePath string
 	var progressIntervalRaw string
@@ -875,12 +872,6 @@ Options:
 			log.Fatalf("Failed to start trace: %v", err)
 		}
 		defer trace.Stop()
-	}
-
-	switch encryptMode {
-	case "age", "aes":
-	default:
-		log.Fatalf("Invalid --encrypt %q (supported: age, aes)", encryptMode)
 	}
 
 	if !makeDirs(keysDir) {
@@ -920,7 +911,6 @@ Options:
 		ProgressInterval:       progressInterval,
 		DisableZeroCopy:        *disableZeroCopy,
 		TargetIODepth:          *targetIODepth,
-		EncryptMode:            encryptMode,
 	}); serveErr != nil {
 		log.Fatalf("File transfer listener stopped: %v", serveErr)
 	}
