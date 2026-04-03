@@ -168,7 +168,7 @@ func (s *connSession) run() error {
 		if authRes.recipient != nil {
 			switch authRes.encryptMode {
 			case "aes":
-				encOut, encErr := encoding.AESGCMEncrypt(s.conn, authRes.recipient, 0)
+				encOut, encErr := encoding.Encrypt(s.conn, authRes.recipient, encoding.Options{Algorithm: encoding.AlgorithmAES})
 				if encErr != nil {
 					return encErr
 				}
@@ -189,7 +189,7 @@ func (s *connSession) run() error {
 			}
 			switch authRes.encryptMode {
 			case "aes":
-				decIn, decErr := encoding.AESGCMDecrypt(br, s.serverID)
+				decIn, decErr := encoding.Decrypt(br, s.serverID)
 				if decErr != nil {
 					return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed"}
 				}

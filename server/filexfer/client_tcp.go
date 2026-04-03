@@ -246,7 +246,7 @@ func (c *Client) sendTCPAuth(conn net.Conn, state tcpAuthState) error {
 	defer c.releaseScratchBuffer(encrypted)
 	switch state.encMode {
 	case "aes":
-		ew, encErr := intencoding.AESGCMEncrypt(encrypted, recipient, 0)
+		ew, encErr := intencoding.Encrypt(encrypted, recipient, intencoding.Options{Algorithm: intencoding.AlgorithmAES})
 		if encErr != nil {
 			return encErr
 		}
@@ -297,7 +297,7 @@ func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload strin
 	var ew io.WriteCloser
 	switch state.encMode {
 	case "aes":
-		ew, err = intencoding.AESGCMEncrypt(conn, recipient, 0)
+		ew, err = intencoding.Encrypt(conn, recipient, intencoding.Options{Algorithm: intencoding.AlgorithmAES})
 	default:
 		ew, err = age.Encrypt(conn, recipient)
 	}
@@ -325,7 +325,7 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 	}
 	switch state.encMode {
 	case "aes":
-		decReader, err := intencoding.AESGCMDecrypt(conn, identity)
+		decReader, err := intencoding.Decrypt(conn, identity)
 		if err != nil {
 			return nil, fmt.Errorf("aes decryption failed: %w", err)
 		}
@@ -755,7 +755,7 @@ func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, pro
 	var ew io.WriteCloser
 	switch state.encMode {
 	case "aes":
-		ew, err = intencoding.AESGCMEncrypt(conn, recipient, 0)
+		ew, err = intencoding.Encrypt(conn, recipient, intencoding.Options{Algorithm: intencoding.AlgorithmAES})
 	default:
 		ew, err = age.Encrypt(conn, recipient)
 	}
