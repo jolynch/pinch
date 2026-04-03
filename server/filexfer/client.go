@@ -2854,7 +2854,7 @@ func decodePayloadReader(payload io.Reader, comp string, enc string, identity ag
 		if identity == nil {
 			return nil, errors.New("missing identity for AES encrypted frame")
 		}
-		decrypted, err := intencoding.AESGCMDecrypt(payload, identity)
+		decrypted, err := intencoding.Decrypt(payload, identity)
 		if err != nil {
 			return nil, err
 		}

@@ -79,7 +79,7 @@ func processAUTHRequest(req Request, serverID *age.X25519Identity) (authResult, 
 		if b64Err != nil {
 			return authResult{}, errNotAuthorized
 		}
-		dec, err := encoding.AESGCMDecrypt(bytes.NewReader(blobBytes), serverID)
+		dec, err := encoding.Decrypt(bytes.NewReader(blobBytes), serverID)
 		if err != nil {
 			return authResult{}, errNotAuthorized
 		}

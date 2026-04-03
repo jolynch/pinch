@@ -115,7 +115,7 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 		var plain []byte
 		switch protocol {
 		case "aes":
-			dec, decErr := encoding.AESGCMDecrypt(bytes.NewReader(blobBytes), serverID)
+			dec, decErr := encoding.Decrypt(bytes.NewReader(blobBytes), serverID)
 			if decErr != nil {
 				_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
 				return
@@ -144,7 +144,7 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 		var encErr error
 		switch protocol {
 		case "aes":
-			ew, encErr = encoding.AESGCMEncrypt(conn, recipient, 0)
+			ew, encErr = encoding.Encrypt(conn, recipient, encoding.Options{Algorithm: encoding.AlgorithmAES})
 		default:
 			ew, encErr = age.Encrypt(conn, recipient)
 		}
@@ -158,7 +158,7 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 		var cmdReader io.Reader
 		switch protocol {
 		case "aes":
-			cmdReader, err = encoding.AESGCMDecrypt(br, serverID)
+			cmdReader, err = encoding.Decrypt(br, serverID)
 		default:
 			cmdReader, err = age.Decrypt(br, serverID)
 		}
