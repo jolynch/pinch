@@ -1677,6 +1677,12 @@ func SuggestBatchMaxBytes(suggestedConcurrency int, windowConcurrency int, windo
 	if windowBytes <= 0 {
 		return defaultClientBatchMaxBytes
 	}
+	// A single concurrent window should use the full transfer window. Splitting
+	// that lone stream into smaller batches only adds coordination overhead
+	// without creating additional across-file concurrency.
+	if windowConcurrency == 1 {
+		return windowBytes
+	}
 	if windowConcurrency <= 0 {
 		windowConcurrency = 4
 	}
