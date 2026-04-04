@@ -1681,7 +1681,7 @@ func SuggestBatchMaxBytes(suggestedConcurrency int, windowConcurrency int, windo
 	// that lone stream into smaller batches only adds coordination overhead
 	// without creating additional across-file concurrency.
 	if windowConcurrency == 1 {
-		return windowBytes
+		return largestPow2MiBWithin(windowBytes)
 	}
 	if windowConcurrency <= 0 {
 		windowConcurrency = 4
@@ -1714,11 +1714,33 @@ func SuggestBatchMaxBytes(suggestedConcurrency int, windowConcurrency int, windo
 	// Floor: a batch is one TCP SEND, so it should not be smaller than the
 	// socket buffer the OS allocated — sending less wastes a round-trip for
 	// data that would have fit in a single write/read cycle.
-	floor := max(serverWmemBytes, int64(utils.MaxSocketReadBufferBytes()))
-	batch = max(batch, floor)
+	// Round the floor up to the nearest power-of-2 MiB so the result stays aligned.
+	rawFloor := max(serverWmemBytes, int64(utils.MaxSocketReadBufferBytes()))
+	floorMiB := max(int64(1), (rawFloor+mib-1)/mib)
+	floorPow2 := int64(1)
+	for floorPow2 < floorMiB {
+		floorPow2 <<= 1
+	}
+	batch = max(batch, floorPow2*mib)
 
 	// Ceiling: a batch larger than the transfer window is meaningless.
-	return min(batch, windowBytes)
+	// Round down to keep MiB alignment.
+	return min(batch, largestPow2MiBWithin(windowBytes))
+}
+
+// largestPow2MiBWithin returns the largest power-of-2 multiple of MiB that is
+// <= v. If v < 1 MiB it returns v unchanged (sub-MiB callers handle their own
+// alignment).
+func largestPow2MiBWithin(v int64) int64 {
+	const mib = int64(1 << 20)
+	if v < mib {
+		return v
+	}
+	p := int64(1)
+	for p*2 <= v/mib {
+		p <<= 1
+	}
+	return p * mib
 }
 
 func suggestedConcurrencyFromProbe(serverCPU int, ioDepth int, strategy string) int {
