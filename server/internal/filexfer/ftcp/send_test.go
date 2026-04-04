@@ -41,7 +41,7 @@ func (d *sendTestDeps) RegisterTransferFileState(string, <-chan TransferFileStat
 func (d *sendTestDeps) ClipTransfer(string) bool { return false }
 
 func (d *sendTestDeps) GetTransfer(string) (Transfer, bool) { return Transfer{}, false }
-func (d *sendTestDeps) ListTransfers() []Transfer              { return nil }
+func (d *sendTestDeps) ListTransfers() []Transfer           { return nil }
 
 func (d *sendTestDeps) SetTransferHints(string, string, int64, int) bool { return true }
 
@@ -231,11 +231,9 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 }
 
 func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
-	size := (2 * defaultFileFrameLogicalSize) + 1
-	data := make([]byte, size)
-	for i := range data {
-		data[i] = byte(i)
-	}
+	size := (5 * defaultFileFrameLogicalSize) + 1
+	data := bytes.Repeat([]byte("compress-me-"), int(size/int64(len("compress-me-")))+1)
+	data = data[:size]
 	tmp := writeTempSendFile(t, data)
 	deps := &sendTestDeps{filePath: tmp}
 
@@ -250,8 +248,8 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("frameComps failed: %v", err)
 	}
-	if len(comps) < 3 {
-		t.Fatalf("expected >=3 frames for adaptive test, got %d", len(comps))
+	if len(comps) < 5 {
+		t.Fatalf("expected >=5 frames for adaptive test, got %d", len(comps))
 	}
 	if comps[0] != "none" {
 		t.Fatalf("expected first frame to start at none, got %q", comps[0])
