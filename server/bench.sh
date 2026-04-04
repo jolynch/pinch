@@ -21,8 +21,8 @@ Options:
   --target-dir PATH          Target directory for copy (default: /var/lib/pinch/data).
   --skip-fsync               Skip fdatasync after each file/window (passed to copy).
   --no-sync                  Alias for --skip-fsync.
-  --concurrency N            Copy command concurrency (default: 128).
-  --encrypt MODE             Client encryption mode (supported: age|aes).
+  --concurrency N            Copy command concurrency (default: adaptive).
+  --encrypt MODE             Client encryption mode (supported: auto|aes|chacha20).
   --compress MODE            Compression mode passed to copy (adapt|none|lz4|zstd).
   --disable-zero-copy        Force server to use buffered send path (no tee/splice).
   --freq HZ                  perf sample frequency (default: 199).
@@ -63,7 +63,7 @@ SERVER_URL="127.0.0.1:3453"
 SERVER_STARTUP_TIMEOUT_SEC=30
 SOURCE_DIRECTORY=""
 TARGET_DIR="/var/lib/pinch/data"
-CONCURRENCY="48"
+CONCURRENCY=""
 ENCRYPT_MODE=""
 COMPRESS_MODE=""
 DISABLE_ZERO_COPY=false
@@ -209,8 +209,8 @@ require_cmd go
 require_cmd rm
 require_cmd time
 
-if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "age" && "${ENCRYPT_MODE}" != "aes" ]]; then
-  echo "unsupported --encrypt value: ${ENCRYPT_MODE} (supported: age, aes)" >&2
+if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "auto" && "${ENCRYPT_MODE}" != "aes" && "${ENCRYPT_MODE}" != "chacha20" ]]; then
+  echo "unsupported --encrypt value: ${ENCRYPT_MODE} (supported: auto, aes, chacha20)" >&2
   exit 2
 fi
 if [[ "${RSYNC}" == "true" && "${SKIP_WRITE}" == "true" ]]; then
@@ -345,7 +345,10 @@ echo "bench: source=${SOURCE_DIRECTORY} target=${TARGET_DIR}"
 echo "Cleaning prior benchmark output..."
 rm -rf "${TARGET_DIR}/" "${STATE_DIR}/"
 
-COPY_CMD=(./pinch filecli "${SERVER_URL}" copy --concurrency "${CONCURRENCY}")
+COPY_CMD=(./pinch filecli "${SERVER_URL}" copy)
+if [[ -n "${CONCURRENCY}" ]]; then
+  COPY_CMD+=(--concurrency "${CONCURRENCY}")
+fi
 if [[ -n "${ENCRYPT_MODE}" ]]; then
   COPY_CMD+=(--encrypt "${ENCRYPT_MODE}")
 fi

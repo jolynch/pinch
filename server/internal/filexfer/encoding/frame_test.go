@@ -16,7 +16,6 @@ func TestWriteFrameReturnsStats(t *testing.T) {
 		Size:       int64(len(payload)),
 		WSize:      int64(len(payload)),
 		Comp:       "none",
-		Enc:        "none",
 		HeaderHash: "xxh128:00",
 		HeaderTS:   time.Now().UnixMilli(),
 		Payload:    payload,

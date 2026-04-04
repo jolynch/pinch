@@ -29,7 +29,7 @@ func ParseRequest(payload []byte) (Request, error) {
 	switch verb {
 	case VerbAUTH:
 		if c.eof() {
-			return Request{}, protocolErr{code: "BAD_AUTH", message: "missing auth protocol (key, age, aes)"}
+			return Request{}, protocolErr{code: "BAD_AUTH", message: "missing auth protocol (key, aes, chacha20)"}
 		}
 		protocol, protoErr := c.readToken()
 		if protoErr != nil {
@@ -42,7 +42,7 @@ func ParseRequest(payload []byte) (Request, error) {
 			}
 			req.Params = append(req.Params, map[string]string{"protocol": "key"})
 			return req, nil
-		case "age", "aes":
+		case "aes", "chacha20":
 			if c.eof() {
 				return Request{}, protocolErr{code: "BAD_AUTH", message: "missing auth blob"}
 			}

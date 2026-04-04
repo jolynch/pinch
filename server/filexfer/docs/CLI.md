@@ -148,7 +148,7 @@ pinch filecli get --skip-write /srv/data/file.bin   # fetch without writing
 Important flags:
 
 - `-o <path|->`: output file path, or `-` for stdout
-- `--encrypt none|age`: encryption algorithm (default: none)
+- `--encrypt none|auto|aes|chacha20`: encryption algorithm (default: none)
 - `--compress adapt|none|lz4|zstd`: compression algorithm (default: adapt)
 - `--concurrency N`: parallel download workers (0=auto)
 - `--skip-write`: fetch to discard without writing

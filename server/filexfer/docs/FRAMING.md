@@ -34,7 +34,7 @@ FX/1 <file_id> <properties...>
 Example:
 
 ```text
-FX/1 12 offset=0 size=1048576 wsize=262144 comp=zstd enc=age hash=xxh128:9f12ab... deadline:30s
+FX/1 12 offset=0 size=1048576 wsize=262144 comp=zstd hash=xxh128:9f12ab... deadline:30s
 <262144 payload bytes>
 FXT/1 12 status=ok hash=xxh64:1af3bc9d00ee42aa
 ```
@@ -46,7 +46,6 @@ Properties are ASCII and case-sensitive.
 ### Required
 
 - `comp=<mode>`: compression mode.
-- `enc=<mode>`: encryption mode.
 - `offset=<n>`: byte offset within the logical file where payload data belongs.
 - `size=<n>`: number of original (logical, uncompressed) bytes represented by this frame.
 - `wsize=<n>`: number of payload bytes on the wire for this frame.
@@ -76,23 +75,11 @@ Receiver behavior:
 - `none`: write bytes directly.
 - `zstd` or `lz4`: decompress before writing to destination offset.
 
-## Encryption
-
-`enc` allowed values:
-
-- `none`
-- `age`
-
-Receiver behavior:
-
-- `none`: interpret payload as plaintext/compressed bytes per `comp`.
-- `age`: decrypt payload before decompression and write.
-
 ## Parsing Rules
 
 - Maximum header bytes: 16 KiB (defensive limit).
 - Unknown properties are ignored.
-- Missing required fields (`comp`, `enc`, `offset`, `size`, `wsize`) reject frame.
+- Missing required fields (`comp`, `offset`, `size`, `wsize`) reject frame.
 - Invalid `file_id` reject frame.
 - Invalid numeric value formats reject frame.
 - Invalid `deadline` duration format rejects frame when `deadline:` is present.
@@ -105,7 +92,6 @@ Receiver behavior:
 - `size` is the logical uncompressed bytes covered by this frame.
 - `wsize` is the exact payload byte count that follows the header newline.
 - For `comp=none`, `size` must equal `wsize`.
-- For `enc=age`, decrypt before applying `comp`.
 - For `comp=zstd|lz4`, decompressed bytes must equal `size`.
 - Trailer `hash=<algo>:<value>` is used for frame-integrity validation/logging.
 - `deadline:<duration>` limits how long receiver should allow this frame to complete; exceeded deadline is a protocol timeout.
@@ -152,7 +138,7 @@ FXR/1 <file_id> <properties...>
 Example:
 
 ```text
-FXR/1 12 status=ok comp=zstd enc=age offset=0 size=1048576 wsize=262144 elapsed=420ms
+FXR/1 12 status=ok comp=zstd offset=0 size=1048576 wsize=262144 elapsed=420ms
 <262144 payload bytes>
 FXT/1 12 status=ok hash=xxh64:1af3bc9d00ee42aa
 ```
@@ -167,7 +153,6 @@ FXT/1 12 status=ok hash=xxh64:1af3bc9d00ee42aa
 ### Optional Response Properties
 
 - `comp=<mode>`: compression mode actually applied.
-- `enc=<mode>`: encryption mode actually applied.
 - `deadline:<duration>`: effective deadline used for this segment.
 - `elapsed=<duration>`: observed processing duration.
 - `detail=<token>`: machine-readable short detail code.
@@ -229,7 +214,7 @@ The server repeats these triplets until each requested window is complete.
 Default logical frame size cap is `8 MiB`.
 
 For `SEND` responses, header properties are emitted in this order:
-`offset`, `size`, `wsize`, `comp`, `enc`, `hash`, optional `max-wsize`, then `ts`.
+`offset`, `size`, `wsize`, `comp`, `hash`, optional `max-wsize`, then `ts`.
 Current implementation supports adaptive compression and may vary `comp` per frame.
 
 Current trailer shape for `SEND`:

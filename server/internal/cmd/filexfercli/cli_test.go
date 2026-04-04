@@ -18,6 +18,7 @@ import (
 
 	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
+	"github.com/jolynch/pinch/internal/aead"
 	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 	"github.com/zeebo/xxh3"
@@ -92,18 +93,28 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 		protocol := req.Params[0]["protocol"]
 
 		if protocol == "key" {
-			// Key exchange: return server public key and close.
+			// Key exchange: return recommended cipher and server public key.
 			if serverID == nil {
 				_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED no server identity\r\n")
 				return
 			}
-			_, _ = io.WriteString(conn, "OK "+serverID.Recipient().String()+"\r\n")
+			_, _ = io.WriteString(conn, "OK "+string(aead.RecommendedCipher())+" "+serverID.Recipient().String()+"\r\n")
 			return
 		}
 
-		// age or aes: decode and decrypt the blob to get the client's public key.
+		// aes/chacha20: decode and decrypt the blob to get the client's public key.
 		blobRaw := req.Params[0]["blob"]
 		if blobRaw == "" || serverID == nil {
+			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+			return
+		}
+		opts := aead.Options{}
+		switch protocol {
+		case "aes":
+			opts.Algorithm = aead.AlgorithmAES
+		case "chacha20":
+			opts.Algorithm = aead.AlgorithmChaCha20
+		default:
 			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
 			return
 		}
@@ -112,24 +123,13 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED bad base64\r\n")
 			return
 		}
-		var plain []byte
-		switch protocol {
-		case "aes":
-			dec, decErr := encoding.Decrypt(bytes.NewReader(blobBytes), serverID)
-			if decErr != nil {
-				_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
-				return
-			}
-			plain, err = io.ReadAll(dec)
-		default:
-			dec, decErr := age.Decrypt(bytes.NewReader(blobBytes), serverID)
-			if decErr != nil {
-				_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
-				return
-			}
-			plain, err = io.ReadAll(dec)
+		dec, decErr := aead.DecryptWithOptions(bytes.NewReader(blobBytes), serverID, opts)
+		if decErr != nil {
+			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+			return
 		}
-		if err != nil {
+		plain, readErr := io.ReadAll(dec)
+		if readErr != nil {
 			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
 			return
 		}
@@ -140,14 +140,7 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 		}
 
 		// Encrypt responses to client.
-		var ew io.WriteCloser
-		var encErr error
-		switch protocol {
-		case "aes":
-			ew, encErr = encoding.Encrypt(conn, recipient, encoding.Options{Algorithm: encoding.AlgorithmAES})
-		default:
-			ew, encErr = age.Encrypt(conn, recipient)
-		}
+		ew, encErr := aead.Encrypt(conn, recipient, opts)
 		if encErr != nil {
 			return
 		}
@@ -155,14 +148,8 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 		closeOut = ew.Close
 
 		// Decrypt the command from client.
-		var cmdReader io.Reader
-		switch protocol {
-		case "aes":
-			cmdReader, err = encoding.Decrypt(br, serverID)
-		default:
-			cmdReader, err = age.Decrypt(br, serverID)
-		}
-		if err != nil {
+		cmdReader, cmdDecErr := aead.DecryptWithOptions(br, serverID, opts)
+		if cmdDecErr != nil {
 			_, _ = io.WriteString(out, "ERR NOT_AUTHORIZED request decryption failed\r\n")
 			_ = closeOut()
 			return
@@ -237,7 +224,7 @@ func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 func buildCLIFrameWithMetadata(fileID uint64, body []byte, offset int64, meta *FileTrailerMetadata) string {
 	xsum := xxh128HexCLI(body)
 	header := fmt.Sprintf(
-		"FX/1 %d offset=%d size=%d wsize=%d comp=none enc=none hash=xxh128:%s ts=1000\n",
+		"FX/1 %d offset=%d size=%d wsize=%d comp=none hash=xxh128:%s ts=1000\n",
 		fileID,
 		offset,
 		len(body),
@@ -493,7 +480,7 @@ func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 	}
 }
 
-func TestRunCLITransferWithEncryptAge(t *testing.T) {
+func TestRunCLITransferWithEncryptAuto(t *testing.T) {
 	tmp := t.TempDir()
 	targetDir := filepath.Join(tmp, "dst")
 	manifestRaw := strings.Join([]string{
@@ -538,7 +525,7 @@ func TestRunCLITransferWithEncryptAge(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := runTransferCLI(srv.URL, []string{"-s", "/remote", "--encrypt", "age", targetDir}, &stdout, &stderr)
+	code := runTransferCLI(srv.URL, []string{"-s", "/remote", "--encrypt", "auto", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
