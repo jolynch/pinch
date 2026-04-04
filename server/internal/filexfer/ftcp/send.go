@@ -239,8 +239,19 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 	if item.Size > 0 && item.Size < windowLen {
 		windowLen = item.Size
 	}
+	// In fast mode, advise sequential access for the whole window then spawn
+	// a background goroutine that issues readahead(2) for the next frame
+	// while we read and process the current one. Only useful when there are
+	// at least two frames worth of data.
+	var readaheadCh chan readaheadHint
 	if item.Mode == loadStrategyFast {
-		tryReadAheadWindow(fd, item.Offset, windowLen)
+		tryAdviseSequential(fd, item.Offset, windowLen)
+		if runtime.GOOS == "linux" && windowLen > defaultFileFrameLogicalSize {
+			done := make(chan struct{})
+			var stopReadahead func()
+			readaheadCh, stopReadahead = startFrameReadahead(fd, done)
+			defer func() { close(done); stopReadahead() }()
+		}
 	}
 
 	cursor := item.Offset
@@ -334,6 +345,16 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 			DirectIO:      usedDirectOpen,
 		}
 
+		if readaheadCh != nil && !isTerminal {
+			nextFrameSize := min(remaining-frameSize, defaultFileFrameLogicalSize)
+			if nextFrameSize > 0 {
+				sendReadaheadHint(readaheadCh, readaheadHint{
+					offset: nextOffset,
+					length: nextFrameSize,
+				})
+			}
+		}
+
 		frameOffset := cursor
 		var stats frameStreamStats
 		if !disableZeroCopy && canZeroCopy(frameArgs) {
@@ -360,7 +381,7 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 				}
 				if cursor == item.Offset {
 					if item.Mode == loadStrategyFast {
-						tryReadAheadWindow(fd, item.Offset, windowLen)
+						tryAdviseSequential(fd, item.Offset, windowLen)
 					}
 					windowWireTotal = 0
 					windowLogicalTotal = 0
@@ -372,7 +393,7 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 					windowHasher = xxh3.New128()
 				} else {
 					if item.Mode == loadStrategyFast {
-						tryReadAheadWindow(fd, cursor, remaining)
+						tryAdviseSequential(fd, cursor, remaining)
 					}
 				}
 				continue
@@ -1065,9 +1086,65 @@ func logicalBufferBucketSize(maxChunk int64) int {
 	return bucket8MiB
 }
 
-func tryReadAheadWindow(fd *os.File, offset int64, length int64) {
+func tryAdviseSequential(fd *os.File, offset int64, length int64) {
 	if fd == nil || offset < 0 || length <= 0 {
 		return
 	}
 	_ = unix.Fadvise(int(fd.Fd()), offset, length, unix.FADV_SEQUENTIAL)
+}
+
+// readaheadHint describes a file region for the background readahead goroutine
+// to prefetch into the page cache.
+type readaheadHint struct {
+	offset int64
+	length int64
+}
+
+// tryReadAheadRange issues the readahead(2) syscall to asynchronously populate
+// the page cache for the given byte range.
+func tryReadAheadRange(fd *os.File, offset int64, length int64) {
+	if fd == nil || offset < 0 || length <= 0 {
+		return
+	}
+	_, _, _ = unix.Syscall(unix.SYS_READAHEAD, fd.Fd(), uintptr(offset), uintptr(length))
+}
+
+// startFrameReadahead spawns a background goroutine that issues readahead(2)
+// for file regions received on the returned channel. The goroutine exits when
+// done is closed or the channel is closed. Call the returned stop function to
+// ensure the goroutine has exited before closing fd.
+func startFrameReadahead(fd *os.File, done <-chan struct{}) (chan readaheadHint, func()) {
+	ch := make(chan readaheadHint, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case hint, ok := <-ch:
+				if !ok {
+					return
+				}
+				tryReadAheadRange(fd, hint.offset, hint.length)
+			case <-done:
+				return
+			}
+		}
+	}()
+	stop := func() {
+		close(ch)
+		wg.Wait()
+	}
+	return ch, stop
+}
+
+// sendReadaheadHint sends a readahead hint to the background goroutine,
+// discarding any stale hint already in the channel so that the goroutine
+// always processes the most recent request.
+func sendReadaheadHint(ch chan readaheadHint, hint readaheadHint) {
+	select {
+	case <-ch:
+	default:
+	}
+	ch <- hint
 }
