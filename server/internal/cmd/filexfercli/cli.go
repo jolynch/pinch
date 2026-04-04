@@ -301,14 +301,14 @@ func resolveEncryptionOptions(mode string) (pubKey string, identity string, encM
 	switch mode {
 	case "", "none":
 		return "", "", "", nil
-	case "age", "aes":
+	case "auto", "aes", "chacha20":
 		id, genErr := age.GenerateX25519Identity()
 		if genErr != nil {
 			return "", "", "", fmt.Errorf("generate age identity: %w", genErr)
 		}
 		return id.Recipient().String(), id.String(), mode, nil
 	default:
-		return "", "", "", fmt.Errorf("unsupported --encrypt value %q (supported: none, age, aes)", mode)
+		return "", "", "", fmt.Errorf("unsupported --encrypt value %q (supported: none, auto, aes, chacha20)", mode)
 	}
 }
 
@@ -459,7 +459,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.BoolVar(&cfg.verifyMeta, "", "verify-meta", false, "Run read-only metadata verification after copy; with --skip-fetch this is allowed only if LOCAL_DST already exists")
 	cf.IntVar(&cfg.verifyDataSamplePct, "", "verify-data-sample", 0, "Percent of frame slots to sample per file for data verification (0-100); implies --verify-meta; not allowed with --skip-fetch or --skip-write")
 	cf.StringVar(&cfg.modeRaw, "", "mode", LoadStrategyFast, "Server read strategy: fast|gentle")
-	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
+	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&cfg.compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "Parallel download / verification workers (0=adapt from server)")
 	cf.BoolVar(&cfg.progress, "", "progress", true, "Show transfer progress every 2s")
@@ -996,7 +996,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	var maxChunk int
 	var deadlineRaw string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory to transfer")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&loadStrategyRaw, "", "load-strategy", LoadStrategyFast, "Server load strategy (fast|gentle)")
 	probeSizeRaw = encoding.HumanBytes(defaultCLIProbeBytes)
 	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "Probe payload size for transfer metadata; 1B, 4KiB, 8MiB")
@@ -1092,10 +1092,15 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		fmt.Fprintf(stderr, "probe failed: %v\n", err)
 		return 1
 	}
+	cipherDisplay := "none"
+	if probeResult.Cipher != "" {
+		cipherDisplay = probeResult.Cipher
+	}
 	fmt.Fprintf(
 		stdout,
-		"transfer-probe : strategy=%s avg_ms=%d est_link=%dMbps srv-conc=(%d cpu * %d io = %d)\n",
+		"transfer-probe : strategy=%s cipher=%s avg_ms=%d est_link=%dMbps srv-conc=(%d cpu * %d io = %d)\n",
 		cfg.loadStrategy,
+		cipherDisplay,
 		probeResult.AvgLatencyMS,
 		probeResult.LinkMbps,
 		probeResult.ServerCPU, probeResult.ServerIODepth, probeResult.SuggestedConcurrency,
@@ -1388,7 +1393,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var progressFilePath string
 	var progressFileIntervalRaw string
 	cf.StringVar(&outFile, "o", "", "", "Output file path, or '-' for stdout")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=auto)")
 	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not write the file; fetch to discard instead")
@@ -1505,7 +1510,6 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		onProgressUpdate = progressReporter.ReportUpdate
 	}
 	forwardProgress := func(update DownloadProgressUpdate) {
-		applyProgressUpdateToManifest(manifest, update)
 		if onProgressUpdate != nil {
 			onProgressUpdate(update)
 		}
@@ -1592,7 +1596,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var progressFilePath string
 	var progressFileIntervalRaw string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory on server (default: manifest root)")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
 	cf.BoolVar(&yes, "y", "yes", false, "Skip confirmation prompt")
@@ -1741,11 +1745,11 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 
 		// SYNC: send old manifest, receive new manifest + removed paths.
 		syncResp, err := client.SyncManifest(context.Background(), SyncManifestRequest{
-			Directory:    syncSourceDir,
-			OldManifest:  oldManifest,
-			Mode:         loadStrategy,
-			LinkMbps:     probeResult.LinkMbps,
-			Concurrency:  probeResult.SuggestedConcurrency,
+			Directory:   syncSourceDir,
+			OldManifest: oldManifest,
+			Mode:        loadStrategy,
+			LinkMbps:    probeResult.LinkMbps,
+			Concurrency: probeResult.SuggestedConcurrency,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "sync failed: %v\n", err)
@@ -1878,20 +1882,22 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		}
 
 		progressUpdates := make(chan DownloadProgressUpdate, 1024)
+		entryByID := manifestEntriesByID(mergedManifest)
 		var onProgressUpdate func(DownloadProgressUpdate)
 		if cfg.verbose {
 			progressReporter := newVerboseProgressReporter(stderr)
 			onProgressUpdate = progressReporter.ReportUpdate
 		}
 		forwardProgress := func(update DownloadProgressUpdate) {
-			applyProgressUpdateToManifest(mergedManifest, update)
 			if onProgressUpdate != nil {
 				onProgressUpdate(update)
 			}
 		}
-		stopProgress, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, mergedProgress, progressUpdates, forwardProgress, stderr)
+		stopProgress, persistProgressAck, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, mergedProgress, progressUpdates, forwardProgress, stderr)
+		persistFileDone := func(fileID uint64, ackBytes int64) {
+			persistProgressAck(fileID, ackBytes)
+		}
 		markMetadataDone := func(fileID uint64) {
-			markManifestEntryMetadataDone(mergedManifest, fileID)
 			markMetadataDonePersisted(fileID)
 		}
 
@@ -1948,7 +1954,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			BatchMaxBytes:   batchSize,
 			ProgressUpdates: progressUpdates,
 			OnFileDone: func(evt StartFileDoneEvent) {
-				entry, ok := mergedManifest.EntryByID(evt.File.Meta.FileID)
+				entry, ok := entryByID[evt.File.Meta.FileID]
 				if !ok {
 					recordFailure(fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID))
 					return
@@ -1961,11 +1967,13 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 					recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
 					return
 				}
+				persistFileDone(evt.File.Meta.FileID, entry.Size)
 				markMetadataDone(evt.File.Meta.FileID)
 				printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
 			},
 		})
 		stopProgress()
+		applyProgressStateToManifest(mergedManifest, mergedProgress)
 		if err != nil {
 			fmt.Fprintf(stderr, "sync download failed: %v\n", err)
 			return 1
@@ -2028,7 +2036,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var deadlineRaw string
 	var progressFilePath string
 	var progressFileIntervalRaw string
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|age|aes (default: none)")
+	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
 	cf.StringVar(&progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
@@ -2178,20 +2186,22 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		manifest.DeadlineMS = cfg.deadlineMS
 	}
 	progressUpdates := make(chan DownloadProgressUpdate, 1024)
+	entryByID := manifestEntriesByID(manifest)
 	var onStartProgressUpdate func(DownloadProgressUpdate)
 	if cfg.verbosity >= 2 {
 		progressReporter := newVerboseProgressReporter(stderr)
 		onStartProgressUpdate = progressReporter.ReportUpdate
 	}
 	forwardProgress := func(update DownloadProgressUpdate) {
-		applyProgressUpdateToManifest(manifest, update)
 		if onStartProgressUpdate != nil {
 			onStartProgressUpdate(update)
 		}
 	}
-	stopProgress, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, progressState, progressUpdates, forwardProgress, stderr)
+	stopProgress, persistProgressAck, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, progressState, progressUpdates, forwardProgress, stderr)
+	persistFileDone := func(fileID uint64, ackBytes int64) {
+		persistProgressAck(fileID, ackBytes)
+	}
 	markMetadataDone := func(fileID uint64) {
-		markManifestEntryMetadataDone(manifest, fileID)
 		markMetadataDonePersisted(fileID)
 	}
 	progressStopped := false
@@ -2253,6 +2263,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 				recordFailure(fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err))
 				continue
 			}
+			persistFileDone(entry.ID, entry.Size)
 			markMetadataDone(entry.ID)
 			completed++
 			continue
@@ -2293,7 +2304,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		BatchMaxBytes:   batchSize,
 		ProgressUpdates: progressUpdates,
 		OnFileDone: func(evt StartFileDoneEvent) {
-			entry, ok := manifest.EntryByID(evt.File.Meta.FileID)
+			entry, ok := entryByID[evt.File.Meta.FileID]
 			if !ok {
 				recordFailure(fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID))
 				return
@@ -2303,6 +2314,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 				recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
 				return
 			}
+			persistFileDone(evt.File.Meta.FileID, entry.Size)
 			markMetadataDone(evt.File.Meta.FileID)
 			if cfg.verbosity >= 2 {
 				printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
@@ -2310,6 +2322,8 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		},
 	})
 	if err != nil {
+		stopProgress()
+		progressStopped = true
 		fmt.Fprintf(stderr, "start failed: %v\n", err)
 		return 1
 	}
@@ -2320,6 +2334,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	}
 	stopProgress()
 	progressStopped = true
+	applyProgressStateToManifest(manifest, progressState)
 	failuresMu.Lock()
 	finalFailures := append([]error(nil), failures...)
 	failuresMu.Unlock()
@@ -2599,6 +2614,17 @@ func applyProgressUpdateToManifest(manifest *Manifest, update DownloadProgressUp
 	}
 }
 
+func manifestEntriesByID(manifest *Manifest) map[uint64]ManifestEntry {
+	if manifest == nil || len(manifest.Entries) == 0 {
+		return nil
+	}
+	entries := make(map[uint64]ManifestEntry, len(manifest.Entries))
+	for _, entry := range manifest.Entries {
+		entries[entry.ID] = entry
+	}
+	return entries
+}
+
 func markManifestEntryMetadataDone(manifest *Manifest, fileID uint64) {
 	if manifest == nil {
 		return
@@ -2669,13 +2695,19 @@ type metadataProgressUpdate struct {
 	FileID uint64
 }
 
-func startProgressWriter(progressPath string, initial map[uint64]ManifestProgress, updates <-chan DownloadProgressUpdate, onUpdate func(DownloadProgressUpdate), stderr io.Writer) (func(), func(uint64)) {
+type persistedProgressUpdate struct {
+	FileID   uint64
+	AckBytes int64
+}
+
+func startProgressWriter(progressPath string, initial map[uint64]ManifestProgress, updates <-chan DownloadProgressUpdate, onUpdate func(DownloadProgressUpdate), stderr io.Writer) (func(), func(uint64, int64), func(uint64)) {
 	state := initial
 	if state == nil {
 		state = make(map[uint64]ManifestProgress)
 	}
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
+	persistedProgressCh := make(chan persistedProgressUpdate, 1024)
 	metadataDoneCh := make(chan metadataProgressUpdate, 1024)
 
 	writeSnapshot := func() error {
@@ -2717,10 +2749,34 @@ func startProgressWriter(progressPath string, initial map[uint64]ManifestProgres
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		dirty := false
+		hasPersistedState := func() bool {
+			return len(state) > 0
+		}
+		flushSnapshot := func(force bool) {
+			if !force && !dirty {
+				return
+			}
+			if !hasPersistedState() {
+				return
+			}
+			if err := writeSnapshot(); err != nil {
+				fmt.Fprintf(stderr, "progress flush failed: %v\n", err)
+				return
+			}
+			dirty = false
+		}
 		applyProgress := func(update DownloadProgressUpdate) {
 			if onUpdate != nil {
 				onUpdate(update)
 			}
+			prev := state[update.FileID]
+			if update.AckBytes > prev.AckBytes {
+				prev.AckBytes = update.AckBytes
+				state[update.FileID] = prev
+				dirty = true
+			}
+		}
+		applyPersistedProgress := func(update persistedProgressUpdate) {
 			prev := state[update.FileID]
 			if update.AckBytes > prev.AckBytes {
 				prev.AckBytes = update.AckBytes
@@ -2745,6 +2801,8 @@ func startProgressWriter(progressPath string, initial map[uint64]ManifestProgres
 						continue
 					}
 					applyProgress(update)
+				case update := <-persistedProgressCh:
+					applyPersistedProgress(update)
 				case update := <-metadataDoneCh:
 					applyMetadataDone(update)
 				default:
@@ -2756,32 +2814,20 @@ func startProgressWriter(progressPath string, initial map[uint64]ManifestProgres
 			select {
 			case <-stopCh:
 				drainPending()
-				if dirty {
-					if err := writeSnapshot(); err != nil {
-						fmt.Fprintf(stderr, "progress flush failed: %v\n", err)
-					}
-				}
+				flushSnapshot(true)
 				return
 			case update, ok := <-updates:
 				if !ok {
-					if dirty {
-						if err := writeSnapshot(); err != nil {
-							fmt.Fprintf(stderr, "progress flush failed: %v\n", err)
-						}
-					}
+					flushSnapshot(hasPersistedState())
 					return
 				}
 				applyProgress(update)
+			case update := <-persistedProgressCh:
+				applyPersistedProgress(update)
 			case update := <-metadataDoneCh:
 				applyMetadataDone(update)
 			case <-ticker.C:
-				if dirty {
-					if err := writeSnapshot(); err != nil {
-						fmt.Fprintf(stderr, "progress flush failed: %v\n", err)
-					} else {
-						dirty = false
-					}
-				}
+				flushSnapshot(false)
 			}
 		}
 	}()
@@ -2790,16 +2836,23 @@ func startProgressWriter(progressPath string, initial map[uint64]ManifestProgres
 		close(stopCh)
 		<-doneCh
 	}
-	markMetadataDone := func(fileID uint64) {
+	persistProgressAck := func(fileID uint64, ackBytes int64) {
+		update := persistedProgressUpdate{FileID: fileID, AckBytes: ackBytes}
 		select {
 		case <-doneCh:
 			return
-		case metadataDoneCh <- metadataProgressUpdate{FileID: fileID}:
-		default:
-			// Do not block download workers on progress persistence.
+		case persistedProgressCh <- update:
 		}
 	}
-	return stop, markMetadataDone
+	markMetadataDone := func(fileID uint64) {
+		update := metadataProgressUpdate{FileID: fileID}
+		select {
+		case <-doneCh:
+			return
+		case metadataDoneCh <- update:
+		}
+	}
+	return stop, persistProgressAck, markMetadataDone
 }
 
 func refreshCompletedFileMetadata(ctx context.Context, client *Client, manifest *Manifest, fileID uint64, outRoot string, outFile string) error {

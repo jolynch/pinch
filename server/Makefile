@@ -8,7 +8,7 @@ build:
 	CGO_ENABLED=0 go build -a -tags netgo -ldflags='-s -w -extldflags "-static"' -o pinch-server
 
 test: build
-	go test ./...
+	go test -race ./...
 
 fuzz:
 	go test ./internal/filexfer/encoding -run=^$$ -fuzz=FuzzRoundTrip -fuzztime=$(FUZZTIME)
