@@ -1,4 +1,4 @@
-package encoding
+package aead
 
 import (
 	"bytes"
@@ -213,6 +213,27 @@ func TestChunkSizeFromHeader(t *testing.T) {
 	}
 }
 
+func TestAcquireAEADBufferLayout(t *testing.T) {
+	buf, chunkSize, release := acquireAEADBuffer(64 * 1024)
+	defer release()
+
+	if chunkSize != 64*1024 {
+		t.Fatalf("unexpected chunk size: got %d want %d", chunkSize, 64*1024)
+	}
+	if len(buf) != 2*chunkSize+aeadTagSize {
+		t.Fatalf("unexpected buffer len: got %d want %d", len(buf), 2*chunkSize+aeadTagSize)
+	}
+
+	cipherBuf := buf[:chunkSize+aeadTagSize]
+	plainBuf := buf[chunkSize+aeadTagSize:]
+	if len(cipherBuf) != chunkSize+aeadTagSize {
+		t.Fatalf("unexpected cipher buffer len: got %d want %d", len(cipherBuf), chunkSize+aeadTagSize)
+	}
+	if len(plainBuf) != chunkSize {
+		t.Fatalf("unexpected plain buffer len: got %d want %d", len(plainBuf), chunkSize)
+	}
+}
+
 func TestHeaderChunkSizeTamper(t *testing.T) {
 	for _, algorithm := range testAlgorithms {
 		t.Run(algorithmName(algorithm), func(t *testing.T) {
@@ -291,6 +312,26 @@ func TestReadStanzaHeaderRejectsUnsetAlgorithm(t *testing.T) {
 
 	if _, err := Decrypt(bytes.NewReader(raw), id); err == nil {
 		t.Fatal("expected header parse error for unset algorithm")
+	}
+}
+
+func TestDecryptWithOptionsRejectsUnexpectedAlgorithm(t *testing.T) {
+	id, recipient := generateTestIdentity(t)
+
+	var ciphertext bytes.Buffer
+	w, err := Encrypt(&ciphertext, recipient, Options{Algorithm: AlgorithmAES})
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if _, err := w.Write([]byte("tamper me")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if _, err := DecryptWithOptions(bytes.NewReader(ciphertext.Bytes()), id, Options{Algorithm: AlgorithmChaCha20}); err == nil {
+		t.Fatal("expected algorithm mismatch error")
 	}
 }
 

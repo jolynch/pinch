@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/jolynch/pinch/internal/aead"
 	"github.com/jolynch/pinch/internal/filexfer"
-	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	"github.com/jolynch/pinch/internal/filexfer/limit"
 )
 
@@ -31,7 +31,7 @@ type ServerOptions struct {
 	ProgressPath           string        // write transfer % to this file/pipe
 	ProgressInterval       time.Duration // tick interval for progress writes (default 1s)
 	DisableZeroCopy        bool          // force buffered send path even when zero-copy is available
-	TargetIODepth          int           // target IO depth per CPU advertised in PROBE (default 8)
+	TargetIODepth          int           // target IO depth per CPU advertised in PROBE (default 4)
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -162,45 +162,26 @@ func (s *connSession) run() error {
 			return authErr
 		}
 		if authRes.keyExchange {
-			// AUTH key — return the server's public key and close.
-			return writeOKLine(s.respOut, s.serverID.Recipient().String())
+			// AUTH key — return the server's recommended cipher and public key.
+			return writeOKLine(s.respOut, string(aead.RecommendedCipher())+" "+s.serverID.Recipient().String())
 		}
 		if authRes.recipient != nil {
-			switch authRes.encryptMode {
-			case "aes":
-				encOut, encErr := encoding.Encrypt(s.conn, authRes.recipient, encoding.Options{Algorithm: encoding.AlgorithmAES})
-				if encErr != nil {
-					return encErr
-				}
-				s.respOut = encOut
-				s.closeResp = encOut.Close
-			default:
-				encOut, encErr := age.Encrypt(s.conn, authRes.recipient)
-				if encErr != nil {
-					return encErr
-				}
-				s.respOut = encOut
-				s.closeResp = encOut.Close
+			encOut, encErr := aead.Encrypt(s.conn, authRes.recipient, aead.Options{Algorithm: authRes.responseCipher})
+			if encErr != nil {
+				return encErr
 			}
+			s.respOut = encOut
+			s.closeResp = encOut.Close
 		}
 		if authRes.encryptedRequests {
 			if s.serverID == nil {
 				return protocolErr{code: "NOT_AUTHORIZED", message: "server auth key unavailable"}
 			}
-			switch authRes.encryptMode {
-			case "aes":
-				decIn, decErr := encoding.Decrypt(br, s.serverID)
-				if decErr != nil {
-					return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed"}
-				}
-				cmdReader = bufio.NewReader(decIn)
-			default:
-				decIn, decErr := age.Decrypt(br, s.serverID)
-				if decErr != nil {
-					return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed"}
-				}
-				cmdReader = bufio.NewReader(decIn)
+			decIn, decErr := aead.DecryptWithOptions(br, s.serverID, aead.Options{Algorithm: authRes.responseCipher})
+			if decErr != nil {
+				return protocolErr{code: "NOT_AUTHORIZED", message: "request decryption failed"}
 			}
+			cmdReader = bufio.NewReader(decIn)
 		}
 
 		cmdPayload, cmdErr := readCommandLine(cmdReader, maxCommandLineBytes)

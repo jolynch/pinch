@@ -15,5 +15,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+          cache-dependency-path: "**/go.sum"
       - name: Build and test
         run: make acceptance

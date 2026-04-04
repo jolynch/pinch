@@ -1,4 +1,4 @@
-package encoding
+package aead
 
 import (
 	"crypto/aes"
@@ -120,13 +120,12 @@ func Encrypt(dst io.Writer, recipient age.Recipient, opts Options) (io.WriteClos
 	}
 
 	buf, chunkSize, release := acquireAEADBuffer(chunkSize)
-	half := len(buf) / 2
 
 	return &aeadWriter{
 		aead:       aeadCipher,
 		dst:        dst,
-		plainBuf:   buf[:half],
-		sealBuf:    buf[half:],
+		plainBuf:   buf[:chunkSize],
+		sealBuf:    buf[chunkSize:],
 		chunkSize:  chunkSize,
 		backingBuf: buf,
 		releaseBuf: release,
@@ -140,6 +139,16 @@ func Encrypt(dst io.Writer, recipient age.Recipient, opts Options) (io.WriteClos
 //
 // Not goroutine-safe.
 func Decrypt(src io.Reader, identity age.Identity) (io.Reader, error) {
+	return decryptWithOptions(src, identity, Options{})
+}
+
+// DecryptWithOptions creates a streaming AEAD decrypting reader and, when
+// opts.Algorithm is set, requires the ciphertext header to match it.
+func DecryptWithOptions(src io.Reader, identity age.Identity, opts Options) (io.Reader, error) {
+	return decryptWithOptions(src, identity, opts)
+}
+
+func decryptWithOptions(src io.Reader, identity age.Identity, opts Options) (io.Reader, error) {
 	if src == nil {
 		return nil, errors.New("nil source reader")
 	}
@@ -150,6 +159,15 @@ func Decrypt(src io.Reader, identity age.Identity) (io.Reader, error) {
 	algorithm, stanza, chunkSize, err := readStanzaHeader(src)
 	if err != nil {
 		return nil, fmt.Errorf("read stanza header: %w", err)
+	}
+	if opts.Algorithm != "" {
+		expected, err := validateAlgorithm(opts.Algorithm)
+		if err != nil {
+			return nil, err
+		}
+		if algorithm != expected {
+			return nil, fmt.Errorf("unexpected AEAD algorithm: got %q want %q", algorithm, expected)
+		}
 	}
 
 	fileKey, err := identity.Unwrap([]*age.Stanza{stanza})
@@ -163,13 +181,12 @@ func Decrypt(src io.Reader, identity age.Identity) (io.Reader, error) {
 	}
 
 	buf, chunkSize, release := acquireAEADBuffer(chunkSize)
-	half := len(buf) / 2
 
 	return &aeadReader{
 		aead:       aeadCipher,
 		src:        src,
-		cipherBuf:  buf[:half],
-		plainBuf:   buf[half:],
+		cipherBuf:  buf[:chunkSize+aeadTagSize],
+		plainBuf:   buf[chunkSize+aeadTagSize:],
 		chunkSize:  chunkSize,
 		backingBuf: buf,
 		releaseBuf: release,
@@ -290,7 +307,10 @@ func parseAlgorithmID(id byte) (Algorithm, error) {
 
 func acquireAEADBuffer(chunkSize int) ([]byte, int, func()) {
 	chunkSize = Options{ChunkSize: chunkSize}.ResolveChunkSize()
-	bufSize := 2 * (chunkSize + aeadTagSize)
+	// Keep the logical chunk size exact while reserving one tag-sized margin for
+	// ciphertext expansion. A 64 KiB chunk therefore uses a 64 KiB plaintext
+	// working region plus a 64 KiB+tag ciphertext region.
+	bufSize := 2*chunkSize + aeadTagSize
 	pool := aeadBufferPool(bufSize)
 	raw := pool.Get()
 	buf := raw.([]byte)
@@ -522,6 +542,13 @@ func (w *aeadWriter) flushChunk(last bool) error {
 		return err
 	}
 	sealed := w.aead.Seal(w.sealBuf[:0], w.nonce[:], w.plainBuf[:w.plainN], aad[:])
+	// Write 4-byte big-endian length prefix so the reader knows exactly how
+	// many bytes to read for each chunk (no EOF signaling needed).
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(sealed)))
+	if err := writeFull(w.dst, lenBuf[:]); err != nil {
+		return err
+	}
 	if err := writeFull(w.dst, sealed); err != nil {
 		return err
 	}
@@ -601,11 +628,26 @@ func (r *aeadReader) Read(p []byte) (int, error) {
 }
 
 func (r *aeadReader) readChunk() error {
-	sealedSize := r.chunkSize + aeadTagSize
-	n, err := io.ReadFull(r.src, r.cipherBuf[:sealedSize])
+	// Read the 4-byte big-endian length prefix that precedes each sealed chunk.
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r.src, lenBuf[:]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return io.EOF
+		}
+		return fmt.Errorf("read chunk length: %w", err)
+	}
+	sealedLen := int(binary.BigEndian.Uint32(lenBuf[:]))
+	if sealedLen < aeadTagSize || sealedLen > r.chunkSize+aeadTagSize {
+		return fmt.Errorf("invalid sealed chunk length: %d", sealedLen)
+	}
 
-	switch {
-	case err == nil:
+	n, err := io.ReadFull(r.src, r.cipherBuf[:sealedLen])
+	if err != nil {
+		return fmt.Errorf("read sealed chunk: %w", err)
+	}
+
+	fullSize := r.chunkSize + aeadTagSize
+	if n == fullSize {
 		// Full-size read. Try non-final nonce first.
 		r.buildNonce(false)
 		aad, aadErr := buildChunkAAD(r.chunkSize, r.chunkCount, false)
@@ -633,30 +675,22 @@ func (r *aeadReader) readChunk() error {
 		r.done = true
 		r.chunkCount++
 		return nil
-
-	case errors.Is(err, io.ErrUnexpectedEOF) && n > 0:
-		// Short read — must be the final (possibly short) chunk.
-		r.buildNonce(true)
-		aad, aadErr := buildChunkAAD(r.chunkSize, r.chunkCount, true)
-		if aadErr != nil {
-			return aadErr
-		}
-		plaintext, openErr := r.aead.Open(r.plainBuf[:0], r.nonce[:], r.cipherBuf[:n], aad[:])
-		if openErr != nil {
-			return fmt.Errorf("AEAD authentication failed on final chunk: %w", openErr)
-		}
-		r.unread = plaintext
-		r.done = true
-		r.chunkCount++
-		return nil
-
-	case errors.Is(err, io.EOF) && n == 0:
-		// Stream ended without a final chunk — truncated.
-		return io.ErrUnexpectedEOF
-
-	default:
-		return err
 	}
+
+	// Short chunk — must be the final chunk.
+	r.buildNonce(true)
+	aad, aadErr := buildChunkAAD(r.chunkSize, r.chunkCount, true)
+	if aadErr != nil {
+		return aadErr
+	}
+	plaintext, openErr := r.aead.Open(r.plainBuf[:0], r.nonce[:], r.cipherBuf[:n], aad[:])
+	if openErr != nil {
+		return fmt.Errorf("AEAD authentication failed on final chunk: %w", openErr)
+	}
+	r.unread = plaintext
+	r.done = true
+	r.chunkCount++
+	return nil
 }
 
 func (r *aeadReader) buildNonce(last bool) {

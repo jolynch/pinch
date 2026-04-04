@@ -43,30 +43,70 @@ var (
 	fsFileBurst  = "1MiB"
 )
 
+// loadServerAgeIdentity loads an age identity from the key file in dir.
+// It returns the identity if found, or an error if the file exists but is unreadable/invalid.
+// If the key file does not exist, it returns (nil, nil).
 func loadServerAgeIdentity(dir string) (*age.X25519Identity, error) {
 	keyPath := path.Join(dir, "key")
-	if raw, err := os.ReadFile(keyPath); err == nil {
-		lines := strings.Split(string(raw), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			identity, parseErr := age.ParseX25519Identity(line)
-			if parseErr != nil {
-				return nil, fmt.Errorf("invalid existing key file %s: %w", keyPath, parseErr)
-			}
-			return identity, nil
+	raw, err := os.ReadFile(keyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
 		}
-		return nil, fmt.Errorf("existing key file %s has no identity", keyPath)
-	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read key file %s: %w", keyPath, err)
 	}
+	lines := strings.Split(string(raw), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		identity, parseErr := age.ParseX25519Identity(line)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid existing key file %s: %w", keyPath, parseErr)
+		}
+		return identity, nil
+	}
+	return nil, fmt.Errorf("existing key file %s has no identity", keyPath)
+}
 
-	identity, err := age.GenerateX25519Identity()
+// loadOrGenerateServerKey attempts to load a persistent key from dir.
+// If the directory exists and contains a valid key, it returns that key.
+// If the directory exists but the key is unreadable, it returns an error.
+// If the directory does not exist and isDefault is true, it generates an ephemeral in-memory key.
+// If the directory does not exist and isDefault is false (explicitly provided), it returns an error.
+func loadOrGenerateServerKey(dir string, isDefault bool) (*age.X25519Identity, error) {
+	if _, err := os.Stat(dir); err != nil {
+		if os.IsNotExist(err) {
+			if !isDefault {
+				return nil, fmt.Errorf("keys directory %s does not exist", dir)
+			}
+			// Default dir doesn't exist — generate ephemeral key.
+			identity, genErr := age.GenerateX25519Identity()
+			if genErr != nil {
+				return nil, fmt.Errorf("generate ephemeral identity: %w", genErr)
+			}
+			log.Printf("Keys directory not found, using ephemeral in-memory key")
+			return identity, nil
+		}
+		return nil, fmt.Errorf("stat keys directory %s: %w", dir, err)
+	}
+
+	// Directory exists — try to load.
+	identity, err := loadServerAgeIdentity(dir)
+	if err != nil {
+		return nil, err
+	}
+	if identity != nil {
+		return identity, nil
+	}
+
+	// Directory exists but no key file — generate and persist.
+	identity, err = age.GenerateX25519Identity()
 	if err != nil {
 		return nil, fmt.Errorf("generate age identity: %w", err)
 	}
+	keyPath := path.Join(dir, "key")
 	out, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open key file %s: %w", keyPath, err)
@@ -742,6 +782,7 @@ Options:
 	fs.StringVar(&listen, "listen", listen, "")
 	fs.StringVar(&inputDir, "in", inputDir, "")
 	fs.StringVar(&outputDir, "out", outputDir, "")
+	defaultKeysDir := keysDir
 	fs.StringVar(&keysDir, "keys", keysDir, "")
 	fs.IntVar(&tokenLength, "tlen", tokenLength, "")
 	fs.IntVar(&bufSizeBytes, "blen", bufSizeBytes, "")
@@ -763,9 +804,9 @@ Options:
 		log.Fatalf("Could not setup key directory, dying")
 	}
 	var err error
-	serverKey, err = loadServerAgeIdentity(keysDir)
+	serverKey, err = loadOrGenerateServerKey(keysDir, keysDir == defaultKeysDir)
 	if err != nil {
-		log.Fatalf("AGE key setup failed: %v", err)
+		log.Fatalf("Key setup failed: %v", err)
 	}
 	log.Printf("Public key %s", serverKey.Recipient().String())
 
@@ -825,7 +866,7 @@ Options:
   -c, --chroot string         server root directory (default "/")
   -k, --keys string           age keys directory (default "/var/lib/pinch/keys")
       --require-auth          require AUTH before commands
-      --target-io-depth int   target IO depth per CPU advertised in PROBE (default 8)
+      --target-io-depth int   target IO depth per CPU advertised in PROBE (default 4)
       --trace string          write runtime/trace to this file
       --progress-path string           write transfer % to this file/pipe
       --progress-path-interval string  progress write interval (default "1s")
@@ -840,10 +881,11 @@ Options:
 	var chroot string
 	fs.StringVar(&chroot, "chroot", "/", "")
 	fs.StringVar(&chroot, "c", "/", "")
+	defaultKeysDir := keysDir
 	fs.StringVar(&keysDir, "keys", keysDir, "")
 	fs.StringVar(&keysDir, "k", keysDir, "")
 	requireAuth := fs.Bool("require-auth", false, "")
-	targetIODepth := fs.Int("target-io-depth", 8, "")
+	targetIODepth := fs.Int("target-io-depth", 4, "")
 	disableZeroCopy := fs.Bool("disable-zero-copy", false, "")
 	traceFile := fs.String("trace", "", "")
 	var progressFilePath string
@@ -874,12 +916,9 @@ Options:
 		defer trace.Stop()
 	}
 
-	if !makeDirs(keysDir) {
-		log.Fatalf("Could not setup key directory, dying")
-	}
-	serverKey, err = loadServerAgeIdentity(keysDir)
+	serverKey, err = loadOrGenerateServerKey(keysDir, keysDir == defaultKeysDir)
 	if err != nil {
-		log.Fatalf("AGE key setup failed: %v", err)
+		log.Fatalf("Key setup failed: %v", err)
 	}
 	log.Printf("Public key %s", serverKey.Recipient().String())
 

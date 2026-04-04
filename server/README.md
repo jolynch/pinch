@@ -72,7 +72,7 @@ curl localhost:8080/status/${FD} | jq .
 Compression and Encryption
 ==========================
 
-Pinch can also encrypt and decrypt data using `age`.
+Pinch can also encrypt and decrypt data using AEAD (AES-GCM or ChaCha20-Poly1305, auto-detected).
 
 ```bash
 $ curl -s 'localhost:8080/pinch?timeout=100s&age-public-key=age1630vztsaydze8r9qc3e865spc989mvcls3wg7hh9vu2w3luulqlqp0v6wh' | jq .

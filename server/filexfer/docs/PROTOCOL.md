@@ -54,26 +54,35 @@ For this line protocol, token bytes cannot span command newlines.
 
 Three forms:
 
-- `AUTH key` — key exchange: server returns its age public key.
-- `AUTH age <blob>` — age encryption: blob is the client's age public key encrypted with age to the server's public key.
-- `AUTH aes <blob>` — AES-GCM encryption: blob is the client's age public key encrypted with AES-GCM to the server's public key.
+- `AUTH key` — key exchange: server returns its recommended cipher and age public key.
+- `AUTH aes <blob>` — encrypted session setup using AES-GCM.
+- `AUTH chacha20 <blob>` — encrypted session setup using ChaCha20-Poly1305.
 
 `<blob>` is length-prefixed (`<len>:<bytes>`).
 
 ### Key Exchange Flow
 
 1. Client sends `AUTH key\r\n`.
-2. Server responds `OK <server-age-public-key>\r\n` and closes the connection.
-3. Client opens a new connection and sends `AUTH age <blob>\r\n` or `AUTH aes <blob>\r\n`.
+2. Server responds `OK <recommended-cipher> <server-age-public-key>\r\n` and closes the connection.
+3. Client opens a new connection and sends either `AUTH aes <blob>\r\n` or `AUTH chacha20 <blob>\r\n`.
+
+If the client requested `auto`, it first resolves `auto` to the server's
+recommended cipher from step 2 and then uses that resolved value in the second
+connection.
 
 ### Encrypted Connection Flow
 
-After `AUTH age <blob>` or `AUTH aes <blob>`:
+After `AUTH aes <blob>` or `AUTH chacha20 <blob>`:
 
-- Server decrypts blob using its identity to recover the client's age public key.
+- Server treats the first AUTH token (`aes` or `chacha20`) as the session
+  cipher.
+- Server decrypts `<blob>` using its identity and the selected AEAD algorithm
+  to recover the client's age public key.
 - If valid:
-  - subsequent response bytes are encrypted to the client's public key using the selected cipher (age or AES-GCM).
-  - subsequent command bytes from the client must be encrypted to the server's public key using the same cipher.
+  - subsequent command bytes from the client must be encrypted to the server's
+    public key using that same AEAD algorithm.
+  - subsequent response bytes are encrypted to the client's public key using
+    that same AEAD algorithm.
 - If invalid: `ERR NOT_AUTHORIZED authorization failed`.
 
 ### Unencrypted Connection Flow

@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"filippo.io/age"
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 	"github.com/jolynch/pinch/utils"
@@ -92,19 +91,8 @@ func serveFTCPTestConn(conn net.Conn, handler func(intftcp.Request, io.Writer) e
 	closeResponse := func() error { return nil }
 	cmdReq := firstReq
 	if firstReq.Verb == intftcp.VerbAUTH {
-		if len(firstReq.Params) > 0 {
-			blob := strings.TrimSpace(firstReq.Params[0]["blob"])
-			if blob != "" {
-				if recipient, parseErr := age.ParseX25519Recipient(blob); parseErr == nil {
-					ew, encErr := age.Encrypt(conn, recipient)
-					if encErr != nil {
-						return
-					}
-					responseOut = ew
-					closeResponse = ew.Close
-				}
-			}
-		}
+		// The test server doesn't exercise encryption, so just skip the
+		// AUTH blob and read the next command line.
 		cmdLine, cmdErr := readCompatLine(br)
 		if cmdErr != nil {
 			_, _ = io.WriteString(responseOut, "ERR BAD_REQUEST missing command\r\n")
@@ -283,7 +271,7 @@ func buildFXFrameWithTrailerTokens(t *testing.T, fileID uint64, comp string, off
 	trailerTS := headerTS + 1
 	xsum := xxh128HexTest(logical)
 	header := fmt.Sprintf(
-		"FX/1 %d offset=%d size=%d wsize=%d comp=%s enc=none hash=xxh128:%s ts=%d\n",
+		"FX/1 %d offset=%d size=%d wsize=%d comp=%s hash=xxh128:%s ts=%d\n",
 		fileID,
 		offset,
 		len(logical),
@@ -431,24 +419,8 @@ func downloadSingle(ctx context.Context, client *Client, req singleDownloadReque
 	return resp.Files[0], nil
 }
 
-func encryptAgeBlob(t *testing.T, plaintext []byte, recipient age.Recipient) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	w, err := age.Encrypt(&buf, recipient)
-	if err != nil {
-		t.Fatalf("age encrypt setup failed: %v", err)
-	}
-	if _, err := w.Write(plaintext); err != nil {
-		t.Fatalf("age encrypt write failed: %v", err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("age encrypt close failed: %v", err)
-	}
-	return buf.Bytes()
-}
-
 func TestParseFXHeaderMaxWSizeHint(t *testing.T) {
-	meta, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none enc=none hash=xxh128:abc max-wsize=16777216 ts=1000")
+	meta, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none hash=xxh128:abc max-wsize=16777216 ts=1000")
 	if err != nil {
 		t.Fatalf("parseFXHeader failed: %v", err)
 	}
@@ -458,10 +430,10 @@ func TestParseFXHeaderMaxWSizeHint(t *testing.T) {
 }
 
 func TestParseFXHeaderInvalidMaxWSizeHint(t *testing.T) {
-	if _, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none enc=none hash=xxh128:abc max-wsize=-1 ts=1000"); err == nil {
+	if _, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none hash=xxh128:abc max-wsize=-1 ts=1000"); err == nil {
 		t.Fatalf("expected parse error for negative max-wsize")
 	}
-	if _, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none enc=none hash=xxh128:abc max-wsize=nope ts=1000"); err == nil {
+	if _, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none hash=xxh128:abc max-wsize=nope ts=1000"); err == nil {
 		t.Fatalf("expected parse error for malformed max-wsize")
 	}
 }

@@ -166,7 +166,7 @@ type Client struct {
 	Comp                    string // adapt|none|lz4|zstd; empty means server default (adapt)
 	ClientAgePublicKey      string
 	ClientAgeIdentity       string
-	EncryptMode             string // "age" (default) or "aes" — selects post-AUTH stream cipher
+	EncryptMode             string // "auto", "aes", or "chacha20" — selects post-AUTH stream cipher
 
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
@@ -223,7 +223,6 @@ type FileFrameMeta struct {
 	FileID          uint64
 	Comp            string
 	CompCounts      map[string]uint64
-	Enc             string
 	Offset          int64
 	Size            int64
 	WireSize        int64
@@ -316,6 +315,7 @@ type ProbeResponse struct {
 	LinkMbps             int64
 	SuggestedConcurrency int
 	ServerSendBufBytes   int64
+	SuggestedCipher      string // resolved cipher suggested for this connection (e.g. "aes", "chacha20", or "" if none)
 }
 
 type GetManifestResponse struct {
@@ -403,7 +403,7 @@ var ErrFileMissing = errors.New("file missing")
 const (
 	// Window and batch sizes. The window is max in-flight bytes per file; the batch is
 	// the unit of parallel work. parallelism = window / batch.
-	defaultClientRequestWindowBytes      int64 = 1024 * 1024 * 1024
+	defaultClientRequestWindowBytes      int64 = 512 * 1024 * 1024
 	defaultClientMaxFrameReadBufferBytes int   = 64 * 1024 * 1024
 	defaultClientBatchMaxBytes           int64 = 64 * 1024 * 1024
 
@@ -850,7 +850,6 @@ func (c *Client) downloadManifestGroupSequential(
 		meta := FileFrameMeta{
 			FileID: plan.entry.ID,
 			Comp:   "none",
-			Enc:    "none",
 			Offset: plan.resumeFrom,
 		}
 		offset := plan.resumeFrom
@@ -888,7 +887,7 @@ func (c *Client) downloadManifestGroupSequential(
 			}
 
 			payloadReader := io.LimitReader(br, frameMeta.WireSize)
-			logicalReader, decodeErr := decodePayloadReader(payloadReader, frameMeta.Comp, frameMeta.Enc, nil)
+			logicalReader, decodeErr := decodePayloadReader(payloadReader, frameMeta.Comp)
 			if decodeErr != nil {
 				_ = closeWriter()
 				return nil, nil, nil, fmt.Errorf("decode payload reader: %w", decodeErr)
@@ -916,7 +915,6 @@ func (c *Client) downloadManifestGroupSequential(
 			meta.Size += frameMeta.Size
 			meta.WireSize += frameMeta.WireSize
 			meta.Comp = frameMeta.Comp
-			meta.Enc = frameMeta.Enc
 			offset += frameMeta.Size
 
 			trailerLine, trailerReadErr := br.ReadString('\n')
@@ -1487,7 +1485,6 @@ func aggregateSplitWindowResults(
 		Meta: FileFrameMeta{
 			FileID: plan.entry.ID,
 			Comp:   "none",
-			Enc:    "none",
 			Offset: plan.resumeFrom,
 		},
 	}
@@ -1506,7 +1503,6 @@ func aggregateSplitWindowResults(
 		aggregate.Meta.WireSize += meta.WireSize
 		if idx == 0 {
 			aggregate.Meta.Comp = meta.Comp
-			aggregate.Meta.Enc = meta.Enc
 		}
 		if len(meta.CompCounts) > 0 {
 			if aggregate.Meta.CompCounts == nil {
@@ -1804,6 +1800,12 @@ func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse
 	}
 	response := summarizeProbeSamples(probeResults, probeBytes)
 	response.SuggestedConcurrency = clampConcurrency(suggestedConcurrencyFromProbe(response.ServerCPU, response.ServerIODepth, loadStrategy))
+
+	// Resolve the cipher name for display. If encryption is enabled,
+	// resolveTCPAuthState resolves "auto" to the server's recommendation.
+	if authState, authErr := c.resolveTCPAuthState(ctx); authErr == nil && authState.hasAuth {
+		response.SuggestedCipher = authState.encMode
+	}
 	return response, nil
 }
 
@@ -2549,10 +2551,9 @@ func (s *fileStream) openNextFrame() error {
 	if s.expectOffset && meta.Offset != s.expectedOffset {
 		return fmt.Errorf("non-contiguous frame offset: expected=%d got=%d", s.expectedOffset, meta.Offset)
 	}
-	if s.meta.FileID == 0 && s.meta.Comp == "" && s.meta.Enc == "" && s.meta.Size == 0 && s.meta.WireSize == 0 {
+	if s.meta.FileID == 0 && s.meta.Comp == "" && s.meta.Size == 0 && s.meta.WireSize == 0 {
 		s.meta.FileID = meta.FileID
 		s.meta.Comp = meta.Comp
-		s.meta.Enc = meta.Enc
 		s.meta.Offset = meta.Offset
 		s.meta.MaxWireSizeHint = meta.MaxWireSizeHint
 		s.meta.HeaderTS = meta.HeaderTS
@@ -2560,13 +2561,10 @@ func (s *fileStream) openNextFrame() error {
 		if meta.FileID != s.meta.FileID {
 			return fmt.Errorf("file id mismatch across frames: expected=%d got=%d", s.meta.FileID, meta.FileID)
 		}
-		if meta.Enc != s.meta.Enc {
-			return fmt.Errorf("encryption mode mismatch across frames: expected=%s got=%s", s.meta.Enc, meta.Enc)
-		}
 	}
 
 	payloadReader := io.LimitReader(s.br, meta.WireSize)
-	logicalReader, err := decodePayloadReader(payloadReader, meta.Comp, meta.Enc, s.identity)
+	logicalReader, err := decodePayloadReader(payloadReader, meta.Comp)
 	if err != nil {
 		return fmt.Errorf("decode payload reader: %w", err)
 	}
@@ -2650,7 +2648,6 @@ func parseFXHeader(line string) (FileFrameMeta, error) {
 	}
 
 	comp := props["comp"]
-	enc := props["enc"]
 	offset, err := parseHeaderInt(props["offset"], "offset")
 	if err != nil {
 		return FileFrameMeta{}, err
@@ -2680,13 +2677,12 @@ func parseFXHeader(line string) (FileFrameMeta, error) {
 	if ts < 0 {
 		return FileFrameMeta{}, errors.New("invalid header ts")
 	}
-	if comp == "" || enc == "" {
+	if comp == "" {
 		return FileFrameMeta{}, errors.New("missing required frame properties")
 	}
 	return FileFrameMeta{
 		FileID:          fileID,
 		Comp:            comp,
-		Enc:             enc,
 		Offset:          offset,
 		Size:            size,
 		WireSize:        wsize,
@@ -2859,34 +2855,7 @@ func validHashToken(raw string) bool {
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
-func decodePayloadReader(payload io.Reader, comp string, enc string, identity age.Identity) (io.ReadCloser, error) {
-	switch enc {
-	case "none":
-		return decodePayloadReaderByComp(payload, comp)
-	case "age":
-		if identity == nil {
-			return nil, errors.New("missing age identity for encrypted frame")
-		}
-		decrypted, err := age.Decrypt(payload, identity)
-		if err != nil {
-			return nil, err
-		}
-		return decodePayloadReaderByComp(decrypted, comp)
-	case "aes":
-		if identity == nil {
-			return nil, errors.New("missing identity for AES encrypted frame")
-		}
-		decrypted, err := intencoding.Decrypt(payload, identity)
-		if err != nil {
-			return nil, err
-		}
-		return decodePayloadReaderByComp(decrypted, comp)
-	default:
-		return nil, fmt.Errorf("unsupported encryption mode: %s", enc)
-	}
-}
-
-func decodePayloadReaderByComp(payload io.Reader, comp string) (io.ReadCloser, error) {
+func decodePayloadReader(payload io.Reader, comp string) (io.ReadCloser, error) {
 	switch comp {
 	case "none":
 		return io.NopCloser(payload), nil

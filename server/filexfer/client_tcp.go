@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"filippo.io/age"
-	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/internal/aead"
 	ftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 )
 
@@ -28,7 +28,7 @@ type tcpAuthState struct {
 	parsedIdentity age.Identity
 	serverKey      string // server's age public key (discovered via AUTH key)
 	hasAuth        bool
-	encMode        string // "age" or "aes"
+	encMode        string // resolved cipher: "aes" or "chacha20"
 }
 
 type probeResponse struct {
@@ -163,7 +163,7 @@ func (c *Client) resolveTCPAuthState(ctx context.Context) (tcpAuthState, error) 
 	if encMode == "" || encMode == "none" {
 		return tcpAuthState{}, nil
 	}
-	if encMode != "age" && encMode != "aes" {
+	if encMode != "auto" && encMode != "aes" && encMode != "chacha20" {
 		return tcpAuthState{}, fmt.Errorf("unsupported encrypt mode: %s", encMode)
 	}
 
@@ -184,10 +184,15 @@ func (c *Client) resolveTCPAuthState(ctx context.Context) (tcpAuthState, error) 
 		return tcpAuthState{}, err
 	}
 
-	// Discover the server's public key via AUTH key.
-	serverKey, err := c.discoverServerKey(ctx)
+	// Discover the server's public key and recommended cipher via AUTH key.
+	recommendedCipher, serverKey, err := c.discoverServerKey(ctx)
 	if err != nil {
 		return tcpAuthState{}, fmt.Errorf("discover server key: %w", err)
+	}
+
+	// Resolve "auto" to the server's recommended cipher.
+	if encMode == "auto" {
+		encMode = recommendedCipher
 	}
 
 	return tcpAuthState{
@@ -201,36 +206,42 @@ func (c *Client) resolveTCPAuthState(ctx context.Context) (tcpAuthState, error) 
 }
 
 // discoverServerKey sends AUTH key on a fresh connection and reads back the
-// server's age public key from the OK response.
-func (c *Client) discoverServerKey(ctx context.Context) (string, error) {
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return "", fmt.Errorf("dial for key exchange: %w", err)
+// server's recommended cipher and public key from the OK response.
+// Response format: "OK <cipher> <pubkey>\r\n"
+func (c *Client) discoverServerKey(ctx context.Context) (recommendedCipher string, serverKey string, err error) {
+	conn, dialErr := c.dialTCP(ctx)
+	if dialErr != nil {
+		return "", "", fmt.Errorf("dial for key exchange: %w", dialErr)
 	}
 	defer conn.Close()
 	if err := writeTCPLine(conn, "AUTH key"); err != nil {
-		return "", err
+		return "", "", err
 	}
 	br := bufio.NewReader(conn)
 	line, err := readTCPLine(br, maxTCPLineBytes)
 	if err != nil {
-		return "", fmt.Errorf("read key exchange response: %w", err)
+		return "", "", fmt.Errorf("read key exchange response: %w", err)
 	}
 	msg, ok := parseOKStatusLine(line)
 	if !ok {
 		if lineErr := parseErrControlFrame(line); lineErr != nil {
-			return "", lineErr
+			return "", "", lineErr
 		}
-		return "", fmt.Errorf("unexpected key exchange response: %s", line)
+		return "", "", fmt.Errorf("unexpected key exchange response: %s", line)
 	}
-	key := strings.TrimSpace(msg)
-	if key == "" {
-		return "", errors.New("server returned empty public key")
+	parts := strings.Fields(msg)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("malformed AUTH key response: expected '<cipher> <pubkey>', got %q", msg)
+	}
+	cipher := parts[0]
+	key := parts[1]
+	if cipher != "aes" && cipher != "chacha20" {
+		return "", "", fmt.Errorf("unsupported server cipher: %s", cipher)
 	}
 	if _, err := age.ParseX25519Recipient(key); err != nil {
-		return "", fmt.Errorf("invalid server public key: %w", err)
+		return "", "", fmt.Errorf("invalid server public key: %w", err)
 	}
-	return key, nil
+	return cipher, key, nil
 }
 
 func (c *Client) sendTCPAuth(conn net.Conn, state tcpAuthState) error {
@@ -241,48 +252,31 @@ func (c *Client) sendTCPAuth(conn net.Conn, state tcpAuthState) error {
 	if err != nil {
 		return fmt.Errorf("parse server key: %w", err)
 	}
-	// Encrypt the client's public key to the server.
+	// Encrypt the client's public key to the server using AEAD.
 	encrypted := c.acquireScratchBuffer(0)
 	defer c.releaseScratchBuffer(encrypted)
-	switch state.encMode {
-	case "aes":
-		ew, encErr := intencoding.Encrypt(encrypted, recipient, intencoding.Options{Algorithm: intencoding.AlgorithmAES})
-		if encErr != nil {
-			return encErr
-		}
-		if _, err := ew.Write([]byte(state.publicKey)); err != nil {
-			return err
-		}
-		if err := ew.Close(); err != nil {
-			return err
-		}
-	default:
-		ew, encErr := age.Encrypt(encrypted, recipient)
-		if encErr != nil {
-			return encErr
-		}
-		if _, err := ew.Write([]byte(state.publicKey)); err != nil {
-			return err
-		}
-		if err := ew.Close(); err != nil {
-			return err
-		}
+	ew, encErr := aead.Encrypt(encrypted, recipient, aeadOptionsForMode(state.encMode))
+	if encErr != nil {
+		return encErr
+	}
+	if _, err := ew.Write([]byte(state.publicKey)); err != nil {
+		return err
+	}
+	if err := ew.Close(); err != nil {
+		return err
 	}
 	encoded := base64.StdEncoding.EncodeToString(encrypted.Bytes())
 	return writeTCPLine(conn, "AUTH "+state.encMode+" "+encoded)
 }
 
-// halfCloseWrite sends TCP FIN for the write direction only, signaling EOF to
-// the remote reader while keeping the connection open for reading responses.
-// This is required for age-encrypted requests: age's DecryptReader performs an
-// extra Read after the final chunk to confirm EOF, which would deadlock on a
-// duplex connection that stays open.
-func halfCloseWrite(conn net.Conn) {
-	type writeHalfCloser interface {
-		CloseWrite() error
-	}
-	if wc, ok := conn.(writeHalfCloser); ok {
-		_ = wc.CloseWrite()
+func aeadOptionsForMode(mode string) aead.Options {
+	switch mode {
+	case "aes":
+		return aead.Options{Algorithm: aead.AlgorithmAES}
+	case "chacha20":
+		return aead.Options{Algorithm: aead.AlgorithmChaCha20}
+	default:
+		return aead.Options{} // RecommendedCipher
 	}
 }
 
@@ -294,13 +288,7 @@ func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload strin
 	if err != nil {
 		return err
 	}
-	var ew io.WriteCloser
-	switch state.encMode {
-	case "aes":
-		ew, err = intencoding.Encrypt(conn, recipient, intencoding.Options{Algorithm: intencoding.AlgorithmAES})
-	default:
-		ew, err = age.Encrypt(conn, recipient)
-	}
+	ew, err := aead.Encrypt(conn, recipient, aeadOptionsForMode(state.encMode))
 	if err != nil {
 		return err
 	}
@@ -308,11 +296,7 @@ func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload strin
 		_ = ew.Close()
 		return err
 	}
-	if err := ew.Close(); err != nil {
-		return err
-	}
-	halfCloseWrite(conn)
-	return nil
+	return ew.Close()
 }
 
 func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Reader, error) {
@@ -321,22 +305,13 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 	}
 	identity := state.parsedIdentity
 	if identity == nil {
-		return nil, errors.New("missing age identity for encrypted response")
+		return nil, errors.New("missing identity for encrypted response")
 	}
-	switch state.encMode {
-	case "aes":
-		decReader, err := intencoding.Decrypt(conn, identity)
-		if err != nil {
-			return nil, fmt.Errorf("aes decryption failed: %w", err)
-		}
-		return decReader, nil
-	default:
-		decReader, err := age.Decrypt(conn, identity)
-		if err != nil {
-			return nil, err
-		}
-		return decReader, nil
+	decReader, err := aead.Decrypt(conn, identity)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %w", err)
 	}
+	return decReader, nil
 }
 
 func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
@@ -752,13 +727,7 @@ func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, pro
 	if err != nil {
 		return err
 	}
-	var ew io.WriteCloser
-	switch state.encMode {
-	case "aes":
-		ew, err = intencoding.Encrypt(conn, recipient, intencoding.Options{Algorithm: intencoding.AlgorithmAES})
-	default:
-		ew, err = age.Encrypt(conn, recipient)
-	}
+	ew, err := aead.Encrypt(conn, recipient, aeadOptionsForMode(state.encMode))
 	if err != nil {
 		return err
 	}
@@ -770,11 +739,7 @@ func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, pro
 		_ = ew.Close()
 		return err
 	}
-	if err := ew.Close(); err != nil {
-		return err
-	}
-	halfCloseWrite(conn)
-	return nil
+	return ew.Close()
 }
 
 type firstReadTimestampReader struct {

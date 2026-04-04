@@ -1093,8 +1093,8 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		return 1
 	}
 	cipherDisplay := "none"
-	if probeResult.Cipher != "" {
-		cipherDisplay = probeResult.Cipher
+	if probeResult.SuggestedCipher != "" {
+		cipherDisplay = probeResult.SuggestedCipher
 	}
 	fmt.Fprintf(
 		stdout,
@@ -2478,10 +2478,6 @@ func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer)
 	}
 }
 
-func parseFileID(raw string) (uint64, error) {
-	return strconv.ParseUint(raw, 10, 64)
-}
-
 type noOpWriteCloser struct {
 	io.Writer
 }
@@ -2599,21 +2595,6 @@ func applyProgressStateToManifest(manifest *Manifest, state map[uint64]ManifestP
 	}
 }
 
-func applyProgressUpdateToManifest(manifest *Manifest, update DownloadProgressUpdate) {
-	if manifest == nil {
-		return
-	}
-	for i := range manifest.Entries {
-		if manifest.Entries[i].ID != update.FileID {
-			continue
-		}
-		if update.AckBytes > manifest.Entries[i].Progress.AckBytes {
-			manifest.Entries[i].Progress.AckBytes = update.AckBytes
-		}
-		return
-	}
-}
-
 func manifestEntriesByID(manifest *Manifest) map[uint64]ManifestEntry {
 	if manifest == nil || len(manifest.Entries) == 0 {
 		return nil
@@ -2623,18 +2604,6 @@ func manifestEntriesByID(manifest *Manifest) map[uint64]ManifestEntry {
 		entries[entry.ID] = entry
 	}
 	return entries
-}
-
-func markManifestEntryMetadataDone(manifest *Manifest, fileID uint64) {
-	if manifest == nil {
-		return
-	}
-	for i := range manifest.Entries {
-		if manifest.Entries[i].ID == fileID {
-			manifest.Entries[i].Progress.MetadataDone = true
-			return
-		}
-	}
 }
 
 func loadProgressState(progressPath string) (map[uint64]ManifestProgress, error) {

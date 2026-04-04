@@ -568,7 +568,7 @@ func buildFrameHeaderLine(fileID uint64, offset int64, size int64, wireSize int6
 			" offset=" + strconv.FormatInt(offset, 10) +
 			" size=" + strconv.FormatInt(size, 10) +
 			" wsize=" + strconv.FormatInt(wireSize, 10) +
-			" comp=" + comp + " enc=none hash=" + placeholderHeaderHashToken +
+			" comp=" + comp + " hash=" + placeholderHeaderHashToken +
 			" max-wsize=" + strconv.FormatInt(*maxWSizeHint, 10) +
 			" ts=" + strconv.FormatInt(ts, 10) + "\n"
 	}
@@ -576,7 +576,7 @@ func buildFrameHeaderLine(fileID uint64, offset int64, size int64, wireSize int6
 		" offset=" + strconv.FormatInt(offset, 10) +
 		" size=" + strconv.FormatInt(size, 10) +
 		" wsize=" + strconv.FormatInt(wireSize, 10) +
-		" comp=" + comp + " enc=none hash=" + placeholderHeaderHashToken +
+		" comp=" + comp + " hash=" + placeholderHeaderHashToken +
 		" ts=" + strconv.FormatInt(ts, 10) + "\n"
 }
 

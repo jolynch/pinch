@@ -133,7 +133,6 @@ func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error
 			Size:       rangeSize,
 			WSize:      0,
 			Comp:       "none",
-			Enc:        "none",
 			HeaderHash: headerHash,
 			HeaderTS:   headerTS,
 			TrailerTS:  trailerTS,

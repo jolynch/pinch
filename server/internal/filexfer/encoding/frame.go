@@ -90,7 +90,6 @@ type WriteArgs struct {
 	Size         int64
 	WSize        int64
 	Comp         string
-	Enc          string
 	HeaderHash   string
 	MaxWSizeHint *int64
 	HeaderTS     int64
@@ -112,13 +111,13 @@ func WriteFrame(w io.Writer, args WriteArgs) (WriteStats, error) {
 	header := ""
 	if args.MaxWSizeHint != nil {
 		header = fmt.Sprintf(
-			"FX/1 %d offset=%d size=%d wsize=%d comp=%s enc=%s hash=%s max-wsize=%d ts=%d\n",
-			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.Enc, args.HeaderHash, *args.MaxWSizeHint, args.HeaderTS,
+			"FX/1 %d offset=%d size=%d wsize=%d comp=%s hash=%s max-wsize=%d ts=%d\n",
+			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.HeaderHash, *args.MaxWSizeHint, args.HeaderTS,
 		)
 	} else {
 		header = fmt.Sprintf(
-			"FX/1 %d offset=%d size=%d wsize=%d comp=%s enc=%s hash=%s ts=%d\n",
-			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.Enc, args.HeaderHash, args.HeaderTS,
+			"FX/1 %d offset=%d size=%d wsize=%d comp=%s hash=%s ts=%d\n",
+			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.HeaderHash, args.HeaderTS,
 		)
 	}
 	if _, err := w.Write([]byte(header)); err != nil {
@@ -177,7 +176,6 @@ func WriteFrame(w io.Writer, args WriteArgs) (WriteStats, error) {
 type FileFrameMeta struct {
 	FileID          uint64
 	Comp            string
-	Enc             string
 	Offset          int64
 	Size            int64
 	WireSize        int64
@@ -213,7 +211,6 @@ func ParseFXHeader(line string) (FileFrameMeta, error) {
 	}
 
 	comp := props["comp"]
-	enc := props["enc"]
 	offset, err := parseHeaderInt(props["offset"], "offset")
 	if err != nil {
 		return FileFrameMeta{}, err
@@ -243,13 +240,12 @@ func ParseFXHeader(line string) (FileFrameMeta, error) {
 	if ts < 0 {
 		return FileFrameMeta{}, errors.New("invalid header ts")
 	}
-	if comp == "" || enc == "" {
+	if comp == "" {
 		return FileFrameMeta{}, errors.New("missing required frame properties")
 	}
 	return FileFrameMeta{
 		FileID:          fileID,
 		Comp:            comp,
-		Enc:             enc,
 		Offset:          offset,
 		Size:            size,
 		WireSize:        wsize,

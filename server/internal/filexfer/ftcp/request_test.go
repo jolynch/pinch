@@ -31,6 +31,31 @@ func TestParseRequestSENDMinimal(t *testing.T) {
 	}
 }
 
+func TestParseRequestAUTHChaCha20(t *testing.T) {
+	req, err := ParseRequest([]byte(`AUTH chacha20 abc123`))
+	if err != nil {
+		t.Fatalf("ParseRequest err: %v", err)
+	}
+	if req.Verb != VerbAUTH {
+		t.Fatalf("verb=%v", req.Verb)
+	}
+	if len(req.Params) != 1 {
+		t.Fatalf("params len=%d", len(req.Params))
+	}
+	if got := req.Params[0]["protocol"]; got != "chacha20" {
+		t.Fatalf("unexpected protocol: %q", got)
+	}
+	if got := req.Params[0]["blob"]; got != "abc123" {
+		t.Fatalf("unexpected blob: %q", got)
+	}
+}
+
+func TestParseRequestAUTHRejectsUnexpectedArguments(t *testing.T) {
+	if _, err := ParseRequest([]byte(`AUTH aes abc123 mode=chacha20`)); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestParseRequestSENDMultipleBlocksWithOptions(t *testing.T) {
 	payload := []byte(`SEND tx1 fd=42 "/tmp/a.txt" offset=10 size=20 comp=none foo=bar fd=77 10:/tmp/b.txt size=99`)
 	req, err := ParseRequest(payload)
