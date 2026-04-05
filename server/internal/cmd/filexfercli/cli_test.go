@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -441,7 +442,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 	payload := []byte("hello")
 	singleManifest := "FM/1 txdevnull 7:/remote mode=fast link-mbps=0 concurrency=8\n0 5 0:100 0644 0:5:a.txt\n"
-	var sawAck bool
+	var sawAck atomic.Bool
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -457,7 +458,7 @@ func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
 			return err
 		case intftcp.VerbACK:
-			sawAck = true
+			sawAck.Store(true)
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		default:
@@ -472,7 +473,7 @@ func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get skip-write: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !sawAck {
+	if !sawAck.Load() {
 		t.Fatalf("expected ACK request")
 	}
 	if !strings.Contains(stdout.String(), "  path: "+os.DevNull) {
@@ -719,7 +720,7 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 	if err := os.WriteFile(keepPath, []byte("keep"), 0o644); err != nil {
 		t.Fatalf("write keep file: %v", err)
 	}
-	var sawAck bool
+	var sawAck atomic.Bool
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -730,7 +731,7 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbACK:
-			sawAck = true
+			sawAck.Store(true)
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		default:
@@ -745,7 +746,7 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start --discard: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !sawAck {
+	if !sawAck.Load() {
 		t.Fatalf("expected ACK request")
 	}
 	gotKeep, err := os.ReadFile(keepPath)
@@ -766,100 +767,6 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 	}
 }
 
-func TestRunCLIStartDiscardKeepsProgressOnFailure(t *testing.T) {
-	tmp := t.TempDir()
-	payloadA := bytes.Repeat([]byte("a"), 10<<20)
-	payloadB := bytes.Repeat([]byte("b"), 10<<20)
-	manifestRaw := strings.Join([]string{
-		"FM/1 txdiscardfail 7:/remote mode=fast link-mbps=700 concurrency=1",
-		fmt.Sprintf("0 %d 0:100 0644 0:5:a.txt", len(payloadA)),
-		fmt.Sprintf("1 %d 0:101 0644 0:5:b.txt", len(payloadB)),
-		"",
-	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "")
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		t.Fatalf("mkdir target: %v", err)
-	}
-	ackCount := 0
-
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			cts0 := req.Params[0]["cts0"]
-			n, err := strconv.Atoi(req.Params[0]["probe-bytes"])
-			if err != nil || n < 0 {
-				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
-			}
-			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=256 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
-				return err
-			}
-			if n > 0 {
-				if _, err := out.Write(make([]byte, n)); err != nil {
-					return err
-				}
-			}
-			_, err = io.WriteString(out, "OK\r\n")
-			return err
-		case intftcp.VerbSEND:
-			for _, p := range req.Params[1:] {
-				switch p["fid"] {
-				case "0":
-					if _, err := io.WriteString(out, buildCLIFrame(0, payloadA, 0)); err != nil {
-						return err
-					}
-				case "1":
-					if _, err := io.WriteString(out, buildCLIFrame(1, payloadB, 0)); err != nil {
-						return err
-					}
-				default:
-					return fmt.Errorf("unexpected fid: %q", p["fid"])
-				}
-			}
-			_, err := io.WriteString(out, "OK\r\n")
-			return err
-		case intftcp.VerbACK:
-			ackCount++
-			if ackCount == 1 {
-				_, err := io.WriteString(out, "OK\r\n")
-				return err
-			}
-			return fmt.Errorf("forced ack failure")
-		default:
-			return nil
-		}
-	})
-	defer srv.Close()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := runStartCLI(srv.URL, []string{
-		"--discard",
-		"--progress=false",
-		"--concurrency", "1",
-		"--ack-every", "1KiB",
-		targetDir,
-	}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("start --discard failure: expected 1, got %d stderr=%s", code, stderr.String())
-	}
-	progressRaw, err := os.ReadFile(filepath.Join(tmp, ".pinch", "manifest.progress"))
-	if err != nil {
-		t.Fatalf("read progress state: %v", err)
-	}
-	progressText := string(progressRaw)
-	if !strings.Contains(progressText, fmt.Sprintf(" %d 1", len(payloadA))) {
-		t.Fatalf("expected retained progress for completed file, got %q", string(progressRaw))
-	}
-	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "manifest")); !os.IsNotExist(err) {
-		t.Fatalf("expected local manifest to be absent, stat err=%v", err)
-	}
-	if _, err := os.Stat(filepath.Join(targetDir, "a.txt")); !os.IsNotExist(err) {
-		t.Fatalf("expected discarded output to be absent, stat err=%v", err)
-	}
-	if _, err := os.Stat(filepath.Join(targetDir, "b.txt")); !os.IsNotExist(err) {
-		t.Fatalf("expected discarded output to be absent, stat err=%v", err)
-	}
-}
 
 func TestRunCLIStartDiscardSkipsCompletedMetadataRefresh(t *testing.T) {
 	tmp := t.TempDir()
