@@ -27,7 +27,6 @@ const defaultFileFrameLogicalSize int64 = 4 * 1024 * 1024
 const defaultCompressedFrameBufferBytes = 4 * 1024 * 1024
 const defaultMaxLinuxPipeSizeBytes int64 = 1 * 1024 * 1024
 const maxCompressedFrameBufferPoolBytes = 32 * 1024 * 1024
-const placeholderHeaderHashToken = "xxh128:00000000000000000000000000000000"
 const loadStrategyFast = "fast"
 const loadStrategyGentle = "gentle"
 
@@ -589,7 +588,7 @@ func buildFrameHeaderLine(fileID uint64, offset int64, size int64, wireSize int6
 			" offset=" + strconv.FormatInt(offset, 10) +
 			" size=" + strconv.FormatInt(size, 10) +
 			" wsize=" + strconv.FormatInt(wireSize, 10) +
-			" comp=" + comp + " hash=" + placeholderHeaderHashToken +
+			" comp=" + comp +
 			" max-wsize=" + strconv.FormatInt(*maxWSizeHint, 10) +
 			" ts=" + strconv.FormatInt(ts, 10) + "\n"
 	}
@@ -597,7 +596,7 @@ func buildFrameHeaderLine(fileID uint64, offset int64, size int64, wireSize int6
 		" offset=" + strconv.FormatInt(offset, 10) +
 		" size=" + strconv.FormatInt(size, 10) +
 		" wsize=" + strconv.FormatInt(wireSize, 10) +
-		" comp=" + comp + " hash=" + placeholderHeaderHashToken +
+		" comp=" + comp +
 		" ts=" + strconv.FormatInt(ts, 10) + "\n"
 }
 

@@ -861,7 +861,7 @@ Start the file transfer TCP server.
 
 Options:
   -l, --listen string         listen address (default "127.0.0.1:3453")
-  -b, --bwlimit string        response rate limit (e.g. 100MiB, 1000mbps)
+  -b, --bwlimit string        response rate limit for gentle transfers only; fast transfers do not respect it (e.g. 100MiB, 1000mbps)
       --bwlimit-burst string  rate limit burst size (default "1MiB")
   -c, --chroot string         server root directory (default "/")
   -k, --keys string           age keys directory (default "/var/lib/pinch/keys")
