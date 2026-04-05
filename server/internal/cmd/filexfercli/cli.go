@@ -2335,6 +2335,10 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	stopProgress()
 	progressStopped = true
 	applyProgressStateToManifest(manifest, progressState)
+	if err := saveProgressState(ps.ProgressPath, progressState); err != nil {
+		fmt.Fprintf(stderr, "save progress state failed: %v\n", err)
+		return 1
+	}
 	failuresMu.Lock()
 	finalFailures := append([]error(nil), failures...)
 	failuresMu.Unlock()
@@ -2660,6 +2664,46 @@ func loadProgressState(progressPath string) (map[uint64]ManifestProgress, error)
 	return state, nil
 }
 
+func saveProgressState(progressPath string, state map[uint64]ManifestProgress) error {
+	if len(state) == 0 {
+		if err := os.Remove(progressPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	dir := filepath.Dir(progressPath)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	tmpPath := progressPath + ".tmp"
+	fd, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+	ids := make([]uint64, 0, len(state))
+	for fileID := range state {
+		ids = append(ids, fileID)
+	}
+	slices.Sort(ids)
+	for _, fileID := range ids {
+		entry := state[fileID]
+		metaDone := 0
+		if entry.MetadataDone {
+			metaDone = 1
+		}
+		if _, err := fmt.Fprintf(fd, "%d %d %d\n", fileID, entry.AckBytes, metaDone); err != nil {
+			_ = fd.Close()
+			return err
+		}
+	}
+	if err := fd.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, progressPath)
+}
+
 type metadataProgressUpdate struct {
 	FileID uint64
 }
@@ -2680,37 +2724,7 @@ func startProgressWriter(progressPath string, initial map[uint64]ManifestProgres
 	metadataDoneCh := make(chan metadataProgressUpdate, 1024)
 
 	writeSnapshot := func() error {
-		dir := filepath.Dir(progressPath)
-		if dir != "." && dir != "" {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return err
-			}
-		}
-		tmpPath := progressPath + ".tmp"
-		fd, err := os.Create(tmpPath)
-		if err != nil {
-			return err
-		}
-		ids := make([]uint64, 0, len(state))
-		for fileID := range state {
-			ids = append(ids, fileID)
-		}
-		slices.Sort(ids)
-		for _, fileID := range ids {
-			entry := state[fileID]
-			metaDone := 0
-			if entry.MetadataDone {
-				metaDone = 1
-			}
-			if _, err := fmt.Fprintf(fd, "%d %d %d\n", fileID, entry.AckBytes, metaDone); err != nil {
-				_ = fd.Close()
-				return err
-			}
-		}
-		if err := fd.Close(); err != nil {
-			return err
-		}
-		return os.Rename(tmpPath, progressPath)
+		return saveProgressState(progressPath, state)
 	}
 
 	go func() {
