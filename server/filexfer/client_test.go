@@ -324,8 +324,8 @@ type singleDownloadRequest struct {
 	FileID          uint64
 	OutRoot         string
 	OutFile         string
-	Stdout        io.Writer
-	AckEveryBytes int64
+	Stdout          io.Writer
+	AckEveryBytes   int64
 	ResumeFromBytes int64
 	NoSync          bool
 	ProgressUpdates chan<- DownloadProgressUpdate
@@ -420,7 +420,7 @@ func downloadSingle(ctx context.Context, client *Client, req singleDownloadReque
 }
 
 func TestParseFXHeaderMaxWSizeHint(t *testing.T) {
-	meta, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none hash=xxh128:abc max-wsize=16777216 ts=1000")
+	meta, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none max-wsize=16777216 ts=1000")
 	if err != nil {
 		t.Fatalf("parseFXHeader failed: %v", err)
 	}
@@ -430,10 +430,10 @@ func TestParseFXHeaderMaxWSizeHint(t *testing.T) {
 }
 
 func TestParseFXHeaderInvalidMaxWSizeHint(t *testing.T) {
-	if _, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none hash=xxh128:abc max-wsize=-1 ts=1000"); err == nil {
+	if _, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none max-wsize=-1 ts=1000"); err == nil {
 		t.Fatalf("expected parse error for negative max-wsize")
 	}
-	if _, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none hash=xxh128:abc max-wsize=nope ts=1000"); err == nil {
+	if _, err := parseFXHeader("FX/1 7 offset=0 size=5 wsize=5 comp=none max-wsize=nope ts=1000"); err == nil {
 		t.Fatalf("expected parse error for malformed max-wsize")
 	}
 }
@@ -520,7 +520,6 @@ func TestFileStreamBufferHint(t *testing.T) {
 		t.Fatalf("expected clamp via effective policy, got=%d want=%d", got, effectiveFrameReadBufferSize(0, 4*1024*1024, 1))
 	}
 }
-
 
 func TestDownloadFileFromManifestWritesToOutRoot(t *testing.T) {
 	outRoot := t.TempDir()
@@ -1804,4 +1803,3 @@ func FuzzSuggestBatchMaxBytes(f *testing.F) {
 		}
 	})
 }
-

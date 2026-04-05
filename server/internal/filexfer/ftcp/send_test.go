@@ -153,6 +153,16 @@ func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {
 	}
 }
 
+func TestBuildFrameHeaderLineOmitsPlaceholderHash(t *testing.T) {
+	header := buildFrameHeaderLine(7, 0, 5, 5, "none", nil, 1000)
+	if strings.Contains(header, " hash=") {
+		t.Fatalf("expected FTCP SEND header to omit placeholder hash, got %q", header)
+	}
+	if !strings.Contains(header, " comp=none ts=1000") {
+		t.Fatalf("unexpected header contents: %q", header)
+	}
+}
+
 func TestParseSENDRequestModeDefaultsAndValidation(t *testing.T) {
 	req, err := ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt"`))
 	if err != nil {
