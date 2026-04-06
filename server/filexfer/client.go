@@ -22,6 +22,7 @@ import (
 
 	"filippo.io/age"
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	intlimit "github.com/jolynch/pinch/internal/filexfer/limit"
 	"github.com/jolynch/pinch/utils"
 	"github.com/zeebo/xxh3"
 )
@@ -36,6 +37,13 @@ const (
 	LoadStrategyFast   = "fast"
 	LoadStrategyGentle = "gentle"
 )
+
+const defaultGentleCPUPct = intlimit.DefaultGentleCPUPct
+const defaultGentleBWPct = intlimit.DefaultGentleBWPct
+
+func NormalizeGentleCPUPct(v int) int { return intlimit.NormalizeGentleCPUPct(v) }
+
+func NormalizeGentleBWPct(v int) int { return intlimit.NormalizeGentleBWPct(v) }
 
 type DownloadStatus struct {
 	Started int `json:"started"`
@@ -257,11 +265,14 @@ type GetFilesRequest struct {
 	// BatchMaxBytes is the unit of parallel work for a single large file: when a file
 	// exceeds BatchMaxBytes, it is split into windows of this size and downloaded
 	// concurrently. The number of concurrent windows is bounded by
-	// FileRequestWindowBytes/BatchMaxBytes — e.g. a 1 MiB batch with a 10 MiB window
-	// allows up to 10 concurrent requests against that file, while a 10 MiB batch allows
-	// only one. BatchMaxBytes must be <= Client.FileRequestWindowBytes.
-	BatchMaxBytes   int64
-	ProgressUpdates chan<- DownloadProgressUpdate
+	// FileRequestWindowBytes/BatchMaxBytes unless SplitWindowWorkers is set to a
+	// lower cap. BatchMaxBytes must be <= Client.FileRequestWindowBytes.
+	BatchMaxBytes int64
+	// SplitWindowWorkers caps the number of concurrent windows for a single large
+	// file. Zero uses the legacy behavior of deriving concurrency from
+	// FileRequestWindowBytes/BatchMaxBytes.
+	SplitWindowWorkers int
+	ProgressUpdates    chan<- DownloadProgressUpdate
 }
 
 type GetFilesResponse struct {
@@ -274,9 +285,12 @@ type StartFromManifestRequest struct {
 	OutputWriter func(ManifestEntry, int64) (io.WriteCloser, func() error, error)
 	Concurrency  int
 	// BatchMaxBytes is the unit of parallel work per file. See GetFilesRequest.BatchMaxBytes.
-	BatchMaxBytes   int64
-	ProgressUpdates chan<- DownloadProgressUpdate
-	OnFileDone      func(StartFileDoneEvent)
+	BatchMaxBytes int64
+	// SplitWindowWorkers caps per-file split-window concurrency. See
+	// GetFilesRequest.SplitWindowWorkers.
+	SplitWindowWorkers int
+	ProgressUpdates    chan<- DownloadProgressUpdate
+	OnFileDone         func(StartFileDoneEvent)
 }
 
 type StartFileDoneEvent struct {
@@ -303,19 +317,24 @@ type GetManifestRequest struct {
 }
 
 type ProbeRequest struct {
-	Samples      int
-	ProbeBytes   int64
-	LoadStrategy string
+	Samples          int
+	ProbeBytes       int64
+	LoadStrategy     string
+	TransferID       string
+	ObservedLinkMbps int64
 }
 
 type ProbeResponse struct {
 	ServerCPU            int
 	ServerIODepth        int
+	GentleCPUPct         int
+	GentleBWPct          int
 	AvgLatencyMS         int64
 	LinkMbps             int64
 	SuggestedConcurrency int
 	ServerSendBufBytes   int64
 	SuggestedCipher      string // resolved cipher suggested for this connection (e.g. "aes", "chacha20", or "" if none)
+	ServerLimiterBps     int64  // server's current rate limiter in bytes/sec (0 = unlimited)
 }
 
 type GetManifestResponse struct {
@@ -1065,7 +1084,7 @@ func (c *Client) downloadManifestBatchSequential(
 	if windowBytes <= 0 {
 		windowBytes = defaultClientRequestWindowBytes
 	}
-	k := maxSplitWindowWorkers(windowBytes, req.BatchMaxBytes, len(plans))
+	k := maxSplitWindowWorkers(windowBytes, req.BatchMaxBytes, req.SplitWindowWorkers, len(plans))
 
 	var (
 		allFiles    []DownloadFileResponse
@@ -1197,7 +1216,7 @@ func (c *Client) downloadManifestBatchWindows(
 		}
 	}
 
-	maxWorkers := maxSplitWindowWorkers(c.FileRequestWindowBytes, req.BatchMaxBytes, len(windows))
+	maxWorkers := maxSplitWindowWorkers(c.FileRequestWindowBytes, req.BatchMaxBytes, req.SplitWindowWorkers, len(windows))
 	limiter := make(chan struct{}, maxWorkers)
 	results := make(chan splitWindowResult, len(windows))
 	var (
@@ -1338,14 +1357,25 @@ func buildSplitWindows(start int64, end int64, maxBytes int64) []splitWindow {
 	return windows
 }
 
-func maxSplitWindowWorkers(windowBytes int64, batchBytes int64, numWindows int) int {
-	if numWindows < 1 || batchBytes <= 0 {
-		return 1
+func splitWindowWorkerLimit(windowBytes int64, batchBytes int64, plannedWorkers int) int {
+	if batchBytes <= 0 {
+		return max(1, plannedWorkers)
 	}
 	if windowBytes <= 0 {
 		windowBytes = defaultClientRequestWindowBytes
 	}
-	return max(1, min(numWindows, int(windowBytes/batchBytes)))
+	derivedWorkers := max(1, int(windowBytes/batchBytes))
+	if plannedWorkers <= 0 {
+		return derivedWorkers
+	}
+	return max(1, min(plannedWorkers, derivedWorkers))
+}
+
+func maxSplitWindowWorkers(windowBytes int64, batchBytes int64, plannedWorkers int, numWindows int) int {
+	if numWindows < 1 || batchBytes <= 0 {
+		return 1
+	}
+	return max(1, min(numWindows, splitWindowWorkerLimit(windowBytes, batchBytes, plannedWorkers)))
 }
 
 func (c *Client) downloadSplitWindow(
@@ -1581,11 +1611,12 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 			}
 			startOne := time.Now()
 			downloadBatchResp, err := c.GetFiles(ctx, GetFilesRequest{
-				Manifest:        req.Manifest,
-				FileIDs:         fileIDs,
-				OutputWriter:    req.OutputWriter,
-				BatchMaxBytes:   batchMaxBytes,
-				ProgressUpdates: req.ProgressUpdates,
+				Manifest:           req.Manifest,
+				FileIDs:            fileIDs,
+				OutputWriter:       req.OutputWriter,
+				BatchMaxBytes:      batchMaxBytes,
+				SplitWindowWorkers: req.SplitWindowWorkers,
+				ProgressUpdates:    req.ProgressUpdates,
 			})
 			if err != nil {
 				errCh <- fmt.Errorf("batch first-id=%d count=%d: %w", batch[0].ID, len(batch), err)
@@ -1657,7 +1688,8 @@ func (c *Client) effectiveBatchMaxBytes(reqBatchMaxBytes int64) int64 {
 // concurrency and per-file parallelism (i.e. suggestedConcurrency / windowConcurrency < 2),
 // window concurrency is reduced to suggestedConcurrency so all slots go to
 // concurrent file downloads rather than per-file splitting. This happens
-// naturally in gentle mode where total concurrency = ceil(cpu/4).
+// naturally in gentle mode when the server advertises a low CPU budget
+// (25% by default).
 //
 //	Example (gentle, 24 cpu):  conc=6, winConc reduced to 6, perFile=1 → batch = windowBytes
 //	Example (gentle, 32 cpu):  conc=8, winConc=4, perFile=2 → batch = windowBytes/2
@@ -1669,59 +1701,118 @@ func (c *Client) effectiveBatchMaxBytes(reqBatchMaxBytes int64) int64 {
 //     SEND request, so there is no benefit in making it smaller than the socket
 //     buffer the OS has already allocated for the connection.
 //   - Ceiling: windowBytes. A batch larger than the window cannot be scheduled.
-func SuggestBatchMaxBytes(suggestedConcurrency int, windowConcurrency int, windowBytes int64, serverWmemBytes int64) int64 {
-	if windowBytes <= 0 {
-		return defaultClientBatchMaxBytes
+func SuggestBatchMaxBytes(suggestedConcurrency int, windowConcurrency int, windowBytes int64, serverWmemBytes int64, linkMbps int64) int64 {
+	return buildBatchSizePlan(suggestedConcurrency, windowConcurrency, windowBytes, serverWmemBytes, linkMbps).BatchMaxBytes
+}
+
+// BatchSizePlan captures the inputs and intermediate values used to compute
+// the batch size, for human-readable diagnostic output.
+type BatchSizePlan struct {
+	BatchMaxBytes      int64
+	ConcBatchBytes     int64 // batch from concurrency math before bw cap
+	BwCeilBytes        int64 // bandwidth ceiling (0 if not applied)
+	FloorBytes         int64 // socket buffer floor
+	WindowBytes        int64
+	SplitWindowWorkers int
+	SuggestedConc      int
+	EffectiveWinConc   int
+	PerFileWorkers     int
+	LinkMbps           int64
+}
+
+// ExplainBatchMaxBytes computes the batch size and returns a plan with
+// intermediate values suitable for diagnostic output.
+func ExplainBatchMaxBytes(suggestedConcurrency int, windowConcurrency int, windowBytes int64, serverWmemBytes int64, linkMbps int64) BatchSizePlan {
+	return buildBatchSizePlan(suggestedConcurrency, windowConcurrency, windowBytes, serverWmemBytes, linkMbps)
+}
+
+func buildBatchSizePlan(suggestedConcurrency int, windowConcurrency int, windowBytes int64, serverWmemBytes int64, linkMbps int64) BatchSizePlan {
+	plan := BatchSizePlan{
+		SuggestedConc: suggestedConcurrency,
+		WindowBytes:   windowBytes,
+		LinkMbps:      linkMbps,
 	}
-	// A single concurrent window should use the full transfer window. Splitting
-	// that lone stream into smaller batches only adds coordination overhead
-	// without creating additional across-file concurrency.
-	if windowConcurrency == 1 {
-		return largestPow2MiBWithin(windowBytes)
+	if windowBytes <= 0 || windowConcurrency == 1 {
+		plan.BatchMaxBytes = defaultClientBatchMaxBytes
+		if windowBytes > 0 {
+			plan.BatchMaxBytes = largestPow2MiBWithin(windowBytes)
+		}
+		plan.ConcBatchBytes = plan.BatchMaxBytes
+		plan.EffectiveWinConc = max(1, windowConcurrency)
+		plan.PerFileWorkers = 1
+		plan.SplitWindowWorkers = 1
+		return plan
 	}
+	conc := max(1, plan.SuggestedConc)
+	plan.EffectiveWinConc = effectiveWindowConcurrency(conc, windowConcurrency)
+	plan.PerFileWorkers = max(1, conc/plan.EffectiveWinConc)
+	const mib = int64(1 << 20)
+	if windowBytes < mib {
+		plan.ConcBatchBytes = windowBytes
+		plan.BatchMaxBytes = windowBytes
+		plan.SplitWindowWorkers = 1
+		return plan
+	}
+	plan.ConcBatchBytes = roundUpPow2MiB(windowBytes / int64(plan.PerFileWorkers))
+	batch := plan.ConcBatchBytes
+	if batch < mib {
+		plan.BatchMaxBytes = batch
+		plan.SplitWindowWorkers = splitWindowWorkerLimit(windowBytes, batch, plan.PerFileWorkers)
+		return plan
+	}
+	plan.BwCeilBytes = bandwidthCeilBatchBytes(linkMbps, conc)
+	if plan.BwCeilBytes >= mib {
+		batch = min(batch, plan.BwCeilBytes)
+	}
+	plan.FloorBytes = roundedSocketFloorBytes(serverWmemBytes)
+	batch = max(batch, plan.FloorBytes)
+	plan.BatchMaxBytes = min(batch, largestPow2MiBWithin(windowBytes))
+	plan.SplitWindowWorkers = splitWindowWorkerLimit(windowBytes, plan.BatchMaxBytes, plan.PerFileWorkers)
+	return plan
+}
+
+func effectiveWindowConcurrency(suggestedConcurrency int, windowConcurrency int) int {
 	if windowConcurrency <= 0 {
 		windowConcurrency = 4
 	}
-	if suggestedConcurrency <= 0 {
-		suggestedConcurrency = 1
+	if windowConcurrency == 1 {
+		return 1
 	}
-
-	// Auto-range window concurrency: if there isn't enough total concurrency
-	// to give each window at least 2 per-file workers, reduce window concurrency
-	// to match the total so all slots are used for parallel file downloads.
 	if suggestedConcurrency/windowConcurrency < 2 {
-		windowConcurrency = suggestedConcurrency
+		return suggestedConcurrency
 	}
-	perFileWorkers := max(1, suggestedConcurrency/windowConcurrency)
-	raw := windowBytes / int64(perFileWorkers)
+	return windowConcurrency
+}
 
-	// Round up to the nearest power-of-2 MiB.
+func roundUpPow2MiB(v int64) int64 {
 	const mib = int64(1 << 20)
-	if windowBytes < mib {
-		return windowBytes
+	if v <= 0 {
+		return 0
 	}
-	mibCount := max(int64(1), (raw+mib-1)/mib)
+	if v < mib {
+		return mib
+	}
+	if v == mib {
+		return v
+	}
+	mibCount := max(int64(1), (v+mib-1)/mib)
 	pow2 := int64(1)
 	for pow2 < mibCount {
 		pow2 <<= 1
 	}
-	batch := pow2 * mib
+	return pow2 * mib
+}
 
-	// Floor: a batch is one TCP SEND, so it should not be smaller than the
-	// socket buffer the OS allocated — sending less wastes a round-trip for
-	// data that would have fit in a single write/read cycle.
-	// Round the floor up to the nearest power-of-2 MiB so the result stays aligned.
-	rawFloor := max(serverWmemBytes, int64(utils.MaxSocketReadBufferBytes()))
-	floorMiB := max(int64(1), (rawFloor+mib-1)/mib)
-	floorPow2 := int64(1)
-	for floorPow2 < floorMiB {
-		floorPow2 <<= 1
+func bandwidthCeilBatchBytes(linkMbps int64, suggestedConcurrency int) int64 {
+	if linkMbps <= 0 {
+		return 0
 	}
-	batch = max(batch, floorPow2*mib)
+	perWorkerBytesPerSec := (linkMbps * 1_000_000 / 8) / int64(max(1, suggestedConcurrency))
+	return largestPow2MiBWithin(perWorkerBytesPerSec / 2)
+}
 
-	// Ceiling: a batch larger than the transfer window is meaningless.
-	// Round down to keep MiB alignment.
-	return min(batch, largestPow2MiBWithin(windowBytes))
+func roundedSocketFloorBytes(serverWmemBytes int64) int64 {
+	return roundUpPow2MiB(max(serverWmemBytes, int64(utils.MaxSocketReadBufferBytes())))
 }
 
 // largestPow2MiBWithin returns the largest power-of-2 multiple of MiB that is
@@ -1739,7 +1830,7 @@ func largestPow2MiBWithin(v int64) int64 {
 	return p * mib
 }
 
-func suggestedConcurrencyFromProbe(serverCPU int, ioDepth int, strategy string) int {
+func suggestedConcurrencyFromProbe(serverCPU int, ioDepth int, strategy string, gentleCPUPct int) int {
 	if serverCPU <= 0 {
 		serverCPU = runtime.NumCPU()
 	}
@@ -1748,11 +1839,12 @@ func suggestedConcurrencyFromProbe(serverCPU int, ioDepth int, strategy string) 
 	}
 	strategy = normalizeLoadStrategy(strategy)
 	if strategy == LoadStrategyGentle {
-		// Gentle: 25% of available CPUs, io-depth is ignored —
+		// Gentle: a server-advertised percent of available CPUs, io-depth is ignored —
 		// window concurrency and per-file parallelism are auto-ranged
 		// in SuggestBatchMaxBytes to fill this budget.
-		value := serverCPU / 4
-		if serverCPU%4 != 0 {
+		gentleCPUPct = NormalizeGentleCPUPct(gentleCPUPct)
+		value := (serverCPU * gentleCPUPct) / 100
+		if (serverCPU*gentleCPUPct)%100 != 0 {
 			value++
 		}
 		return value
@@ -1792,14 +1884,14 @@ func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse
 
 	probeResults := make([]probeResponse, 0, samples)
 	for i := 0; i < samples; i++ {
-		result, err := c.probeTCP(ctx, probeBytes)
+		result, err := c.probeTCP(ctx, req, probeBytes)
 		if err != nil {
 			return ProbeResponse{}, fmt.Errorf("probe %d failed: %w", i+1, err)
 		}
 		probeResults = append(probeResults, result)
 	}
 	response := summarizeProbeSamples(probeResults, probeBytes)
-	response.SuggestedConcurrency = clampConcurrency(suggestedConcurrencyFromProbe(response.ServerCPU, response.ServerIODepth, loadStrategy))
+	response.SuggestedConcurrency = clampConcurrency(suggestedConcurrencyFromProbe(response.ServerCPU, response.ServerIODepth, loadStrategy, response.GentleCPUPct))
 
 	// Resolve the cipher name for display. If encryption is enabled,
 	// resolveTCPAuthState resolves "auto" to the server's recommendation.
@@ -1830,9 +1922,12 @@ func summarizeProbeSamples(results []probeResponse, probeBytes int64) ProbeRespo
 	return ProbeResponse{
 		ServerCPU:          serverCPU,
 		ServerIODepth:      serverIODepth,
+		GentleCPUPct:       results[0].GentleCPUPct,
+		GentleBWPct:        results[0].GentleBWPct,
 		AvgLatencyMS:       avgMS,
 		LinkMbps:           roundedMbps,
 		ServerSendBufBytes: serverSendBufBytes,
+		ServerLimiterBps:   results[len(results)-1].LimiterBps,
 	}
 }
 

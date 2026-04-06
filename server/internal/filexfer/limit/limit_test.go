@@ -111,3 +111,18 @@ func TestNewLimiterRejectsBurstWhenRateEnabled(t *testing.T) {
 		t.Fatalf("expected error for zero burst when rate enabled")
 	}
 }
+
+func TestNormalizeGentlePercents(t *testing.T) {
+	if got := NormalizeGentleCPUPct(0); got != DefaultGentleCPUPct {
+		t.Fatalf("NormalizeGentleCPUPct(0) = %d, want %d", got, DefaultGentleCPUPct)
+	}
+	if got := NormalizeGentleCPUPct(40); got != 40 {
+		t.Fatalf("NormalizeGentleCPUPct(40) = %d, want 40", got)
+	}
+	if got := NormalizeGentleBWPct(-1); got != DefaultGentleBWPct {
+		t.Fatalf("NormalizeGentleBWPct(-1) = %d, want %d", got, DefaultGentleBWPct)
+	}
+	if got := NormalizeGentleBWPct(60); got != 60 {
+		t.Fatalf("NormalizeGentleBWPct(60) = %d, want 60", got)
+	}
+}

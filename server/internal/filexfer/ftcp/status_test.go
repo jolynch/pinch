@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jolynch/pinch/internal/filexfer/limit"
 )
 
 type fakeDeps struct {
@@ -23,6 +25,12 @@ func (f fakeDeps) RegisterTransferFileState(string, <-chan TransferFileStateUpda
 }
 func (f fakeDeps) ClipTransfer(string) bool                         { return true }
 func (f fakeDeps) SetTransferHints(string, string, int64, int) bool { return true }
+func (f fakeDeps) GetTransferGentleLimiter(string, int64, int, int64) *limit.Limiter {
+	return nil
+}
+func (f fakeDeps) ReportTransferObservedLink(string, int64, int, int64, float64) (TransferObservedLinkUpdate, bool) {
+	return TransferObservedLinkUpdate{}, false
+}
 func (f fakeDeps) GetTransfer(string) (Transfer, bool) {
 	return f.transfer, f.transferOK
 }
@@ -45,6 +53,7 @@ func (f fakeDeps) AcknowledgeTransferFile(string, uint64, int64) bool { return t
 func (f fakeDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (f fakeDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
 func (f fakeDeps) MarkTransferTooSlow(string) bool                  { return false }
+func (f fakeDeps) GetTransferLimiterBps(string) int64                { return 0 }
 func (f fakeDeps) Root() string                                     { return "/" }
 
 func TestHandleSTATUSWritesStatusLine(t *testing.T) {

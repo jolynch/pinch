@@ -5,11 +5,14 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"log"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/internal/filexfer/limit"
 	"github.com/jolynch/pinch/utils"
 )
 
@@ -17,9 +20,11 @@ const maxProbeBytes int64 = 32 * 1024 * 1024
 const probeCopyBufferBytes = 64 * 1024
 
 type probeRequest struct {
-	ClientCPU  int
-	ProbeBytes int64
-	ClientTS0  int64
+	ClientCPU        int
+	ProbeBytes       int64
+	ClientTS0        int64
+	TransferID       string
+	ObservedLinkMbps int64
 }
 
 func handlePROBECommand(context.Context, Request, io.Writer, Deps) error {
@@ -49,10 +54,27 @@ func parsePROBERequest(req Request) (probeRequest, error) {
 	if err != nil || clientTS0 < 0 {
 		return probeRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid PROBE cts0"}
 	}
-	return probeRequest{ClientCPU: clientCPU, ProbeBytes: probeBytes, ClientTS0: clientTS0}, nil
+	transferID := strings.TrimSpace(p["txferid"])
+	observedLinkMbps := int64(0)
+	if raw := strings.TrimSpace(p["obs-link-mbps"]); raw != "" {
+		observedLinkMbps, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || observedLinkMbps < 0 {
+			return probeRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid PROBE obs-link-mbps"}
+		}
+		if transferID == "" {
+			return probeRequest{}, protocolErr{code: "BAD_REQUEST", message: "PROBE obs-link-mbps requires txferid"}
+		}
+	}
+	return probeRequest{
+		ClientCPU:        clientCPU,
+		ProbeBytes:       probeBytes,
+		ClientTS0:        clientTS0,
+		TransferID:       transferID,
+		ObservedLinkMbps: observedLinkMbps,
+	}, nil
 }
 
-func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, _ Deps, ioDepth int) error {
+func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, deps Deps, ioDepth int, gentleCPUPct int, gentleBWPct int, gentleBurstBytes int64) error {
 	parsed, err := parsePROBERequest(req)
 	if err != nil {
 		return err
@@ -63,15 +85,33 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 	if ioDepth <= 0 {
 		ioDepth = 8
 	}
+	gentleCPUPct = limit.NormalizeGentleCPUPct(gentleCPUPct)
+	gentleBWPct = limit.NormalizeGentleBWPct(gentleBWPct)
 	sts0 := time.Now().UnixMilli()
 	if parsed.ProbeBytes > 0 {
 		if err := drainProbePayload(in, parsed.ProbeBytes, &sts0); err != nil {
 			return protocolErr{code: "BAD_REQUEST", message: "invalid PROBE payload"}
 		}
 	}
+	if deps != nil && parsed.TransferID != "" && parsed.ObservedLinkMbps > 0 {
+		if update, ok := deps.ReportTransferObservedLink(parsed.TransferID, parsed.ObservedLinkMbps, gentleBWPct, gentleBurstBytes, 0.2); ok && update.NewRateBps != update.OldRateBps {
+			log.Printf(
+				"filexfer probe tid=%s observed_link=%dMbps ema_link=%.1fMbps limiter=%s->%s",
+				parsed.TransferID,
+				update.ObservedLinkMbps,
+				update.EMALinkMbps,
+				encoding.HumanRate(float64(update.OldRateBps)),
+				encoding.HumanRate(float64(update.NewRateBps)),
+			)
+		}
+	}
 	sts1 := time.Now().UnixMilli()
+	limiterBps := int64(0)
+	if deps != nil && parsed.TransferID != "" {
+		limiterBps = deps.GetTransferLimiterBps(parsed.TransferID)
+	}
 	respLine := fmt.Sprintf(
-		"PROBE cpu=%d io-depth=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d wmem=%d\n",
+		"PROBE cpu=%d io-depth=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d wmem=%d gentle-cpu-pct=%d gentle-bw-pct=%d limiter-bps=%d\n",
 		runtime.NumCPU(),
 		ioDepth,
 		parsed.ClientTS0,
@@ -79,6 +119,9 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 		sts1,
 		parsed.ProbeBytes,
 		utils.MaxSocketWriteBufferBytes(),
+		gentleCPUPct,
+		gentleBWPct,
+		limiterBps,
 	)
 	if _, err := io.WriteString(out, respLine); err != nil {
 		return err

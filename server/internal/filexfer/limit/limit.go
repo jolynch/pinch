@@ -44,6 +44,25 @@ type Limiter struct {
 
 const defaultBurstBytes int64 = 1 * 1024 * 1024 // 1 MiB
 
+const (
+	DefaultGentleCPUPct = 25
+	DefaultGentleBWPct  = 25
+)
+
+func NormalizeGentleCPUPct(v int) int {
+	if v <= 0 {
+		return DefaultGentleCPUPct
+	}
+	return v
+}
+
+func NormalizeGentleBWPct(v int) int {
+	if v <= 0 {
+		return DefaultGentleBWPct
+	}
+	return v
+}
+
 // NewLimiterFromBps creates a Limiter from a numeric bytes-per-second rate.
 // If burstBytes <= 0, a 1 MiB default burst is used.
 func NewLimiterFromBps(rateBps int64, burstBytes int64) (*Limiter, error) {

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jolynch/pinch/internal/filexfer/limit"
 )
 
 type txferTestDeps struct {
@@ -35,7 +37,7 @@ func (d *txferTestDeps) RegisterTransferFileState(string, <-chan TransferFileSta
 func (d *txferTestDeps) ClipTransfer(string) bool { return true }
 
 func (d *txferTestDeps) GetTransfer(string) (Transfer, bool) { return Transfer{}, false }
-func (d *txferTestDeps) ListTransfers() []Transfer              { return nil }
+func (d *txferTestDeps) ListTransfers() []Transfer           { return nil }
 
 func (d *txferTestDeps) SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
 	d.setHintsCalls++
@@ -44,6 +46,14 @@ func (d *txferTestDeps) SetTransferHints(txferID string, mode string, linkMbps i
 	d.setHintsMbps = linkMbps
 	d.setHintsConc = concurrency
 	return true
+}
+
+func (d *txferTestDeps) GetTransferGentleLimiter(string, int64, int, int64) *limit.Limiter {
+	return nil
+}
+
+func (d *txferTestDeps) ReportTransferObservedLink(string, int64, int, int64, float64) (TransferObservedLinkUpdate, bool) {
+	return TransferObservedLinkUpdate{}, false
 }
 
 func (d *txferTestDeps) GetFile(string, uint64, string) (*os.File, FileRef, error) {
@@ -65,6 +75,7 @@ func (d *txferTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { re
 func (d *txferTestDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (d *txferTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
 func (d *txferTestDeps) MarkTransferTooSlow(string) bool                  { return false }
+func (d *txferTestDeps) GetTransferLimiterBps(string) int64                { return 0 }
 func (d *txferTestDeps) Root() string                                     { return "/" }
 
 func TestParseTXFERRequestRequiresHints(t *testing.T) {

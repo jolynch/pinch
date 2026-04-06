@@ -49,6 +49,21 @@ func TestHumanBytes(t *testing.T) {
 	}
 }
 
+func TestHumanBytesFixedWidth(t *testing.T) {
+	if got := HumanBytesFixedWidth(0, 10); got != "       0 B" {
+		t.Fatalf("unexpected zero value: %q", got)
+	}
+	if got := HumanBytesFixedWidth(492_340_000, 10); got != "469.53 MiB" {
+		t.Fatalf("unexpected mid value: %q", got)
+	}
+	if got := HumanBytesFixedWidth(1_950_000_000, 10); got != "  1.82 GiB" {
+		t.Fatalf("unexpected gib value: %q", got)
+	}
+	if got := HumanBytesFixedWidth(20_174_499_881, 10); got != " 18.79 GiB" {
+		t.Fatalf("unexpected total value: %q", got)
+	}
+}
+
 func TestHumanRate(t *testing.T) {
 	tests := []struct {
 		in   float64
@@ -64,5 +79,17 @@ func TestHumanRate(t *testing.T) {
 		if got := HumanRate(tc.in); got != tc.want {
 			t.Fatalf("unexpected value for %f: got=%q want=%q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestHumanRateFixedWidth(t *testing.T) {
+	if got := HumanRateFixedWidth(0, 13); got != "        0 B/s" {
+		t.Fatalf("unexpected zero rate: %q", got)
+	}
+	if got := HumanRateFixedWidth(245.51*1024*1024, 13); got != " 245.51 MiB/s" {
+		t.Fatalf("unexpected mib rate: %q", got)
+	}
+	if got := HumanRateFixedWidth(1.5*1024*1024*1024, 13); got != "   1.50 GiB/s" {
+		t.Fatalf("unexpected gib rate: %q", got)
 	}
 }

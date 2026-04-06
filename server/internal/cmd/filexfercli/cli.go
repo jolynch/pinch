@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"math/rand"
 	"net"
 	"os"
@@ -28,7 +29,6 @@ import (
 	. "github.com/jolynch/pinch/filexfer"
 	"github.com/jolynch/pinch/internal/filexfer"
 	"github.com/jolynch/pinch/internal/filexfer/encoding"
-	"github.com/jolynch/pinch/utils"
 	"github.com/zeebo/xxh3"
 )
 
@@ -58,12 +58,56 @@ const defaultVerboseProgressInterval = 2 * time.Second
 const defaultCLIProbeBytes int64 = 1 * 1024 * 1024
 const defaultVerifySampleFrameSize int64 = 8 * 1024 * 1024
 const verifySampleBytes int64 = 8
+const defaultTransferProbeRefreshInterval = 10 * time.Second
+const fixedWidthProgressBytesWidth = 10
+const fixedWidthProgressRateWidth = 13
+const maxTransferErrorLines = 5
+
+var transferProbeRefreshInterval = defaultTransferProbeRefreshInterval
 
 var syncPromptInput io.Reader = os.Stdin
 
 var syncPromptIsTerminal = func() bool {
 	stat, err := os.Stdin.Stat()
 	return err == nil && stat != nil && (stat.Mode()&os.ModeCharDevice) != 0
+}
+
+func formatStartBatchCause(plan BatchSizePlan) string {
+	baseCause := "window"
+	bwActive := plan.BwCeilBytes > 0 && plan.BwCeilBytes < plan.ConcBatchBytes
+	baseBatch := plan.ConcBatchBytes
+	if bwActive {
+		baseCause = "bw-probe"
+		baseBatch = plan.BwCeilBytes
+	}
+	if plan.BatchMaxBytes == plan.FloorBytes && plan.FloorBytes > baseBatch {
+		if baseCause == "bw-probe" {
+			return "bw-probe, raised to socket size"
+		}
+		return "floor"
+	}
+	return baseCause
+}
+
+func formatStartBatchWindowLine(windowBytes int64, plan BatchSizePlan) string {
+	return fmt.Sprintf(
+		"    window: %s / %d per-file-workers = %s",
+		encoding.HumanBytes(windowBytes),
+		plan.PerFileWorkers,
+		encoding.HumanBytes(plan.ConcBatchBytes),
+	)
+}
+
+func formatStartBatchProbeLine(linkMiBPerSec int64, suggestedConcurrency int, plan BatchSizePlan) string {
+	if plan.BwCeilBytes <= 0 || plan.BwCeilBytes >= plan.ConcBatchBytes {
+		return ""
+	}
+	return fmt.Sprintf(
+		"    bw-probe: %d MiB/s / %d conc / 2 = %s",
+		linkMiBPerSec,
+		suggestedConcurrency,
+		encoding.HumanBytes(plan.BwCeilBytes),
+	)
 }
 
 type synchronizedWriter struct {
@@ -95,6 +139,66 @@ func (cw *countingWriter) Close() error {
 		return c.Close()
 	}
 	return nil
+}
+
+type probeReporter struct {
+	stop           func()
+	limiterBps     atomic.Int64 // server's current rate limiter (bytes/sec)
+	linkMbps       atomic.Int64 // latest probe-derived link bandwidth (megabits/sec)
+	lastProbeUnixS atomic.Int64 // unix seconds of most recent successful probe
+}
+
+func startTransferProbeReporter(ctx context.Context, client *Client, transferID string, strategy string, probeBytes int64, initialObservedLinkMbps int64) *probeReporter {
+	pr := &probeReporter{stop: func() {}}
+	if client == nil || strings.TrimSpace(transferID) == "" {
+		return pr
+	}
+	if probeBytes <= 0 {
+		probeBytes = defaultCLIProbeBytes
+	}
+	if strings.TrimSpace(strategy) == "" {
+		strategy = LoadStrategyFast
+	}
+	probeCtx, cancel := context.WithCancel(ctx)
+	pr.stop = cancel
+	var observed atomic.Int64
+	if initialObservedLinkMbps > 0 {
+		observed.Store(initialObservedLinkMbps)
+		pr.linkMbps.Store(initialObservedLinkMbps)
+		pr.lastProbeUnixS.Store(time.Now().Unix())
+	}
+	go func() {
+		ticker := time.NewTicker(transferProbeRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-probeCtx.Done():
+				return
+			case <-ticker.C:
+				resp, err := client.ProbeLink(probeCtx, ProbeRequest{
+					Samples:          1,
+					ProbeBytes:       probeBytes,
+					LoadStrategy:     strategy,
+					TransferID:       transferID,
+					ObservedLinkMbps: observed.Load(),
+				})
+				if err != nil {
+					continue
+				}
+				if resp.LinkMbps > 0 {
+					observed.Store(resp.LinkMbps)
+					pr.linkMbps.Store(resp.LinkMbps)
+				}
+				if resp.ServerLimiterBps > 0 {
+					pr.limiterBps.Store(resp.ServerLimiterBps)
+				} else {
+					pr.limiterBps.Store(0)
+				}
+				pr.lastProbeUnixS.Store(time.Now().Unix())
+			}
+		}
+	}()
+	return pr
 }
 
 const defaultFileListener = "127.0.0.1:3453"
@@ -366,7 +470,7 @@ type transferArgs struct {
 	encMode      string
 	loadStrategy string
 	probeBytes   int64
-	verbose      bool
+	verbosity    int
 	maxChunk     int
 	deadlineMS   int64
 }
@@ -383,7 +487,7 @@ type syncArgs struct {
 	compress            string
 	noSync              bool
 	skipWrite           bool
-	verbose             bool
+	verbosity           int
 	yes                 bool
 	probeBytes          int64
 	traceFile           string
@@ -425,6 +529,32 @@ func cleanupCopyState(targetDir string, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func verbosityFromFlags(progress bool, verbose bool) int {
+	if verbose {
+		return 2
+	}
+	if progress {
+		return 1
+	}
+	return 0
+}
+
+func printTransferErrors(stderr io.Writer, phase string, errs []error, verbosity int) {
+	if stderr == nil || len(errs) == 0 {
+		return
+	}
+	printed := len(errs)
+	if verbosity < 2 && printed > maxTransferErrorLines {
+		printed = maxTransferErrorLines
+	}
+	for _, err := range errs[:printed] {
+		fmt.Fprintf(stderr, "%s error: %v\n", phase, err)
+	}
+	if verbosity < 2 && len(errs) > printed {
+		fmt.Fprintf(stderr, "%s failed with %d errors\n", phase, len(errs))
+	}
 }
 
 func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -567,7 +697,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		encMode:      encMode,
 		loadStrategy: loadStrategy,
 		probeBytes:   probeBytes,
-		verbose:      false,
+		verbosity:    0,
 		maxChunk:     0,
 		deadlineMS:   deadlineMS,
 	}
@@ -595,7 +725,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			compress:            compress,
 			noSync:              cfg.skipFsync,
 			skipWrite:           cfg.skipWrite,
-			verbose:             cfg.verbose,
+			verbosity:           verbosityFromFlags(false, cfg.verbose),
 			yes:                 cfg.yes,
 			probeBytes:          probeBytes,
 			traceFile:           cfg.traceFile,
@@ -606,12 +736,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			return code
 		}
 	} else {
-		verbosity := 0
-		if cfg.verbose {
-			verbosity = 2
-		} else if cfg.progress {
-			verbosity = 1
-		}
+		verbosity := verbosityFromFlags(cfg.progress, cfg.verbose)
 		startCfg := startArgs{
 			targetDir:           cfg.localDst,
 			agePublicKey:        agePublicKey,
@@ -1061,7 +1186,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		encMode:      resolvedEncMode,
 		loadStrategy: loadStrategy,
 		probeBytes:   probeBytes,
-		verbose:      verbose,
+		verbosity:    verbosityFromFlags(false, verbose),
 		maxChunk:     maxChunk,
 		deadlineMS:   deadlineMS,
 	}, stdout, stderr)
@@ -1098,7 +1223,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	}
 	fmt.Fprintf(
 		stdout,
-		"transfer-probe : strategy=%s cipher=%s avg_ms=%d est_link=%dMbps srv-conc=(%d cpu * %d io = %d)\n",
+		"txfer-probe   : strategy=%s cipher=%s avg_ms=%d est_link=%dMbps srv-conc=(%d cpu * %d io = %d)\n",
 		cfg.loadStrategy,
 		cipherDisplay,
 		probeResult.AvgLatencyMS,
@@ -1107,7 +1232,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	)
 	manifestResp, err := client.GetManifest(context.Background(), GetManifestRequest{
 		Directory:    cfg.sourceDir,
-		Verbose:      cfg.verbose,
+		Verbose:      cfg.verbosity >= 2,
 		MaxChunkSize: cfg.maxChunk,
 		Mode:         cfg.loadStrategy,
 		LinkMbps:     probeResult.LinkMbps,
@@ -1134,14 +1259,14 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	}
 	fmt.Fprintf(
 		stdout,
-		"transfer-loaded: tid[%s] %d files (%s) from [%s] elapsed=%s\n",
+		"txfer-loaded  : tid[%s] %d files (%s) from [%s] elapsed=%s\n",
 		manifest.TransferID,
 		len(manifest.Entries),
 		encoding.HumanBytes(total),
 		manifest.Root,
 		time.Since(start).Round(time.Millisecond),
 	)
-	fmt.Fprintf(stderr, "transfer-state : >(%s)\n", ps.ServerManifestPath)
+	fmt.Fprintf(stderr, "txfer-state   : >(%s)\n", ps.ServerManifestPath)
 
 	return 0
 }
@@ -1215,11 +1340,12 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 	for _, s := range listResp.Statuses {
 		fmt.Fprintf(
 			stdout,
-			"[%s] source=[%s] files=[%d/%d](%.1f%%) bytes=[%s/%s](%.1f%%)\n",
+			"[%s] source=[%s] files=[%d/%d](%.1f%%) [%s/%s](%.1f%%)\n",
 			s.TransferID,
 			s.Directory,
 			s.Done, s.NumFiles, s.PercentFiles,
-			encoding.HumanBytes(s.DoneSize), encoding.HumanBytes(s.TotalSize), s.PercentBytes,
+			encoding.HumanBytesFixedWidth(s.DoneSize, fixedWidthProgressBytesWidth),
+			encoding.HumanBytesFixedWidth(s.TotalSize, fixedWidthProgressBytesWidth), s.PercentBytes,
 		)
 	}
 	return 0
@@ -1300,15 +1426,16 @@ func pollTransferStatus(client *Client, txferID string, manifest *Manifest, prog
 		if rateBps > 0 && s.TotalSize > s.DoneSize {
 			remaining := float64(s.TotalSize - s.DoneSize)
 			etaSec := remaining / rateBps
-			etaPart = fmt.Sprintf(" eta=%s", (time.Duration(etaSec * float64(time.Second))).Round(time.Second))
+			etaPart = fmt.Sprintf(" eta=%s", fixedWidthETA(time.Duration(etaSec*float64(time.Second))))
 		}
 		fmt.Fprintf(
 			stdout,
-			"server: files=[%d/%d](%.1f%%) bytes=[%s/%s](%.1f%%) rate=%s%s\n",
+			"server: files=[%d/%d](%.1f%%) [%s/%s](%.1f%%) rate=%s%s\n",
 			s.Done, s.NumFiles, s.PercentFiles,
-			encoding.HumanBytes(s.DoneSize), encoding.HumanBytes(s.TotalSize),
+			encoding.HumanBytesFixedWidth(s.DoneSize, fixedWidthProgressBytesWidth),
+			encoding.HumanBytesFixedWidth(s.TotalSize, fixedWidthProgressBytesWidth),
 			s.PercentBytes,
-			encoding.HumanRate(rateBps), etaPart,
+			encoding.HumanRateFixedWidth(rateBps, fixedWidthProgressRateWidth), etaPart,
 		)
 		if hasLocal {
 			localDoneFiles, localTotalFiles, localDoneBytes, localTotalBytes := computeLocalProgress(manifest, progressPath)
@@ -1333,9 +1460,10 @@ func pollTransferStatus(client *Client, txferID string, manifest *Manifest, prog
 			}
 			fmt.Fprintf(
 				stdout,
-				"client: files=[%d/%d](%.1f%%) bytes=[%s/%s](%.1f%%)\n",
+				"client: files=[%d/%d](%.1f%%) [%s/%s](%.1f%%)\n",
 				peakLocalDoneFiles, localTotalFiles, localPctFiles,
-				encoding.HumanBytes(peakLocalDoneBytes), encoding.HumanBytes(localTotalBytes),
+				encoding.HumanBytesFixedWidth(peakLocalDoneBytes, fixedWidthProgressBytesWidth),
+				encoding.HumanBytesFixedWidth(localTotalBytes, fixedWidthProgressBytesWidth),
 				localPctBytes,
 			)
 		}
@@ -1495,12 +1623,18 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	if probe, probeErr := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil {
 		miniProbe = probe
 	}
-	batchSize := SuggestBatchMaxBytes(
+	batchPlan := ExplainBatchMaxBytes(
 		miniProbe.SuggestedConcurrency,
 		client.WindowConcurrency,
 		client.FileRequestWindowBytes,
 		miniProbe.ServerSendBufBytes,
+		miniProbe.LinkMbps,
 	)
+	batchSize := batchPlan.BatchMaxBytes
+	transferCtx, cancelTransfer := context.WithCancel(context.Background())
+	defer cancelTransfer()
+	probeInfo := startTransferProbeReporter(transferCtx, client, manifest.TransferID, LoadStrategyFast, defaultCLIProbeBytes, miniProbe.LinkMbps)
+	defer probeInfo.stop()
 
 	start := time.Now()
 	progressUpdates := make(chan DownloadProgressUpdate, 128)
@@ -1521,13 +1655,12 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		}
 	}()
 
+	var totalCopied atomic.Int64
 	var stopStatusPolling func()
-	if progress {
-		stopStatusPolling = startVerboseStatusPolling(manifest.TransferID, client, stderr)
+	if verbosityFromFlags(progress, verbose) >= 1 {
+		stopStatusPolling = startVerboseStatusPolling(manifest.TransferID, client, &totalCopied, entry.Size, probeInfo, stderr)
 		defer stopStatusPolling()
 	}
-
-	var totalCopied atomic.Int64
 	outputWriter := func(me ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 		w, syncFn, wErr := openDownloadOutput(me, offset, outputPath, stdout, skipFsync)
 		if wErr != nil {
@@ -1550,12 +1683,13 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		defer func() { stopProgressFile(err == nil) }()
 	}
 
-	downloadBatchResp, err := client.GetFiles(context.Background(), GetFilesRequest{
-		Manifest:        manifest,
-		FileIDs:         []uint64{0},
-		BatchMaxBytes:   batchSize,
-		OutputWriter:    outputWriter,
-		ProgressUpdates: progressUpdates,
+	downloadBatchResp, err := client.GetFiles(transferCtx, GetFilesRequest{
+		Manifest:           manifest,
+		FileIDs:            []uint64{0},
+		BatchMaxBytes:      batchSize,
+		SplitWindowWorkers: batchPlan.SplitWindowWorkers,
+		OutputWriter:       outputWriter,
+		ProgressUpdates:    progressUpdates,
 	})
 	elapsed := time.Since(start)
 	if err != nil {
@@ -1656,6 +1790,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintln(stderr, "--concurrency must be > 0")
 		return 2
 	}
+	verbosity := verbosityFromFlags(false, verbose)
 	return runSync(serverURL, syncArgs{
 		sourceDir:           sourceDir,
 		targetDir:           cf.Arg(0),
@@ -1668,7 +1803,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		compress:            compress,
 		noSync:              noSync,
 		skipWrite:           skipWrite,
-		verbose:             verbose,
+		verbosity:           verbosity,
 		yes:                 yes,
 		probeBytes:          probeBytes,
 		traceFile:           traceFile,
@@ -1736,12 +1871,14 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			fmt.Fprintf(stderr, "probe failed: %v\n", err)
 			return 1
 		}
-		batchSize := SuggestBatchMaxBytes(
+		batchPlan := ExplainBatchMaxBytes(
 			probeResult.SuggestedConcurrency,
 			client.WindowConcurrency,
 			client.FileRequestWindowBytes,
 			probeResult.ServerSendBufBytes,
+			effectiveModeLinkMbps(loadStrategy, probeResult.LinkMbps, probeResult.GentleBWPct),
 		)
+		batchSize := batchPlan.BatchMaxBytes
 
 		// SYNC: send old manifest, receive new manifest + removed paths.
 		syncResp, err := client.SyncManifest(context.Background(), SyncManifestRequest{
@@ -1884,7 +2021,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		progressUpdates := make(chan DownloadProgressUpdate, 1024)
 		entryByID := manifestEntriesByID(mergedManifest)
 		var onProgressUpdate func(DownloadProgressUpdate)
-		if cfg.verbose {
+		if cfg.verbosity >= 2 {
 			progressReporter := newVerboseProgressReporter(stderr)
 			onProgressUpdate = progressReporter.ReportUpdate
 		}
@@ -1945,14 +2082,17 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			failures = append(failures, err)
 			failuresMu.Unlock()
 		}
+		transferCtx, cancelTransfer := context.WithCancel(context.Background())
+		probeInfo := startTransferProbeReporter(transferCtx, client, mergedManifest.TransferID, mergedManifest.Mode, cfg.probeBytes, mergedManifest.LinkMbps)
 
-		startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
-			Manifest:        mergedManifest,
-			Entries:         pendingEntries,
-			OutputWriter:    outputWriter,
-			Concurrency:     effectiveConcurrency,
-			BatchMaxBytes:   batchSize,
-			ProgressUpdates: progressUpdates,
+		startResp, err := client.StartFromManifest(transferCtx, StartFromManifestRequest{
+			Manifest:           mergedManifest,
+			Entries:            pendingEntries,
+			OutputWriter:       outputWriter,
+			Concurrency:        effectiveConcurrency,
+			BatchMaxBytes:      batchSize,
+			SplitWindowWorkers: batchPlan.SplitWindowWorkers,
+			ProgressUpdates:    progressUpdates,
 			OnFileDone: func(evt StartFileDoneEvent) {
 				entry, ok := entryByID[evt.File.Meta.FileID]
 				if !ok {
@@ -1972,6 +2112,8 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 				printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
 			},
 		})
+		probeInfo.stop()
+		cancelTransfer()
 		stopProgress()
 		applyProgressStateToManifest(mergedManifest, mergedProgress)
 		if err != nil {
@@ -1987,9 +2129,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		failuresMu.Lock()
 		finalFailures := append([]error(nil), failures...)
 		failuresMu.Unlock()
-		for _, err := range finalFailures {
-			fmt.Fprintf(stderr, "sync error: %v\n", err)
-		}
+		printTransferErrors(stderr, "sync", finalFailures, cfg.verbosity)
 
 		elapsedAll := time.Since(startAll)
 		overallSpeed := 0.0
@@ -2067,12 +2207,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "invalid --progress-file-interval: %v\n", err)
 		return 2
 	}
-	verbosity := 0
-	if verbose {
-		verbosity = 2
-	} else if progress {
-		verbosity = 1
-	}
+	verbosity := verbosityFromFlags(progress, verbose)
 	var deadlineMS int64
 	if deadlineRaw != "" {
 		d, err := time.ParseDuration(deadlineRaw)
@@ -2215,23 +2350,57 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	if probe, probeErr := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil {
 		miniProbe = probe
 	}
+	rawLinkMbps := max(manifest.LinkMbps, miniProbe.LinkMbps)
+	gentleCPUPct := NormalizeGentleCPUPct(miniProbe.GentleCPUPct)
+	gentleBWPct := NormalizeGentleBWPct(miniProbe.GentleBWPct)
+	effectiveLinkMbps := effectiveModeLinkMbps(loadStrategy, rawLinkMbps, gentleBWPct)
 	batchSize := SuggestBatchMaxBytes(
 		miniProbe.SuggestedConcurrency,
 		client.WindowConcurrency,
 		client.FileRequestWindowBytes,
 		miniProbe.ServerSendBufBytes,
+		effectiveLinkMbps,
 	)
-	fmt.Fprintf(
-		stdout,
-		"start-plan: strategy=%s link=%dMbps conc=%d srv-conc=(%d cpu * %d io = %d) batch=%s cli-sendbuf=%s srv-recvbuf=%s\n",
-		loadStrategy,
-		manifest.LinkMbps,
-		effectiveConcurrency,
-		miniProbe.ServerCPU, miniProbe.ServerIODepth, miniProbe.SuggestedConcurrency,
-		encoding.HumanBytes(batchSize),
-		encoding.HumanBytes(miniProbe.ServerSendBufBytes),
-		encoding.HumanBytes(int64(utils.MaxSocketReadBufferBytes())),
+	batchPlan := ExplainBatchMaxBytes(
+		miniProbe.SuggestedConcurrency,
+		client.WindowConcurrency,
+		client.FileRequestWindowBytes,
+		miniProbe.ServerSendBufBytes,
+		effectiveLinkMbps,
 	)
+	linkMiBPerSec := rawLinkMbps * 1_000_000 / 8 / (1 << 20)
+	effectiveLinkMiBPerSec := effectiveLinkMbps * 1_000_000 / 8 / (1 << 20)
+	fmt.Fprintf(stdout, "start-plan:\n")
+	if loadStrategy == LoadStrategyGentle {
+		fmt.Fprintf(stdout, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s), %d%% gentle-cpu, %d%% gentle-bw\n",
+			miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec, gentleCPUPct, gentleBWPct)
+		fmt.Fprintf(stdout, "  mode: [%s] → concurrency = %d cpu * %d%% = %d, bw-limit = %d MiB/s * %d%% = %d MiB/s\n",
+			loadStrategy, miniProbe.ServerCPU, gentleCPUPct, miniProbe.SuggestedConcurrency, linkMiBPerSec, gentleBWPct, effectiveLinkMiBPerSec)
+	} else {
+		fmt.Fprintf(stdout, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s)\n",
+			miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec)
+		fmt.Fprintf(stdout, "  mode: [%s] → concurrency = %d cpu * %d io-depth = %d, bw-limit = none\n",
+			loadStrategy, miniProbe.ServerCPU, miniProbe.ServerIODepth, miniProbe.SuggestedConcurrency)
+	}
+	if cfg.concurrencyExplicit {
+		fmt.Fprintf(stdout, "  concurrency: %d (override from --concurrency, server suggested %d)\n",
+			effectiveConcurrency, miniProbe.SuggestedConcurrency)
+	} else {
+		fmt.Fprintf(stdout, "  concurrency: %d\n", effectiveConcurrency)
+	}
+	fmt.Fprintf(stdout, "    window: %d\n", batchPlan.EffectiveWinConc)
+	fmt.Fprintf(stdout, "    batch-per-window: %d\n", batchPlan.PerFileWorkers)
+	fmt.Fprintf(stdout, "  batch: %s (from %s)\n",
+		encoding.HumanBytes(batchPlan.BatchMaxBytes),
+		formatStartBatchCause(batchPlan))
+	fmt.Fprintln(stdout, formatStartBatchWindowLine(client.FileRequestWindowBytes, batchPlan))
+	if bwProbeLine := formatStartBatchProbeLine(effectiveLinkMiBPerSec, miniProbe.SuggestedConcurrency, batchPlan); bwProbeLine != "" {
+		fmt.Fprintln(stdout, bwProbeLine)
+	}
+	transferCtx, cancelTransfer := context.WithCancel(context.Background())
+	defer cancelTransfer()
+	probeInfo := startTransferProbeReporter(transferCtx, client, manifest.TransferID, loadStrategy, defaultCLIProbeBytes, manifest.LinkMbps)
+	defer probeInfo.stop()
 
 	startAll := time.Now()
 	var completed int64
@@ -2245,11 +2414,6 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		failuresMu.Lock()
 		failures = append(failures, err)
 		failuresMu.Unlock()
-	}
-	var stopStatusPolling func()
-	if cfg.verbosity >= 1 {
-		stopStatusPolling = startVerboseStatusPolling(txferID, client, stderr)
-		defer stopStatusPolling()
 	}
 	pendingEntries := make([]ManifestEntry, 0, len(manifest.Entries))
 	for _, entry := range manifest.Entries {
@@ -2271,6 +2435,15 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		pendingEntries = append(pendingEntries, entry)
 	}
 	var totalCopied atomic.Int64
+	var totalPendingBytes int64
+	for _, e := range pendingEntries {
+		totalPendingBytes += e.Size
+	}
+	var stopStatusPolling func()
+	if cfg.verbosity >= 1 {
+		stopStatusPolling = startVerboseStatusPolling(txferID, client, &totalCopied, totalPendingBytes, probeInfo, stderr)
+		defer stopStatusPolling()
+	}
 	outputWriter := func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 		destPath := resolveDownloadDestinationPath(entry, outRoot, "")
 		w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, cfg.noSync)
@@ -2296,13 +2469,14 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		})
 		defer func() { stopProgressFile(len(failures) == 0) }()
 	}
-	startResp, err := client.StartFromManifest(context.Background(), StartFromManifestRequest{
-		Manifest:        manifest,
-		Entries:         pendingEntries,
-		OutputWriter:    outputWriter,
-		Concurrency:     effectiveConcurrency,
-		BatchMaxBytes:   batchSize,
-		ProgressUpdates: progressUpdates,
+	startResp, err := client.StartFromManifest(transferCtx, StartFromManifestRequest{
+		Manifest:           manifest,
+		Entries:            pendingEntries,
+		OutputWriter:       outputWriter,
+		Concurrency:        effectiveConcurrency,
+		BatchMaxBytes:      batchSize,
+		SplitWindowWorkers: batchPlan.SplitWindowWorkers,
+		ProgressUpdates:    progressUpdates,
 		OnFileDone: func(evt StartFileDoneEvent) {
 			entry, ok := entryByID[evt.File.Meta.FileID]
 			if !ok {
@@ -2342,9 +2516,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	failuresMu.Lock()
 	finalFailures := append([]error(nil), failures...)
 	failuresMu.Unlock()
-	for _, err := range finalFailures {
-		fmt.Fprintf(stderr, "start error: %v\n", err)
-	}
+	printTransferErrors(stderr, "start", finalFailures, cfg.verbosity)
 
 	elapsedAll := time.Since(startAll)
 	overallSpeed := 0.0
@@ -2424,14 +2596,14 @@ func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta Fi
 	io.WriteString(stdout, sb.String())
 }
 
-func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer) func() {
+func startVerboseStatusPolling(txferID string, client *Client, localCopied *atomic.Int64, localTotalBytes int64, probe *probeReporter, stderr io.Writer) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(defaultVerboseProgressInterval)
 		defer ticker.Stop()
-		var prevDoneSize int64
+		var prevCopied int64
 		prevTime := time.Now()
 		for {
 			statusResp, statusErr := client.GetStatus(ctx, GetStatusRequest{
@@ -2444,29 +2616,43 @@ func startVerboseStatusPolling(txferID string, client *Client, stderr io.Writer)
 				fmt.Fprintf(stderr, "status refresh failed: %v\n", statusErr)
 			} else {
 				s := statusResp.Status
+				// Use local byte counter for rate/ETA — it updates on every
+				// frame write, not just on ACK, so rate is never stuck at 0
+				// while data is actively streaming.
+				copied := localCopied.Load()
+				totalBytes := localTotalBytes
+				if s.TotalSize > totalBytes {
+					totalBytes = s.TotalSize
+				}
 				now := time.Now()
 				dt := now.Sub(prevTime).Seconds()
 				var rateBps float64
 				if dt > 0 {
-					rateBps = float64(s.DoneSize-prevDoneSize) / dt
+					rateBps = float64(copied-prevCopied) / dt
 				}
-				prevDoneSize = s.DoneSize
+				prevCopied = copied
 				prevTime = now
 
-				etaPart := ""
-				if rateBps > 0 && s.TotalSize > s.DoneSize {
-					remaining := float64(s.TotalSize - s.DoneSize)
-					etaSec := remaining / rateBps
-					etaPart = fmt.Sprintf(" eta=%s", (time.Duration(etaSec * float64(time.Second))).Round(time.Second))
+				var pctBytes float64
+				if totalBytes > 0 {
+					pctBytes = float64(copied) * 100 / float64(totalBytes)
 				}
+				etaDisplay := fixedWidthETANA()
+				if rateBps > 0 && totalBytes > copied {
+					remaining := float64(totalBytes - copied)
+					etaSec := remaining / rateBps
+					etaDisplay = fixedWidthETA(time.Duration(etaSec * float64(time.Second)))
+				}
+				probePart := formatProbeRateSuffix(now, rateBps, probe)
 				fmt.Fprintf(
 					stderr,
-					"transfer-progress:[%6s/%6s](%5.1f%%) bytes=[%8s/%8s](%5.1f%%) rate=%6s%s\n",
+					"txfer-progress:[%6s/%6s](%5.1f%%) [%s/%s](%5.1f%%) [eta:%s]@[%s]%s\n",
 					encoding.HumanCount(s.Done, 6), encoding.HumanCount(uint64(s.NumFiles), 6),
 					s.PercentFiles,
-					encoding.HumanBytes(s.DoneSize), encoding.HumanBytes(s.TotalSize),
-					s.PercentBytes,
-					encoding.HumanRate(rateBps), etaPart,
+					encoding.HumanBytesFixedWidth(copied, fixedWidthProgressBytesWidth),
+					encoding.HumanBytesFixedWidth(totalBytes, fixedWidthProgressBytesWidth),
+					pctBytes,
+					etaDisplay, encoding.HumanRateFixedWidth(rateBps, fixedWidthProgressRateWidth), probePart,
 				)
 			}
 			select {
@@ -3249,7 +3435,7 @@ func (r *verboseProgressReporter) emitLocked(fileID uint64, st *verboseProgressS
 	eta := "n/a"
 	if rateBps > 0 && copied < st.targetBytes {
 		remaining := st.targetBytes - copied
-		eta = humanETA(time.Duration(float64(remaining) / rateBps * float64(time.Second)))
+		eta = fixedWidthETA(time.Duration(float64(remaining) / rateBps * float64(time.Second)))
 	}
 
 	fmt.Fprintf(
@@ -3257,10 +3443,10 @@ func (r *verboseProgressReporter) emitLocked(fileID uint64, st *verboseProgressS
 		"file progress[%d]: %d%% bytes=%s/%s [%s] rate=%s eta=%s\n",
 		fileID,
 		pct,
-		encoding.HumanBytes(copied),
-		encoding.HumanBytes(st.targetBytes),
-		encoding.HumanBytes(acked),
-		encoding.HumanRate(rateBps),
+		encoding.HumanBytesFixedWidth(copied, fixedWidthProgressBytesWidth),
+		encoding.HumanBytesFixedWidth(st.targetBytes, fixedWidthProgressBytesWidth),
+		encoding.HumanBytesFixedWidth(acked, fixedWidthProgressBytesWidth),
+		encoding.HumanRateFixedWidth(rateBps, fixedWidthProgressRateWidth),
 		eta,
 	)
 
@@ -3286,6 +3472,85 @@ func humanETA(d time.Duration) string {
 		return "0s"
 	}
 	return d.Round(time.Second).String()
+}
+
+func fixedWidthETA(d time.Duration) string {
+	return fmt.Sprintf("%5s", compactETA(d))
+}
+
+func fixedWidthETANA() string {
+	return fmt.Sprintf("%5s", "n/a")
+}
+
+func fixedWidthHumanDuration(d time.Duration) string {
+	return fmt.Sprintf("%4s", humanETA(d))
+}
+
+func compactETA(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	seconds := d.Round(time.Second).Seconds()
+	switch {
+	case seconds < 60:
+		return fmt.Sprintf("%.0fs", seconds)
+	case seconds < 60*60:
+		return fmt.Sprintf("%.1fm", seconds/60)
+	case seconds < 24*60*60:
+		return fmt.Sprintf("%.1fh", seconds/3600)
+	case seconds < 7*24*60*60:
+		return fmt.Sprintf("%.1fd", seconds/(24*3600))
+	default:
+		return fmt.Sprintf("%.1fw", seconds/(7*24*3600))
+	}
+}
+
+func effectiveModeLinkMbps(strategy string, linkMbps int64, gentleBWPct int) int64 {
+	if !strings.EqualFold(strings.TrimSpace(strategy), LoadStrategyGentle) || linkMbps <= 0 {
+		return linkMbps
+	}
+	gentleBWPct = NormalizeGentleBWPct(gentleBWPct)
+	scaled := (linkMbps * int64(gentleBWPct)) / 100
+	if (linkMbps*int64(gentleBWPct))%100 != 0 {
+		scaled++
+	}
+	return max(int64(1), scaled)
+}
+
+func effectiveProbeLimitBps(probe *probeReporter) (limitBps int64, basis string, hardLimit bool) {
+	if probe == nil {
+		return 0, "", false
+	}
+	if limiterBps := probe.limiterBps.Load(); limiterBps > 0 {
+		return limiterBps, "limit", true
+	}
+	if linkMbps := probe.linkMbps.Load(); linkMbps > 0 {
+		return (linkMbps * 1_000_000) / 8, "link", false
+	}
+	return 0, "", false
+}
+
+func formatProbeRateSuffix(now time.Time, rateBps float64, probe *probeReporter) string {
+	if probe == nil {
+		return ""
+	}
+	limitBps, basis, hardLimit := effectiveProbeLimitBps(probe)
+	lastProbeUnixS := probe.lastProbeUnixS.Load()
+	if limitBps <= 0 || basis == "" || lastProbeUnixS <= 0 {
+		return ""
+	}
+	pctOfLimit := int(math.Round((rateBps * 100) / float64(limitBps)))
+	if pctOfLimit < 0 {
+		pctOfLimit = 0
+	}
+	if !hardLimit && pctOfLimit > 100 {
+		pctOfLimit = 100
+	}
+	age := now.Sub(time.Unix(lastProbeUnixS, 0))
+	if age < 0 {
+		age = 0
+	}
+	return fmt.Sprintf(" (%d%% of %s=%s @%s)", pctOfLimit, basis, encoding.HumanRate(float64(limitBps)), fixedWidthHumanDuration(age))
 }
 
 func printFileMetrics(stdout io.Writer, txferID string, fileID uint64, path string, meta FileFrameMeta, localFileHash string, elapsed time.Duration) {

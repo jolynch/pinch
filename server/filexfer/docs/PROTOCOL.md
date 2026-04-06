@@ -227,19 +227,30 @@ Returns transfer status JSON. Two forms:
 ## PROBE
 
 Latency/throughput probe used before `TXFER` so the client can send transfer hints.
+Clients may continue probing every 10s during an active transfer to refresh the
+server's observed link estimate for gentle limiting.
 
 ### Request
 
-`PROBE cpu=<client-cpu> probe-bytes=<n> cts0=<unix-ms>`
+`PROBE cpu=<client-cpu> probe-bytes=<n> cts0=<unix-ms> [txferid=<id>] [obs-link-mbps=<int>]`
 
 - request line is followed by exactly `probe-bytes` raw bytes.
 - `probe-bytes` must be `<= 32 MiB`.
+- `txferid` is optional and scopes periodic reprobe updates to an existing transfer.
+- `obs-link-mbps` is optional and reports the client's last measured link bandwidth.
+  When provided, the server uses it to refresh the per-transfer observed link estimate
+  for gentle limiting.
 
 ### Response
 
 - first line:
-  - `PROBE cpu=<server-cpu> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n>`
+  - `PROBE cpu=<server-cpu> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n> [io-depth=<int>] [wmem=<bytes>] gentle-cpu-pct=<int> gentle-bw-pct=<int> [limiter-bps=<bytes/sec>]`
 - then exactly `probe-bytes` raw bytes.
 - terminal status line: `OK` or `ERR ...`.
+- `gentle-cpu-pct` is the server-advertised CPU budget clients use when computing
+  gentle suggested concurrency.
+- `gentle-bw-pct` is the server-advertised share of observed link bandwidth used
+  to derive gentle transfer rate limits.
+- `PROBE` traffic itself is not rate-limited.
 
 Clients typically run 3 probes, compute a rounded link estimate, choose mode/concurrency, then issue `TXFER` with those required hints.

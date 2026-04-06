@@ -18,6 +18,7 @@ import (
 	"filippo.io/age"
 	"github.com/jolynch/pinch/internal/aead"
 	ftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
+	intlimit "github.com/jolynch/pinch/internal/filexfer/limit"
 )
 
 const maxTCPLineBytes = 4 * 1024 * 1024
@@ -34,12 +35,15 @@ type tcpAuthState struct {
 type probeResponse struct {
 	ServerCPU       int
 	ServerIODepth   int
+	GentleCPUPct    int
+	GentleBWPct     int
 	CTS0            int64
 	CTS1            int64
 	STS0            int64
 	STS1            int64
 	ProbeBytes      int64
 	ServerWmemBytes int64
+	LimiterBps      int64
 }
 
 func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
@@ -658,7 +662,7 @@ func readTCPStatus(br *bufio.Reader) (string, error) {
 	return message, nil
 }
 
-func (c *Client) probeTCP(ctx context.Context, probeBytes int64) (probeResponse, error) {
+func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int64) (probeResponse, error) {
 	if probeBytes <= 0 {
 		return probeResponse{}, errors.New("probe bytes must be > 0")
 	}
@@ -678,6 +682,12 @@ func (c *Client) probeTCP(ctx context.Context, probeBytes int64) (probeResponse,
 	cts0 := time.Now().UnixMilli()
 	localCPU := runtime.NumCPU()
 	cmd := fmt.Sprintf("PROBE cpu=%d probe-bytes=%d cts0=%d", localCPU, probeBytes, cts0)
+	if txferID := strings.TrimSpace(req.TransferID); txferID != "" {
+		cmd += " txferid=" + txferID
+		if req.ObservedLinkMbps > 0 {
+			cmd += " obs-link-mbps=" + strconv.FormatInt(req.ObservedLinkMbps, 10)
+		}
+	}
 	if err := c.sendTCPProbe(conn, state, cmd, probeBytes); err != nil {
 		return probeResponse{}, fmt.Errorf("send PROBE: %w", err)
 	}
@@ -795,18 +805,29 @@ func parseProbeResponseLine(line string) (probeResponse, error) {
 	if ioDepth <= 0 {
 		ioDepth = 1
 	}
+	gentleCPUPct, _ := strconv.Atoi(strings.TrimSpace(p["gentle-cpu-pct"]))
+	gentleCPUPct = intlimit.NormalizeGentleCPUPct(gentleCPUPct)
+	gentleBWPct, _ := strconv.Atoi(strings.TrimSpace(p["gentle-bw-pct"]))
+	gentleBWPct = intlimit.NormalizeGentleBWPct(gentleBWPct)
 	wmemBytes, _ := strconv.ParseInt(strings.TrimSpace(p["wmem"]), 10, 64)
 	if wmemBytes < 0 {
 		wmemBytes = 0
 	}
+	limiterBps, _ := strconv.ParseInt(strings.TrimSpace(p["limiter-bps"]), 10, 64)
+	if limiterBps < 0 {
+		limiterBps = 0
+	}
 	return probeResponse{
 		ServerCPU:       serverCPU,
 		ServerIODepth:   ioDepth,
+		GentleCPUPct:    gentleCPUPct,
+		GentleBWPct:     gentleBWPct,
 		CTS0:            cts0,
 		STS0:            sts0,
 		STS1:            sts1,
 		ProbeBytes:      probeBytes,
 		ServerWmemBytes: wmemBytes,
+		LimiterBps:      limiterBps,
 	}, nil
 }
 
