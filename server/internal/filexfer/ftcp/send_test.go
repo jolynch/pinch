@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/internal/filexfer/limit"
 	"github.com/zeebo/xxh3"
 )
 
@@ -44,6 +45,12 @@ func (d *sendTestDeps) GetTransfer(string) (Transfer, bool) { return Transfer{},
 func (d *sendTestDeps) ListTransfers() []Transfer           { return nil }
 
 func (d *sendTestDeps) SetTransferHints(string, string, int64, int) bool { return true }
+func (d *sendTestDeps) GetTransferGentleLimiter(string, int64, int, int64) *limit.Limiter {
+	return nil
+}
+func (d *sendTestDeps) ReportTransferObservedLink(string, int64, int, int64, float64) (TransferObservedLinkUpdate, bool) {
+	return TransferObservedLinkUpdate{}, false
+}
 
 func (d *sendTestDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
 	fd, err := os.Open(d.filePath)
@@ -97,6 +104,7 @@ func (d *sendTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { ret
 func (d *sendTestDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (d *sendTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
 func (d *sendTestDeps) MarkTransferTooSlow(string) bool                  { return false }
+func (d *sendTestDeps) GetTransferLimiterBps(string) int64                { return 0 }
 func (d *sendTestDeps) Root() string                                     { return "/" }
 
 func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {

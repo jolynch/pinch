@@ -251,6 +251,16 @@ func TestParseRequestPROBE(t *testing.T) {
 	}
 }
 
+func TestParseRequestPROBEOptionalFields(t *testing.T) {
+	req, err := ParseRequest([]byte(`PROBE cpu=8 probe-bytes=1048576 cts0=100 txferid=tx1 obs-link-mbps=900 gentle-cpu-pct=30 gentle-bw-pct=40`))
+	if err != nil {
+		t.Fatalf("ParseRequest err: %v", err)
+	}
+	if req.Params[0]["txferid"] != "tx1" || req.Params[0]["obs-link-mbps"] != "900" || req.Params[0]["gentle-cpu-pct"] != "30" || req.Params[0]["gentle-bw-pct"] != "40" {
+		t.Fatalf("unexpected optional PROBE params: %#v", req.Params[0])
+	}
+}
+
 func TestParseRequestPROBEMissingRequired(t *testing.T) {
 	_, err := ParseRequest([]byte(`PROBE cpu=8 cts0=100`))
 	if err == nil {

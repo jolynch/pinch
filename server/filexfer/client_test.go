@@ -188,9 +188,9 @@ func TestNewClientLoadStrategyOption(t *testing.T) {
 
 func TestSummarizeProbeResultsAndConcurrency(t *testing.T) {
 	results := []probeResponse{
-		{ServerCPU: 24, CTS0: 1000, CTS1: 1040, STS0: 1005, STS1: 1010},
-		{ServerCPU: 24, CTS0: 2000, CTS1: 2045, STS0: 2005, STS1: 2010},
-		{ServerCPU: 24, CTS0: 3000, CTS1: 3030, STS0: 3005, STS1: 3010},
+		{ServerCPU: 24, GentleCPUPct: 25, CTS0: 1000, CTS1: 1040, STS0: 1005, STS1: 1010},
+		{ServerCPU: 24, GentleCPUPct: 25, CTS0: 2000, CTS1: 2045, STS0: 2005, STS1: 2010},
+		{ServerCPU: 24, GentleCPUPct: 25, CTS0: 3000, CTS1: 3030, STS0: 3005, STS1: 3010},
 	}
 	summary := summarizeProbeSamples(results, 1*1024*1024)
 	if summary.ServerCPU != 24 {
@@ -202,11 +202,46 @@ func TestSummarizeProbeResultsAndConcurrency(t *testing.T) {
 	if summary.LinkMbps <= 0 {
 		t.Fatalf("expected rounded mbps > 0, got %d", summary.LinkMbps)
 	}
-	if got := suggestedConcurrencyFromProbe(24, 8, LoadStrategyGentle); got != 6 {
+	if got := suggestedConcurrencyFromProbe(24, 8, LoadStrategyGentle, 25); got != 6 {
 		t.Fatalf("expected gentle concurrency 6, got %d", got)
 	}
-	if got := suggestedConcurrencyFromProbe(24, 8, LoadStrategyFast); got != 192 {
+	if got := suggestedConcurrencyFromProbe(24, 8, LoadStrategyFast, 25); got != 192 {
 		t.Fatalf("expected fast concurrency 192, got %d", got)
+	}
+}
+
+func TestSuggestedConcurrencyFromProbeUsesServerGentlePercent(t *testing.T) {
+	if got := suggestedConcurrencyFromProbe(24, 8, LoadStrategyGentle, 50); got != 12 {
+		t.Fatalf("expected gentle concurrency 12, got %d", got)
+	}
+	if got := suggestedConcurrencyFromProbe(3, 8, LoadStrategyGentle, 34); got != 2 {
+		t.Fatalf("expected gentle concurrency 2, got %d", got)
+	}
+}
+
+func TestParseProbeResponseLineGentlePercents(t *testing.T) {
+	resp, err := parseProbeResponseLine("PROBE cpu=24 io-depth=8 cts0=100 sts0=110 sts1=120 probe-bytes=1024 wmem=4096 gentle-cpu-pct=30 gentle-bw-pct=40")
+	if err != nil {
+		t.Fatalf("parseProbeResponseLine failed: %v", err)
+	}
+	if resp.GentleCPUPct != 30 {
+		t.Fatalf("expected gentle cpu pct 30, got %d", resp.GentleCPUPct)
+	}
+	if resp.GentleBWPct != 40 {
+		t.Fatalf("expected gentle bw pct 40, got %d", resp.GentleBWPct)
+	}
+}
+
+func TestParseProbeResponseLineDefaultsGentlePercents(t *testing.T) {
+	resp, err := parseProbeResponseLine("PROBE cpu=24 io-depth=8 cts0=100 sts0=110 sts1=120 probe-bytes=1024 wmem=4096")
+	if err != nil {
+		t.Fatalf("parseProbeResponseLine failed: %v", err)
+	}
+	if resp.GentleCPUPct != defaultGentleCPUPct {
+		t.Fatalf("expected default gentle cpu pct %d, got %d", defaultGentleCPUPct, resp.GentleCPUPct)
+	}
+	if resp.GentleBWPct != defaultGentleBWPct {
+		t.Fatalf("expected default gentle bw pct %d, got %d", defaultGentleBWPct, resp.GentleBWPct)
 	}
 }
 
@@ -1120,6 +1155,95 @@ func TestGetFilesSplitsLargeSingleFileWindows(t *testing.T) {
 	}
 }
 
+func TestGetFilesSplitWindowWorkersCapsConcurrency(t *testing.T) {
+	outRoot := t.TempDir()
+	destPath := filepath.Join(outRoot, "big.bin")
+	if err := os.WriteFile(destPath, nil, 0o644); err != nil {
+		t.Fatalf("create destination: %v", err)
+	}
+
+	manifest := &Manifest{
+		TransferID: "txsplitcap",
+		Root:       "/remote",
+		Entries: []ManifestEntry{
+			{ID: 0, Size: 12, Path: "big.bin"},
+		},
+	}
+	payload := []byte("abcdefghijkl")
+
+	var (
+		mu          sync.Mutex
+		inFlight    int
+		maxInFlight int
+	)
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			mu.Lock()
+			inFlight++
+			if inFlight > maxInFlight {
+				maxInFlight = inFlight
+			}
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				inFlight--
+				mu.Unlock()
+			}()
+
+			sendParam := req.Params[len(req.Params)-1]
+			offset := int64(0)
+			if rawOffset := sendParam["offset"]; rawOffset != "" {
+				parsedOffset, err := strconv.ParseInt(rawOffset, 10, 64)
+				if err != nil {
+					return fmt.Errorf("parse offset: %w", err)
+				}
+				offset = parsedOffset
+			}
+			size, err := strconv.ParseInt(sendParam["size"], 10, 64)
+			if err != nil {
+				return fmt.Errorf("parse size: %w", err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			_, err = io.WriteString(out, buildFXFrame(t, 0, "none", offset, payload[offset:offset+size], nil))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL, WithFileRequestWindowBytes(12))
+	_, err := client.GetFiles(context.Background(), GetFilesRequest{
+		Manifest:           manifest,
+		FileIDs:            []uint64{0},
+		BatchMaxBytes:      4,
+		SplitWindowWorkers: 1,
+		ProgressUpdates:    make(chan DownloadProgressUpdate, 8),
+		OutputWriter: func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
+			fd, err := os.OpenFile(destPath, os.O_RDWR|os.O_CREATE, 0o644)
+			if err != nil {
+				return nil, nil, err
+			}
+			if _, err := fd.Seek(offset, io.SeekStart); err != nil {
+				_ = fd.Close()
+				return nil, nil, err
+			}
+			return fd, func() error { return nil }, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("GetFiles failed: %v", err)
+	}
+	if maxInFlight != 1 {
+		t.Fatalf("expected split-window concurrency cap of 1, got %d", maxInFlight)
+	}
+}
+
 func TestGetFilesUsesMultiACK(t *testing.T) {
 	outRoot := t.TempDir()
 	manifest := &Manifest{
@@ -1711,72 +1835,112 @@ func TestSuggestBatchMaxBytes(t *testing.T) {
 		name                 string
 		conc, winConc        int
 		windowBytes, srvWmem int64
+		linkMbps             int64
 		want                 int64
 	}{
 		// Fast mode: 24 cpu * 8 io = 192 conc, winConc=4, perFile=48
 		// 1GiB/48 ≈ 21.3 MiB → ceil pow2 = 32 MiB
-		{"fast 24cpu*8io", 192, 4, 1 << 30, 4 * mib, 32 * mib},
+		// linkMbps=0 → no bw cap
+		{"fast 24cpu*8io", 192, 4, 1 << 30, 4 * mib, 0, 32 * mib},
 
 		// Fast mode: 2 cpu * 8 io = 16, winConc=4, perFile=4
 		// 1GiB/4 = 256 MiB
-		{"fast 2cpu*8io", 16, 4, 1 << 30, 4 * mib, 256 * mib},
+		{"fast 2cpu*8io", 16, 4, 1 << 30, 4 * mib, 0, 256 * mib},
 
 		// Gentle 24 cpu: conc=6, 6/4=1 < 2 → winConc=6, perFile=1
 		// batch = 1 GiB (capped at window)
-		{"gentle 24cpu conc=6", 6, 4, 1 << 30, 4 * mib, 1 << 30},
+		{"gentle 24cpu conc=6", 6, 4, 1 << 30, 4 * mib, 0, 1 << 30},
 
 		// Gentle 32 cpu: conc=8, 8/4=2 → perFile=2
 		// 1GiB/2 = 512 MiB
-		{"gentle 32cpu conc=8", 8, 4, 1 << 30, 4 * mib, 512 * mib},
+		{"gentle 32cpu conc=8", 8, 4, 1 << 30, 4 * mib, 0, 512 * mib},
 
 		// Zero concurrency defaults to 1
-		{"zero conc defaults", 0, 0, 1 << 30, 4 * mib, 1 << 30},
+		{"zero conc defaults", 0, 0, 1 << 30, 4 * mib, 0, 1 << 30},
 
 		// Negative values default safely
-		{"negative conc", -5, -2, 1 << 30, 4 * mib, 1 << 30},
+		{"negative conc", -5, -2, 1 << 30, 4 * mib, 0, 1 << 30},
 
 		// Socket buffer floor: 192 conc → 48 perFile → 1MiB batch
 		// but floor at max(4MiB, clientRmem)
-		{"batch floors at socket buf", 192, 4, 32 * mib, 4 * mib, max(4*mib, clientRmem)},
+		{"batch floors at socket buf", 192, 4, 32 * mib, 4 * mib, 0, max(4*mib, clientRmem)},
 
 		// Batch caps at window
-		{"batch caps at window", 2, 1, 8 * mib, 4 * mib, 8 * mib},
+		{"batch caps at window", 2, 1, 8 * mib, 4 * mib, 0, 8 * mib},
 
 		// Small window (< 1 MiB) returns window directly
-		{"sub-MiB window", 100, 4, 512 * 1024, 4 * mib, 512 * 1024},
+		{"sub-MiB window", 100, 4, 512 * 1024, 4 * mib, 0, 512 * 1024},
 
 		// High CPU fast mode: 256 cpu * 8 io = 2048 conc, winConc=4, perFile=512
 		// 1GiB/512 = 2 MiB
-		{"256 cpus fast", 2048, 4, 1 << 30, 4 * mib, max(4*mib, clientRmem)},
+		{"256 cpus fast", 2048, 4, 1 << 30, 4 * mib, 0, max(4*mib, clientRmem)},
+
+		// Bandwidth ceiling (500ms target): 8400 Mbps, conc=6
+		// perWorker=175 MB/s, 500ms=87.5 MB → pow2 down = 64 MiB
+		// Without bw cap: conc=6, 6/4<2 → winConc=6, perFile=1 → batch=1GiB
+		// With bw cap: min(1GiB, 64MiB) = 64 MiB
+		{"bw cap 8400mbps conc=6", 6, 4, 1 << 30, 4 * mib, 8400, 64 * mib},
+
+		// Bandwidth ceiling (500ms target): 1000 Mbps, conc=6
+		// perWorker=20.8 MB/s, 500ms=10.4 MB → pow2 down = 8 MiB
+		// Without bw cap: batch=1GiB; with bw cap: 8 MiB; floor max(4MiB,rmem) applies
+		{"bw cap 1000mbps conc=6", 6, 4, 1 << 30, 4 * mib, 1000, max(8*mib, clientRmem)},
+
+		// Bandwidth ceiling: very high link
+		// 100000 Mbps, conc=6 → perWorker≈2 GB/s, 500ms=1.04 GB → pow2 down = 512 MiB
+		// concurrency batch = 1GiB → min(1GiB, 512MiB) = 512 MiB
+		{"bw cap 100gbps", 6, 4, 1 << 30, 4 * mib, 100000, 512 * mib},
+
+		// Bandwidth ceiling with high concurrency:
+		// 8400 Mbps, conc=192 → perWorker=5.5 MB/s, 500ms=2.7 MB → pow2 down = 2 MiB
+		// concurrency batch = 32 MiB → min(32, 2) = 2 MiB, floor raises it
+		{"bw cap 8400mbps conc=192", 192, 4, 1 << 30, 4 * mib, 8400, max(4*mib, clientRmem)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := SuggestBatchMaxBytes(tt.conc, tt.winConc, tt.windowBytes, tt.srvWmem)
+			got := SuggestBatchMaxBytes(tt.conc, tt.winConc, tt.windowBytes, tt.srvWmem, tt.linkMbps)
 			if got != tt.want {
-				t.Fatalf("SuggestBatchMaxBytes(%d, %d, %d, %d) = %d, want %d",
-					tt.conc, tt.winConc, tt.windowBytes, tt.srvWmem, got, tt.want)
+				t.Fatalf("SuggestBatchMaxBytes(%d, %d, %d, %d, %d) = %d, want %d",
+					tt.conc, tt.winConc, tt.windowBytes, tt.srvWmem, tt.linkMbps, got, tt.want)
 			}
 		})
 	}
 }
 
+func TestExplainBatchMaxBytesBandwidthCapKeepsSplitWindowWorkers(t *testing.T) {
+	const mib = int64(1 << 20)
+	plan := ExplainBatchMaxBytes(6, 4, 1<<30, 4*mib, 8400)
+	if plan.BatchMaxBytes != 64*mib {
+		t.Fatalf("expected batch size 64 MiB, got %d", plan.BatchMaxBytes)
+	}
+	if plan.PerFileWorkers != 1 {
+		t.Fatalf("expected planned per-file workers to stay at 1, got %d", plan.PerFileWorkers)
+	}
+	if plan.SplitWindowWorkers != 1 {
+		t.Fatalf("expected split-window workers to stay capped at 1, got %d", plan.SplitWindowWorkers)
+	}
+}
+
 func FuzzSuggestBatchMaxBytes(f *testing.F) {
-	f.Add(192, 4, int64(1<<30), int64(4<<20))
-	f.Add(0, 0, int64(1<<30), int64(4<<20))
-	f.Add(-10, -5, int64(1<<20), int64(0))
-	f.Add(256, 128, int64(512<<20), int64(16<<20))
-	f.Add(6, 4, int64(1<<30), int64(4<<20))
-	f.Add(8, 4, int64(1<<30), int64(4<<20))
-	f.Add(1, 1, int64(1), int64(0))
-	f.Add(2048, 4, int64(1<<30), int64(4<<20))
-	f.Fuzz(func(t *testing.T, conc int, winConc int, windowBytes int64, serverWmem int64) {
+	f.Add(192, 4, int64(1<<30), int64(4<<20), int64(0))
+	f.Add(0, 0, int64(1<<30), int64(4<<20), int64(0))
+	f.Add(-10, -5, int64(1<<20), int64(0), int64(0))
+	f.Add(256, 128, int64(512<<20), int64(16<<20), int64(0))
+	f.Add(6, 4, int64(1<<30), int64(4<<20), int64(8400))
+	f.Add(8, 4, int64(1<<30), int64(4<<20), int64(1000))
+	f.Add(1, 1, int64(1), int64(0), int64(0))
+	f.Add(2048, 4, int64(1<<30), int64(4<<20), int64(100000))
+	f.Fuzz(func(t *testing.T, conc int, winConc int, windowBytes int64, serverWmem int64, linkMbps int64) {
 		if windowBytes <= 0 {
 			return
 		}
 		if serverWmem < 0 {
 			serverWmem = 0
 		}
-		got := SuggestBatchMaxBytes(conc, winConc, windowBytes, serverWmem)
+		if linkMbps < 0 {
+			linkMbps = 0
+		}
+		got := SuggestBatchMaxBytes(conc, winConc, windowBytes, serverWmem, linkMbps)
 		const mib = int64(1 << 20)
 
 		// Property 1: power of 2 MiB (when result >= 1 MiB)

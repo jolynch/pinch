@@ -7,6 +7,9 @@ import (
 	"strings"
 )
 
+var humanByteUnits = []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+var humanRateUnits = []string{"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s", "PiB/s", "EiB/s"}
+
 func ParseByteSize(raw string) (int64, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -30,36 +33,28 @@ func ParseByteSize(raw string) (int64, error) {
 }
 
 func HumanBytes(v int64) string {
-	if v <= 0 {
-		return "0 B"
-	}
-	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
-	value := float64(v)
-	unit := 0
-	for value >= 1024 && unit < len(units)-1 {
-		value /= 1024
-		unit++
-	}
-	if unit == 0 {
-		return fmt.Sprintf("%.0f %s", value, units[unit])
-	}
-	return fmt.Sprintf("%.2f %s", value, units[unit])
+	return formatHumanBinary(float64(v), humanByteUnits, 0)
+}
+
+func HumanBytesFixedWidth(v int64, width int) string {
+	return formatHumanBinary(float64(v), humanByteUnits, width)
 }
 
 func HumanRate(bps float64) string {
-	if bps <= 0 {
-		return "0 B/s"
+	return formatHumanBinary(bps, humanRateUnits, 0)
+}
+
+func HumanRateFixedWidth(bps float64, width int) string {
+	return formatHumanBinary(bps, humanRateUnits, width)
+}
+
+func formatHumanBinary(value float64, units []string, width int) string {
+	scaled, unit, decimals := scaleHumanBinary(value, units)
+	formatted := formatHumanValue(scaled, unit, decimals)
+	if width > 0 {
+		return fmt.Sprintf("%*s", width, formatted)
 	}
-	units := []string{"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"}
-	unit := 0
-	for bps >= 1024 && unit < len(units)-1 {
-		bps /= 1024
-		unit++
-	}
-	if unit == 0 {
-		return fmt.Sprintf("%.0f %s", bps, units[unit])
-	}
-	return fmt.Sprintf("%.2f %s", bps, units[unit])
+	return formatted
 }
 
 func HumanCount(n uint64, width int) string {
@@ -100,6 +95,33 @@ func HumanCount(n uint64, width int) string {
 		return raw[len(raw)-width:]
 	}
 	return fmt.Sprintf("%*s", width, raw)
+}
+
+func scaleHumanBinary(value float64, units []string) (scaled float64, unit string, decimals int) {
+	if len(units) == 0 {
+		return value, "", 0
+	}
+	absValue := value
+	if absValue < 0 {
+		absValue = -absValue
+	}
+	unitIdx := 0
+	for absValue >= 1024 && unitIdx < len(units)-1 {
+		absValue /= 1024
+		value /= 1024
+		unitIdx++
+	}
+	if unitIdx == 0 {
+		return value, units[unitIdx], 0
+	}
+	return value, units[unitIdx], 2
+}
+
+func formatHumanValue(value float64, unit string, decimals int) string {
+	if decimals == 0 {
+		return fmt.Sprintf("%.0f %s", value, unit)
+	}
+	return fmt.Sprintf("%.2f %s", value, unit)
 }
 
 func parseHumanValueAndUnit(raw string) (float64, string, error) {

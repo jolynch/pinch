@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/jolynch/pinch/internal/filexfer/limit"
 	intstore "github.com/jolynch/pinch/internal/filexfer/store"
 )
 
@@ -15,6 +16,7 @@ type TransferFileState = intstore.TransferFileState
 type TransferFileStateUpdate = intstore.TransferFileStateUpdate
 type FileRef = intstore.FileRef
 type FileLookupError = intstore.FileLookupError
+type TransferObservedLinkUpdate = intstore.TransferObservedLinkUpdate
 
 const (
 	TransferStateStarted = intstore.TransferStateStarted
@@ -32,6 +34,9 @@ type Deps interface {
 	GetTransfer(txferID string) (Transfer, bool)
 	ListTransfers() []Transfer
 	SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool
+	GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter
+	ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool)
+	GetTransferLimiterBps(txferID string) int64
 	GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error)
 	GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error)
 
@@ -90,6 +95,18 @@ func (runtimeDeps) ListTransfers() []Transfer {
 
 func (runtimeDeps) SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
 	return intstore.SetTransferHints(txferID, mode, linkMbps, concurrency)
+}
+
+func (runtimeDeps) GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter {
+	return intstore.GetTransferGentleLimiter(txferID, fallbackLinkMbps, gentleBWPct, burstBytes)
+}
+
+func (runtimeDeps) ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
+	return intstore.ReportTransferObservedLink(txferID, observedLinkMbps, gentleBWPct, burstBytes, emaAlpha)
+}
+
+func (runtimeDeps) GetTransferLimiterBps(txferID string) int64 {
+	return intstore.GetTransferLimiterBps(txferID)
 }
 
 func (runtimeDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {

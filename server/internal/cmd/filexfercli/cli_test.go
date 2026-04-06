@@ -3,6 +3,7 @@ package filexfercli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -305,7 +306,7 @@ func writeCLIProbeResponse(req intftcp.Request, out io.Writer) error {
 	if err != nil || n < 0 {
 		return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
 	}
-	if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+	if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 io-depth=1 cts0=%s sts0=10 sts1=11 probe-bytes=%d gentle-cpu-pct=25 gentle-bw-pct=25\n", cts0, n)); err != nil {
 		return err
 	}
 	if n > 0 {
@@ -371,7 +372,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 			if err != nil || n < 0 {
 				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
 			}
-			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 io-depth=1 cts0=%s sts0=10 sts1=11 probe-bytes=%d gentle-cpu-pct=25 gentle-bw-pct=25\n", cts0, n)); err != nil {
 				return err
 			}
 			if n > 0 {
@@ -502,7 +503,7 @@ func TestRunCLITransferWithEncryptAuto(t *testing.T) {
 			if err != nil || n < 0 {
 				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
 			}
-			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 io-depth=1 cts0=%s sts0=10 sts1=11 probe-bytes=%d gentle-cpu-pct=25 gentle-bw-pct=25\n", cts0, n)); err != nil {
 				return err
 			}
 			if n > 0 {
@@ -561,7 +562,7 @@ func TestRunCLITransferWithEncryptAES(t *testing.T) {
 			if err != nil || n < 0 {
 				return fmt.Errorf("invalid probe-bytes: %q", req.Params[0]["probe-bytes"])
 			}
-			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 cts0=%s sts0=10 sts1=11 probe-bytes=%d\n", cts0, n)); err != nil {
+			if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 io-depth=1 cts0=%s sts0=10 sts1=11 probe-bytes=%d gentle-cpu-pct=25 gentle-bw-pct=25\n", cts0, n)); err != nil {
 				return err
 			}
 			if n > 0 {
@@ -650,9 +651,14 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "start-plan: strategy=gentle link=700Mbps conc=2") ||
-		!strings.Contains(stdout.String(), "srv-conc=(24 cpu * 1 io = 6)") {
-		t.Fatalf("missing start plan line: %s", stdout.String())
+	out := stdout.String()
+	if !strings.Contains(out, "mode: [gentle]") ||
+		!strings.Contains(out, "concurrency: 2 (override from --concurrency") ||
+		!strings.Contains(out, "    window: ") ||
+		!strings.Contains(out, "    batch-per-window: ") ||
+		!strings.Contains(out, "server: 24 cpu, 1 io-depth") ||
+		!strings.Contains(out, "25% gentle-bw") {
+		t.Fatalf("missing start plan output: %s", out)
 	}
 	// After start, staging dir is renamed to target dir.
 	for _, p := range []string{"a.txt", "b.txt"} {
@@ -699,9 +705,13 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "start-plan: strategy=fast link=1200Mbps conc=5") ||
-		!strings.Contains(stdout.String(), "srv-conc=(24 cpu * 1 io = 24)") {
-		t.Fatalf("missing default start plan line: %s", stdout.String())
+	out := stdout.String()
+	if !strings.Contains(out, "mode: [fast]") ||
+		!strings.Contains(out, "concurrency: 5") ||
+		!strings.Contains(out, "    window: ") ||
+		!strings.Contains(out, "    batch-per-window: ") ||
+		!strings.Contains(out, "server: 24 cpu, 1 io-depth") {
+		t.Fatalf("missing default start plan output: %s", out)
 	}
 }
 
@@ -767,7 +777,6 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 	}
 }
 
-
 func TestRunCLIStartDiscardSkipsCompletedMetadataRefresh(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
@@ -798,6 +807,369 @@ func TestRunCLIStartDiscardSkipsCompletedMetadataRefresh(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(targetDir, "a.txt")); !os.IsNotExist(err) {
 		t.Fatalf("expected discarded output to be absent, stat err=%v", err)
+	}
+}
+
+func TestStartTransferProbeReporterIncludesTransferTelemetry(t *testing.T) {
+	oldInterval := transferProbeRefreshInterval
+	transferProbeRefreshInterval = 5 * time.Millisecond
+	defer func() { transferProbeRefreshInterval = oldInterval }()
+
+	var probeCount atomic.Int64
+	var firstTransferID atomic.Value
+	var firstObserved atomic.Int64
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbPROBE {
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+		probeCount.Add(1)
+		firstTransferID.CompareAndSwap(nil, req.Params[0]["txferid"])
+		if probeCount.Load() == 1 {
+			obs, _ := strconv.ParseInt(strings.TrimSpace(req.Params[0]["obs-link-mbps"]), 10, 64)
+			firstObserved.Store(obs)
+		}
+		cts0 := req.Params[0]["cts0"]
+		n, err := strconv.Atoi(req.Params[0]["probe-bytes"])
+		if err != nil {
+			return err
+		}
+		if _, err := io.WriteString(out, fmt.Sprintf("PROBE cpu=24 io-depth=8 cts0=%s sts0=10 sts1=11 probe-bytes=%d wmem=4096 gentle-cpu-pct=25 gentle-bw-pct=25\n", cts0, n)); err != nil {
+			return err
+		}
+		if n > 0 {
+			if _, err := out.Write(make([]byte, n)); err != nil {
+				return err
+			}
+		}
+		_, err = io.WriteString(out, "OK\r\n")
+		return err
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	pr := startTransferProbeReporter(ctx, client, "txprobe", LoadStrategyFast, 1024, 700)
+	defer pr.stop()
+	defer cancel()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if probeCount.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if probeCount.Load() == 0 {
+		t.Fatalf("expected at least one probe refresh")
+	}
+	gotTxferID, _ := firstTransferID.Load().(string)
+	if gotTxferID != "txprobe" {
+		t.Fatalf("unexpected transfer id: %q", gotTxferID)
+	}
+	if firstObserved.Load() != 700 {
+		t.Fatalf("unexpected initial observed link mbps: %d", firstObserved.Load())
+	}
+	if got := pr.linkMbps.Load(); got <= 0 {
+		t.Fatalf("expected probe reporter to retain link mbps, got %d", got)
+	}
+	if got := pr.lastProbeUnixS.Load(); got <= 0 {
+		t.Fatalf("expected probe reporter to retain last probe timestamp, got %d", got)
+	}
+}
+
+func TestFormatProbeRateSuffixUsesServerLimiter(t *testing.T) {
+	now := time.Unix(200, 0)
+	var probe probeReporter
+	probe.limiterBps.Store(100 * 1024 * 1024)
+	probe.linkMbps.Store(9000)
+	probe.lastProbeUnixS.Store(now.Add(-2 * time.Second).Unix())
+
+	got := formatProbeRateSuffix(now, 25*1024*1024, &probe)
+	if got != " (25% of limit=100.00 MiB/s @  2s)" {
+		t.Fatalf("unexpected limiter suffix: %q", got)
+	}
+}
+
+func TestFormatProbeRateSuffixFallsBackToLinkBandwidth(t *testing.T) {
+	now := time.Unix(300, 0)
+	var probe probeReporter
+	probe.linkMbps.Store(800)
+	probe.lastProbeUnixS.Store(now.Add(-10 * time.Second).Unix())
+
+	got := formatProbeRateSuffix(now, 50*1_000_000, &probe)
+	if got != " (50% of link=95.37 MiB/s @ 10s)" {
+		t.Fatalf("unexpected link suffix: %q", got)
+	}
+}
+
+func TestFormatProbeRateSuffixClampsLinkFallbackTo100Pct(t *testing.T) {
+	now := time.Unix(320, 0)
+	var probe probeReporter
+	probe.linkMbps.Store(800)
+	probe.lastProbeUnixS.Store(now.Add(-3 * time.Second).Unix())
+
+	got := formatProbeRateSuffix(now, 400*1_000_000, &probe)
+	if got != " (100% of link=95.37 MiB/s @  3s)" {
+		t.Fatalf("unexpected clamped link suffix: %q", got)
+	}
+}
+
+func TestFormatStartBatchCause(t *testing.T) {
+	const mib = int64(1 << 20)
+	tests := []struct {
+		name string
+		plan BatchSizePlan
+		want string
+	}{
+		{
+			name: "window",
+			plan: BatchSizePlan{
+				BatchMaxBytes:  32 * mib,
+				ConcBatchBytes: 32 * mib,
+				FloorBytes:     16 * mib,
+			},
+			want: "window",
+		},
+		{
+			name: "bw-probe",
+			plan: BatchSizePlan{
+				BatchMaxBytes:  4 * mib,
+				ConcBatchBytes: 32 * mib,
+				BwCeilBytes:    4 * mib,
+				FloorBytes:     1 * mib,
+			},
+			want: "bw-probe",
+		},
+		{
+			name: "bw-probe raised to socket size",
+			plan: BatchSizePlan{
+				BatchMaxBytes:  16 * mib,
+				ConcBatchBytes: 32 * mib,
+				BwCeilBytes:    4 * mib,
+				FloorBytes:     16 * mib,
+			},
+			want: "bw-probe, raised to socket size",
+		},
+		{
+			name: "floor",
+			plan: BatchSizePlan{
+				BatchMaxBytes:  16 * mib,
+				ConcBatchBytes: 8 * mib,
+				FloorBytes:     16 * mib,
+			},
+			want: "floor",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatStartBatchCause(tt.plan); got != tt.want {
+				t.Fatalf("formatStartBatchCause() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatStartBatchWindowLine(t *testing.T) {
+	const mib = int64(1 << 20)
+	got := formatStartBatchWindowLine(512*mib, BatchSizePlan{
+		PerFileWorkers: 24,
+		ConcBatchBytes: 32 * mib,
+	})
+	want := "    window: 512.00 MiB / 24 per-file-workers = 32.00 MiB"
+	if got != want {
+		t.Fatalf("formatStartBatchWindowLine() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatStartBatchProbeLine(t *testing.T) {
+	const mib = int64(1 << 20)
+
+	t.Run("active", func(t *testing.T) {
+		got := formatStartBatchProbeLine(1001, 96, BatchSizePlan{
+			ConcBatchBytes: 32 * mib,
+			BwCeilBytes:    4 * mib,
+		})
+		want := "    bw-probe: 1001 MiB/s / 96 conc / 2 = 4.00 MiB"
+		if got != want {
+			t.Fatalf("formatStartBatchProbeLine() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("inactive", func(t *testing.T) {
+		got := formatStartBatchProbeLine(1001, 96, BatchSizePlan{
+			ConcBatchBytes: 32 * mib,
+			BwCeilBytes:    32 * mib,
+		})
+		if got != "" {
+			t.Fatalf("expected inactive bw-probe line to be hidden, got %q", got)
+		}
+	})
+}
+
+func TestFixedWidthHumanDurationKeepsShortDurationsAligned(t *testing.T) {
+	short := fixedWidthHumanDuration(2 * time.Second)
+	longer := fixedWidthHumanDuration(10 * time.Second)
+	minute := fixedWidthHumanDuration(62 * time.Second)
+
+	if short != "  2s" {
+		t.Fatalf("unexpected short duration: %q", short)
+	}
+	if longer != " 10s" {
+		t.Fatalf("unexpected longer duration: %q", longer)
+	}
+	if minute != "1m2s" {
+		t.Fatalf("unexpected minute duration: %q", minute)
+	}
+	if len(short) != len(longer) || len(longer) != len(minute) {
+		t.Fatalf("expected fixed-width durations, got lens %d %d %d", len(short), len(longer), len(minute))
+	}
+}
+
+func TestFixedWidthETAKeepsDurationsAligned(t *testing.T) {
+	short := fixedWidthETA(57 * time.Second)
+	minute := fixedWidthETA(74 * time.Second)
+
+	if short != "  57s" {
+		t.Fatalf("unexpected short eta: %q", short)
+	}
+	if minute != " 1.2m" {
+		t.Fatalf("unexpected minute eta: %q", minute)
+	}
+	if len(short) != 5 || len(minute) != 5 {
+		t.Fatalf("expected 5-char eta fields, got %d and %d", len(short), len(minute))
+	}
+}
+
+func TestFixedWidthETANA(t *testing.T) {
+	if got := fixedWidthETANA(); got != "  n/a" {
+		t.Fatalf("unexpected n/a eta: %q", got)
+	}
+	if len(fixedWidthETANA()) != 5 {
+		t.Fatalf("expected 5-char n/a eta field, got %d", len(fixedWidthETANA()))
+	}
+}
+
+func TestCompactETAUsesFractionalUnitsEarly(t *testing.T) {
+	tests := []struct {
+		in   time.Duration
+		want string
+	}{
+		{in: 59 * time.Second, want: "59s"},
+		{in: 74 * time.Second, want: "1.2m"},
+		{in: 95 * time.Minute, want: "1.6h"},
+		{in: 36 * time.Hour, want: "1.5d"},
+		{in: 15 * 24 * time.Hour, want: "2.1w"},
+	}
+	for _, tt := range tests {
+		if got := compactETA(tt.in); got != tt.want {
+			t.Fatalf("compactETA(%s) = %q, want %q", tt.in, got, tt.want)
+		}
+		if len(tt.want) > 5 {
+			t.Fatalf("test case %q exceeds 5 chars", tt.want)
+		}
+	}
+}
+
+func TestVerbosityFromFlags(t *testing.T) {
+	tests := []struct {
+		name     string
+		progress bool
+		verbose  bool
+		want     int
+	}{
+		{name: "quiet", progress: false, verbose: false, want: 0},
+		{name: "progress", progress: true, verbose: false, want: 1},
+		{name: "verbose", progress: false, verbose: true, want: 2},
+		{name: "verbose wins", progress: true, verbose: true, want: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := verbosityFromFlags(tt.progress, tt.verbose); got != tt.want {
+				t.Fatalf("verbosityFromFlags(%v, %v) = %d, want %d", tt.progress, tt.verbose, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrintTransferErrors(t *testing.T) {
+	buildErrors := func(n int) []error {
+		errs := make([]error, 0, n)
+		for i := 1; i <= n; i++ {
+			errs = append(errs, fmt.Errorf("boom-%d", i))
+		}
+		return errs
+	}
+
+	t.Run("no errors", func(t *testing.T) {
+		var buf bytes.Buffer
+		printTransferErrors(&buf, "start", nil, 1)
+		if got := buf.String(); got != "" {
+			t.Fatalf("expected no output, got %q", got)
+		}
+	})
+
+	t.Run("prints first five and summary when not verbose", func(t *testing.T) {
+		var buf bytes.Buffer
+		printTransferErrors(&buf, "start", buildErrors(7), 1)
+		got := buf.String()
+		for i := 1; i <= 5; i++ {
+			want := fmt.Sprintf("start error: boom-%d\n", i)
+			if !strings.Contains(got, want) {
+				t.Fatalf("expected output to contain %q, got %q", want, got)
+			}
+		}
+		if strings.Contains(got, "start error: boom-6\n") || strings.Contains(got, "start error: boom-7\n") {
+			t.Fatalf("expected output to truncate after five errors, got %q", got)
+		}
+		if !strings.Contains(got, "start failed with 7 errors\n") {
+			t.Fatalf("expected summary line, got %q", got)
+		}
+	})
+
+	t.Run("prints all when verbose", func(t *testing.T) {
+		var buf bytes.Buffer
+		printTransferErrors(&buf, "sync", buildErrors(6), 2)
+		got := buf.String()
+		for i := 1; i <= 6; i++ {
+			want := fmt.Sprintf("sync error: boom-%d\n", i)
+			if !strings.Contains(got, want) {
+				t.Fatalf("expected output to contain %q, got %q", want, got)
+			}
+		}
+		if strings.Contains(got, "sync failed with 6 errors\n") {
+			t.Fatalf("did not expect summary line in verbose mode, got %q", got)
+		}
+	})
+}
+
+func TestHumanBytesFixedWidthUsesPerValueUnits(t *testing.T) {
+	zero := encoding.HumanBytesFixedWidth(0, fixedWidthProgressBytesWidth)
+	mid := encoding.HumanBytesFixedWidth(492_340_000, fixedWidthProgressBytesWidth)
+	done := encoding.HumanBytesFixedWidth(1_950_000_000, fixedWidthProgressBytesWidth)
+	totalFormatted := encoding.HumanBytesFixedWidth(20_174_499_881, fixedWidthProgressBytesWidth)
+
+	if zero != "       0 B" {
+		t.Fatalf("unexpected zero progress bytes: %q", zero)
+	}
+	if mid != "469.53 MiB" || done != "  1.82 GiB" || totalFormatted != " 18.79 GiB" {
+		t.Fatalf("unexpected fixed-width byte values: %q %q %q", mid, done, totalFormatted)
+	}
+}
+
+func TestEffectiveModeLinkMbpsScalesGentleBandwidth(t *testing.T) {
+	if got := effectiveModeLinkMbps(LoadStrategyGentle, 8400, 25); got != 2100 {
+		t.Fatalf("expected gentle link mbps 2100, got %d", got)
+	}
+	if got := effectiveModeLinkMbps(LoadStrategyFast, 8400, 25); got != 8400 {
+		t.Fatalf("expected fast link mbps 8400, got %d", got)
+	}
+}
+
+func TestFormatProbeRateSuffixOmitsWhenNoProbeData(t *testing.T) {
+	if got := formatProbeRateSuffix(time.Unix(400, 0), 10, &probeReporter{}); got != "" {
+		t.Fatalf("expected empty suffix without probe data, got %q", got)
 	}
 }
 
@@ -1592,10 +1964,10 @@ func TestVerboseProgressReporterIncludesAckedBytes(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 progress lines, got %d: %q", len(lines), stderr.String())
 	}
-	if got := lines[0]; !strings.Contains(got, "file progress[42]: 20% bytes=20 B/100 B [0 B]") {
+	if got := lines[0]; !strings.Contains(got, "file progress[42]: 20% bytes=") || !strings.Contains(got, "20 B/") || !strings.Contains(got, "[       0 B]") {
 		t.Fatalf("unexpected first progress line: %q", got)
 	}
-	if got := lines[1]; !strings.Contains(got, "file progress[42]: 40% bytes=40 B/100 B [10 B]") {
+	if got := lines[1]; !strings.Contains(got, "file progress[42]: 40% bytes=") || !strings.Contains(got, "40 B/") || !strings.Contains(got, "[      10 B]") {
 		t.Fatalf("unexpected second progress line: %q", got)
 	}
 	for _, line := range lines {

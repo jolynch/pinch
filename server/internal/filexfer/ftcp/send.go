@@ -141,23 +141,17 @@ func parseSENDRequest(req Request) (sendRequest, error) {
 }
 
 func handleSEND(ctx context.Context, req Request, out io.Writer, deps Deps) error {
-	return handleSENDWithOptions(ctx, req, out, deps, nil, false)
+	return handleSENDWithOptions(ctx, req, out, deps, nil, false, 25)
 }
 
-func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps Deps, limiter *limit.Limiter, disableZeroCopy bool) error {
+func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps Deps, limiter *limit.Limiter, disableZeroCopy bool, gentleBWPct int) error {
 	parsed, err := parseSENDRequest(req)
 	if err != nil {
 		return err
 	}
+	gentleBWPct = limit.NormalizeGentleBWPct(gentleBWPct)
 
-	// Derive per-transfer gentle limiter from probed link bandwidth (25%).
-	var gentleLimiter *limit.Limiter
 	transfer, hasTransfer := deps.GetTransfer(parsed.TransferID)
-	if hasTransfer && transfer.LinkMbps > 0 {
-		derivedBps := (transfer.LinkMbps * 1_000_000 / 8) / 4
-		gentleLimiter, _ = limit.NewLimiterFromBps(derivedBps, 1*1024*1024)
-	}
-
 	for _, item := range parsed.Items {
 		itemOut := out
 		if item.Mode == loadStrategyGentle {
@@ -166,6 +160,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps
 					return err
 				}
 			}
+			gentleLimiter := deps.GetTransferGentleLimiter(parsed.TransferID, transfer.LinkMbps, gentleBWPct, gentleLimiterBurstBytes(limiter))
 			if gentleLimiter != nil {
 				itemOut = gentleLimiter.WrapRateLimitedWriter(itemOut, ctx)
 			}

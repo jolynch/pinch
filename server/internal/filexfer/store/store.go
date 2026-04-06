@@ -4,15 +4,18 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/pinch/internal/filexfer/limit"
 	"github.com/jolynch/pinch/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 )
@@ -93,6 +96,9 @@ type managedTransfer struct {
 	transfer     Transfer
 	fileHashes   map[uint64]fileHashState
 	windowHashes map[windowHashKey]*windowHashState
+	observedEMA  float64
+	limiterBps   int64
+	limiter      atomic.Pointer[limit.Limiter]
 }
 
 type transferStore struct {
@@ -119,6 +125,14 @@ type windowHashKey struct {
 type windowHashState struct {
 	hashToken string
 	expiresAt time.Time
+}
+
+type TransferObservedLinkUpdate struct {
+	ObservedLinkMbps int64
+	EMALinkMbps      float64
+	RoundedLinkMbps  int64
+	OldRateBps       int64
+	NewRateBps       int64
 }
 
 // AckEntry is a single (transfer, file, ackBytes) tuple for batch acknowledgement.
@@ -214,7 +228,124 @@ func (s *transferStore) setTransferHints(txferID string, mode string, linkMbps i
 	managed.transfer.Mode = strings.ToLower(strings.TrimSpace(mode))
 	managed.transfer.LinkMbps = linkMbps
 	managed.transfer.Concurrency = concurrency
+	if linkMbps > 0 {
+		managed.observedEMA = float64(linkMbps)
+	}
 	return true
+}
+
+func deriveGentleRateBps(linkMbps int64, gentleBWPct int) int64 {
+	if linkMbps <= 0 || gentleBWPct <= 0 {
+		return 0
+	}
+	return (((linkMbps * 1_000_000) / 8) * int64(gentleBWPct)) / 100
+}
+
+func (s *transferStore) getOrInitGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return nil
+	}
+	if limiter := managed.limiter.Load(); limiter != nil {
+		return limiter
+	}
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return nil
+	}
+	if limiter := managed.limiter.Load(); limiter != nil {
+		return limiter
+	}
+
+	linkMbps := int64(math.Round(managed.observedEMA))
+	if linkMbps <= 0 {
+		linkMbps = managed.transfer.LinkMbps
+	}
+	if linkMbps <= 0 {
+		linkMbps = fallbackLinkMbps
+	}
+	if linkMbps <= 0 {
+		return nil
+	}
+	rateBps := deriveGentleRateBps(linkMbps, gentleBWPct)
+	if rateBps <= 0 {
+		return nil
+	}
+	limiter, err := limit.NewLimiterFromBps(rateBps, burstBytes)
+	if err != nil {
+		return nil
+	}
+	managed.transfer.LinkMbps = linkMbps
+	if managed.observedEMA <= 0 {
+		managed.observedEMA = float64(linkMbps)
+	}
+	managed.limiterBps = rateBps
+	managed.limiter.Store(limiter)
+	return limiter
+}
+
+func (s *transferStore) getTransferLimiterBps(txferID string) int64 {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return 0
+	}
+	managed.mu.RLock()
+	defer managed.mu.RUnlock()
+	return managed.limiterBps
+}
+
+func (s *transferStore) reportObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return TransferObservedLinkUpdate{}, false
+	}
+	if observedLinkMbps <= 0 {
+		return TransferObservedLinkUpdate{}, false
+	}
+	if emaAlpha <= 0 || emaAlpha > 1 {
+		emaAlpha = 0.2
+	}
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return TransferObservedLinkUpdate{}, false
+	}
+
+	ema := float64(observedLinkMbps)
+	if managed.observedEMA > 0 {
+		ema = (emaAlpha * float64(observedLinkMbps)) + ((1 - emaAlpha) * managed.observedEMA)
+	}
+	roundedLinkMbps := int64(math.Round(ema))
+	if roundedLinkMbps <= 0 {
+		roundedLinkMbps = observedLinkMbps
+	}
+	newRateBps := deriveGentleRateBps(roundedLinkMbps, gentleBWPct)
+	update := TransferObservedLinkUpdate{
+		ObservedLinkMbps: observedLinkMbps,
+		EMALinkMbps:      ema,
+		RoundedLinkMbps:  roundedLinkMbps,
+		OldRateBps:       managed.limiterBps,
+		NewRateBps:       newRateBps,
+	}
+
+	managed.observedEMA = ema
+	managed.transfer.LinkMbps = roundedLinkMbps
+	if newRateBps <= 0 {
+		return update, true
+	}
+	if newRateBps == managed.limiterBps && managed.limiter.Load() != nil {
+		return update, true
+	}
+	limiter, err := limit.NewLimiterFromBps(newRateBps, burstBytes)
+	if err != nil {
+		return TransferObservedLinkUpdate{}, false
+	}
+	managed.limiterBps = newRateBps
+	managed.limiter.Store(limiter)
+	return update, true
 }
 
 func (s *transferStore) setTransferDeadline(txferID string, deadlineMS int64) bool {
@@ -896,6 +1027,18 @@ func GetTransfer(txferID string) (Transfer, bool) {
 
 func SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
 	return manager.setTransferHints(txferID, mode, linkMbps, concurrency)
+}
+
+func GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter {
+	return manager.getOrInitGentleLimiter(txferID, fallbackLinkMbps, gentleBWPct, burstBytes)
+}
+
+func ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
+	return manager.reportObservedLink(txferID, observedLinkMbps, gentleBWPct, burstBytes, emaAlpha)
+}
+
+func GetTransferLimiterBps(txferID string) int64 {
+	return manager.getTransferLimiterBps(txferID)
 }
 
 func SetTransferDeadline(txferID string, deadlineMS int64) bool {

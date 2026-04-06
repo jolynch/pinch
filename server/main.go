@@ -43,6 +43,21 @@ var (
 	fsFileBurst  = "1MiB"
 )
 
+func parsePercentFlag(raw string, name string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasSuffix(raw, "%") {
+		return 0, fmt.Errorf("%s must be an integer percent like 25%%", name)
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(strings.TrimSuffix(raw, "%")))
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer percent like 25%%", name)
+	}
+	if value < 1 || value > 100 {
+		return 0, fmt.Errorf("%s must be between 1%% and 100%%", name)
+	}
+	return value, nil
+}
+
 // loadServerAgeIdentity loads an age identity from the key file in dir.
 // It returns the identity if found, or an error if the file exists but is unreadable/invalid.
 // If the key file does not exist, it returns (nil, nil).
@@ -863,6 +878,8 @@ Options:
   -l, --listen string         listen address (default "127.0.0.1:3453")
   -b, --bwlimit string        response rate limit for gentle transfers only; fast transfers do not respect it (e.g. 100MiB, 1000mbps)
       --bwlimit-burst string  rate limit burst size (default "1MiB")
+      --gentle-cpu string     percent of server CPUs advertised for gentle concurrency (default "25%")
+      --gentle-bw string      percent of observed link bandwidth used for gentle limiting (default "25%")
   -c, --chroot string         server root directory (default "/")
   -k, --keys string           age keys directory (default "/var/lib/pinch/keys")
       --require-auth          require AUTH before commands
@@ -878,6 +895,10 @@ Options:
 	fs.StringVar(&fsFileRate, "bwlimit", fsFileRate, "")
 	fs.StringVar(&fsFileRate, "b", fsFileRate, "")
 	fs.StringVar(&fsFileBurst, "bwlimit-burst", fsFileBurst, "")
+	gentleCPURaw := fmt.Sprintf("%d%%", limit.DefaultGentleCPUPct)
+	gentleBWRaw := fmt.Sprintf("%d%%", limit.DefaultGentleBWPct)
+	fs.StringVar(&gentleCPURaw, "gentle-cpu", gentleCPURaw, "")
+	fs.StringVar(&gentleBWRaw, "gentle-bw", gentleBWRaw, "")
 	var chroot string
 	fs.StringVar(&chroot, "chroot", "/", "")
 	fs.StringVar(&chroot, "c", "/", "")
@@ -902,6 +923,14 @@ Options:
 	progressInterval, err := time.ParseDuration(progressIntervalRaw)
 	if err != nil {
 		log.Fatalf("Invalid --progress-path-interval: %v", err)
+	}
+	gentleCPUPct, err := parsePercentFlag(gentleCPURaw, "--gentle-cpu")
+	if err != nil {
+		log.Fatalf("Invalid --gentle-cpu: %v", err)
+	}
+	gentleBWPct, err := parsePercentFlag(gentleBWRaw, "--gentle-bw")
+	if err != nil {
+		log.Fatalf("Invalid --gentle-bw: %v", err)
 	}
 
 	if *traceFile != "" {
@@ -944,6 +973,8 @@ Options:
 		RequireAuth:            *requireAuth,
 		ServerIdentity:         serverKey,
 		Limiter:                fileStreamLimiter,
+		GentleCPUPct:           gentleCPUPct,
+		GentleBWPct:            gentleBWPct,
 		SocketWriteBufferBytes: socketWriteBufBytes,
 		RootDir:                chroot,
 		ProgressPath:           progressFilePath,

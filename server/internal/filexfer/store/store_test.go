@@ -724,6 +724,81 @@ func TestGetFileSuccess(t *testing.T) {
 	}
 }
 
+func TestGetTransferGentleLimiterInitializesFromHints(t *testing.T) {
+	resetTransferStore()
+
+	transfer, err := NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer returned error: %v", err)
+	}
+	if ok := SetTransferHints(transfer.ID, "gentle", 800, 6); !ok {
+		t.Fatalf("SetTransferHints failed")
+	}
+
+	limiter := GetTransferGentleLimiter(transfer.ID, 0, 25, 2*1024*1024)
+	if limiter == nil {
+		t.Fatalf("expected limiter")
+	}
+	cfg := limiter.Config()
+	if cfg.RateBps != 25_000_000 {
+		t.Fatalf("unexpected rate: got=%d want=%d", cfg.RateBps, 25_000_000)
+	}
+	if cfg.BurstBytes != 2*1024*1024 {
+		t.Fatalf("unexpected burst: got=%d", cfg.BurstBytes)
+	}
+}
+
+func TestReportTransferObservedLinkUpdatesEMAAndLimiter(t *testing.T) {
+	resetTransferStore()
+
+	transfer, err := NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer returned error: %v", err)
+	}
+	if ok := SetTransferHints(transfer.ID, "gentle", 1000, 6); !ok {
+		t.Fatalf("SetTransferHints failed")
+	}
+	initial := GetTransferGentleLimiter(transfer.ID, 0, 25, 1*1024*1024)
+	if initial == nil {
+		t.Fatalf("expected initial limiter")
+	}
+
+	update, ok := ReportTransferObservedLink(transfer.ID, 500, 25, 1*1024*1024, 0.2)
+	if !ok {
+		t.Fatalf("expected report update")
+	}
+	if update.ObservedLinkMbps != 500 {
+		t.Fatalf("unexpected observed link: %d", update.ObservedLinkMbps)
+	}
+	if update.OldRateBps != 31_250_000 {
+		t.Fatalf("unexpected old rate: %d", update.OldRateBps)
+	}
+	if update.RoundedLinkMbps != 900 {
+		t.Fatalf("unexpected rounded ema link: %d", update.RoundedLinkMbps)
+	}
+	if update.NewRateBps != 28_125_000 {
+		t.Fatalf("unexpected new rate: %d", update.NewRateBps)
+	}
+	stored, ok := GetTransfer(transfer.ID)
+	if !ok {
+		t.Fatalf("expected stored transfer")
+	}
+	if stored.LinkMbps != 900 {
+		t.Fatalf("unexpected stored link mbps: %d", stored.LinkMbps)
+	}
+	updatedLimiter := GetTransferGentleLimiter(transfer.ID, 0, 25, 1*1024*1024)
+	if updatedLimiter == nil {
+		t.Fatalf("expected updated limiter")
+	}
+	if updatedLimiter == initial {
+		t.Fatalf("expected limiter swap")
+	}
+	cfg := updatedLimiter.Config()
+	if cfg.RateBps != 28_125_000 {
+		t.Fatalf("unexpected updated limiter rate: %d", cfg.RateBps)
+	}
+}
+
 func BenchmarkTransferStoreConcurrentHotPaths(b *testing.B) {
 	resetTransferStore()
 

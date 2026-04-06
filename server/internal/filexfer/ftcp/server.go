@@ -20,11 +20,24 @@ const (
 	maxCommandLineBytes = 4 * 1024 * 1024
 )
 
+func gentleLimiterBurstBytes(limiter *limit.Limiter) int64 {
+	if limiter == nil {
+		return 1 * 1024 * 1024
+	}
+	cfg := limiter.Config()
+	if cfg.BurstBytes > 0 {
+		return cfg.BurstBytes
+	}
+	return 1 * 1024 * 1024
+}
+
 type ServerOptions struct {
 	RequireAuth            bool
 	ServerIdentity         *age.X25519Identity
 	Deps                   Deps
 	Limiter                *limit.Limiter
+	GentleCPUPct           int
+	GentleBWPct            int
 	SocketWriteBufferBytes int
 	SyncTimeout            time.Duration // 0 = no timeout; bounds SYNC response write time
 	RootDir                string        // "/" or "" means unrestricted
@@ -102,6 +115,8 @@ type connSession struct {
 	serverID               *age.X25519Identity
 	deps                   Deps
 	limiter                *limit.Limiter
+	gentleCPUPct           int
+	gentleBWPct            int
 	socketWriteBufferBytes int
 	syncTimeout            time.Duration
 	disableZeroCopy        bool
@@ -120,6 +135,8 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated 
 		serverID:               opts.ServerIdentity,
 		deps:                   deps,
 		limiter:                opts.Limiter,
+		gentleCPUPct:           opts.GentleCPUPct,
+		gentleBWPct:            opts.GentleBWPct,
 		socketWriteBufferBytes: opts.SocketWriteBufferBytes,
 		syncTimeout:            opts.SyncTimeout,
 		disableZeroCopy:        opts.DisableZeroCopy,
@@ -215,10 +232,10 @@ func (s *connSession) run() error {
 
 func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Reader, out io.Writer) error {
 	if req.Verb == VerbSEND {
-		return handleSENDWithOptions(ctx, req, out, s.deps, s.limiter, s.disableZeroCopy)
+		return handleSENDWithOptions(ctx, req, out, s.deps, s.limiter, s.disableZeroCopy, s.gentleBWPct)
 	}
 	if req.Verb == VerbPROBE {
-		return handlePROBEWithInput(ctx, req, in, out, s.deps, s.targetIODepth)
+		return handlePROBEWithInput(ctx, req, in, out, s.deps, s.targetIODepth, s.gentleCPUPct, s.gentleBWPct, gentleLimiterBurstBytes(s.limiter))
 	}
 	if req.Verb == VerbSYNC {
 		if s.syncTimeout > 0 {
