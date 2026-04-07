@@ -204,12 +204,15 @@ type Manifest struct {
 }
 
 type ManifestEntry struct {
-	ID       uint64
-	Size     int64
-	Mtime    int64
-	Mode     os.FileMode
-	Path     string
-	Progress ManifestProgress
+	Type       byte // 'F', 'H', 'D', 'S'; 0 treated as 'F'
+	ID         uint64
+	Size       int64
+	Mtime      int64
+	Mode       os.FileMode
+	Path       string
+	Progress   ManifestProgress
+	LinkTarget int64  // H: target file ID; -1 otherwise
+	LinkPath   string // S: symlink target path; "" otherwise
 }
 
 type ManifestProgress struct {
@@ -2258,11 +2261,14 @@ func parseManifest(raw []byte) (*Manifest, error) {
 					return nil, parseErr
 				}
 				entry := ManifestEntry{
-					ID:    raw.ID,
-					Size:  raw.Size,
-					Mtime: raw.Mtime,
-					Mode:  raw.Mode,
-					Path:  raw.Path,
+					Type:       raw.Type,
+					ID:         raw.ID,
+					Size:       raw.Size,
+					Mtime:      raw.Mtime,
+					Mode:       raw.Mode,
+					Path:       raw.Path,
+					LinkTarget: raw.LinkTarget,
+					LinkPath:   raw.LinkPath,
 				}
 				if _, exists := seenIDs[entry.ID]; exists {
 					return nil, fmt.Errorf("duplicate manifest id: %d", entry.ID)
@@ -2336,11 +2342,14 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 			return nil, fmt.Errorf("manifest ids must be increasing: prev=%d curr=%d", entries[i-1].ID, entry.ID)
 		}
 		line, nextPath, nextMtime, err := intencoding.MarshalManifestEntry(intencoding.ManifestEntry{
-			ID:    entry.ID,
-			Size:  entry.Size,
-			Mtime: entry.Mtime,
-			Mode:  entry.Mode,
-			Path:  entry.Path,
+			Type:       entry.Type,
+			ID:         entry.ID,
+			Size:       entry.Size,
+			Mtime:      entry.Mtime,
+			Mode:       entry.Mode,
+			Path:       entry.Path,
+			LinkTarget: entry.LinkTarget,
+			LinkPath:   entry.LinkPath,
 		}, prevPath, prevMtime)
 		if err != nil {
 			return nil, err

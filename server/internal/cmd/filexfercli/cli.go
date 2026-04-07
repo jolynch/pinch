@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"math"
 	"math/rand"
 	"net"
@@ -240,7 +239,7 @@ func newPinchState(targetDir string) (*pinchState, error) {
 func (ps *pinchState) ensureStateDir() error   { return os.MkdirAll(ps.StateDir, 0o755) }
 func (ps *pinchState) ensureStagingDir() error { return os.MkdirAll(ps.StagingDir, 0o755) }
 
-// scanLocalDir walks targetDir and returns a Manifest representing the files
+// scanLocalDir walks targetDir and returns a Manifest representing the entries
 // currently on disk, using meta for header fields (Root, Mode, etc.).
 // If targetDir does not exist the returned manifest has no entries.
 func scanLocalDir(targetDir string, meta *Manifest) (*Manifest, error) {
@@ -254,27 +253,18 @@ func scanLocalDir(targetDir string, meta *Manifest) (*Manifest, error) {
 	if _, err := os.Stat(targetDir); os.IsNotExist(err) {
 		return out, nil
 	}
-	var id uint64
-	err := filepath.WalkDir(targetDir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() {
-			return walkErr
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(targetDir, path)
-		if err != nil {
-			return err
-		}
+	err := encoding.WalkManifestEntries(targetDir, func(result encoding.WalkResult) error {
+		entry := result.Entry
 		out.Entries = append(out.Entries, ManifestEntry{
-			ID:    id,
-			Size:  info.Size(),
-			Mtime: info.ModTime().UnixNano(),
-			Mode:  info.Mode(),
-			Path:  filepath.ToSlash(rel),
+			Type:       entry.Type,
+			ID:         entry.ID,
+			Size:       entry.Size,
+			Mtime:      entry.Mtime,
+			Mode:       entry.Mode,
+			Path:       entry.Path,
+			LinkTarget: entry.LinkTarget,
+			LinkPath:   entry.LinkPath,
 		})
-		id++
 		return nil
 	})
 	return out, err
@@ -779,6 +769,22 @@ type manifestDelta struct {
 	staleBytes     int64
 }
 
+func countManifestEntryTypes(entries []ManifestEntry) (files, hardlinks, symlinks, dirs int) {
+	for _, entry := range entries {
+		switch entry.Type {
+		case encoding.EntryTypeHard:
+			hardlinks++
+		case encoding.EntryTypeSymlink:
+			symlinks++
+		case encoding.EntryTypeDir:
+			dirs++
+		default:
+			files++
+		}
+	}
+	return
+}
+
 func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io.Writer) int {
 	ps, err := newPinchState(cfg.localDst)
 	if err != nil {
@@ -808,7 +814,16 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 		)
 		return 1
 	}
-	fmt.Fprintf(stdout, "copy-verify-meta: ok files=%d\n", len(serverManifest.Entries))
+	files, hardlinks, symlinks, dirs := countManifestEntryTypes(serverManifest.Entries)
+	fmt.Fprintf(
+		stdout,
+		"copy-verify-meta: ok total=%d files=%d hardlinks=%d symlinks=%d dirs=%d\n",
+		len(serverManifest.Entries),
+		files,
+		hardlinks,
+		symlinks,
+		dirs,
+	)
 	if cfg.verifyDataSamplePct <= 0 {
 		return 0
 	}
@@ -853,7 +868,26 @@ func compareManifestEntries(localManifest *Manifest, serverManifest *Manifest) m
 }
 
 func manifestEntryMatches(local ManifestEntry, remote ManifestEntry) bool {
-	return local.Size == remote.Size && local.Mtime == remote.Mtime && local.Mode == remote.Mode
+	localType := local.Type
+	if localType == 0 {
+		localType = encoding.EntryTypeFile
+	}
+	remoteType := remote.Type
+	if remoteType == 0 {
+		remoteType = encoding.EntryTypeFile
+	}
+	if localType != remoteType {
+		return false
+	}
+
+	switch remoteType {
+	case encoding.EntryTypeHard:
+		return local.Mode == remote.Mode && local.LinkTarget == remote.LinkTarget
+	case encoding.EntryTypeSymlink:
+		return local.Mode == remote.Mode && local.LinkPath == remote.LinkPath
+	default:
+		return local.Size == remote.Size && local.Mtime == remote.Mtime && local.Mode == remote.Mode
+	}
 }
 
 type verifySample struct {
@@ -1903,7 +1937,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		var newBytes, staleBytes int64
 		for _, entry := range newManifest.Entries {
 			if old, ok := oldByPath[entry.Path]; ok {
-				if old.Size == entry.Size && old.Mtime == entry.Mtime && old.Mode == entry.Mode {
+				if manifestEntryMatches(old, entry) {
 					entry.Progress = ManifestProgress{AckBytes: entry.Size, MetadataDone: true}
 					unchangedFiles = append(unchangedFiles, entry)
 				} else {
@@ -1995,16 +2029,15 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			}
 		}
 
-		// Download pending entries (new + stale).
-		pendingEntries := make([]ManifestEntry, 0, len(newFiles)+len(staleFiles))
-		for _, entry := range mergedManifest.Entries {
-			if entry.Progress.AckBytes >= entry.Size && entry.Progress.MetadataDone {
-				continue
+		markCompleted := func(entry ManifestEntry) {
+			mergedProgress[entry.ID] = ManifestProgress{
+				AckBytes:     entry.Size,
+				MetadataDone: true,
 			}
-			pendingEntries = append(pendingEntries, entry)
 		}
+		pendingWork, _ := collectPendingManifestWork(mergedManifest.Entries, cfg.skipWrite, markCompleted, nil, nil)
 
-		if len(pendingEntries) == 0 {
+		if !pendingWork.hasAny() {
 			if cfg.skipWrite {
 				fmt.Fprintln(stdout, "sync: skip-write, no downloads needed")
 				return 0
@@ -2057,23 +2090,6 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		var failures []error
 		var failuresMu sync.Mutex
 
-		if cfg.progressFilePath != "" {
-			var totalBytes int64
-			for _, e := range pendingEntries {
-				totalBytes += e.Size
-			}
-			stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), cfg.progressFilePath, cfg.progressInterval, func() int {
-				if totalBytes <= 0 {
-					return 100
-				}
-				pct := int(totalCopied.Load() * 100 / totalBytes)
-				if pct > 100 {
-					pct = 100
-				}
-				return pct
-			})
-			defer func() { stopProgressFile(len(failures) == 0) }()
-		}
 		recordFailure := func(err error) {
 			if err == nil {
 				return
@@ -2082,17 +2098,15 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			failures = append(failures, err)
 			failuresMu.Unlock()
 		}
-		transferCtx, cancelTransfer := context.WithCancel(context.Background())
-		probeInfo := startTransferProbeReporter(transferCtx, client, mergedManifest.TransferID, mergedManifest.Mode, cfg.probeBytes, mergedManifest.LinkMbps)
-
-		startResp, err := client.StartFromManifest(transferCtx, StartFromManifestRequest{
+		startResp, err := downloadManifestFiles(manifestDownloadConfig{
+			Client:             client,
 			Manifest:           mergedManifest,
-			Entries:            pendingEntries,
-			OutputWriter:       outputWriter,
+			Entries:            pendingWork.files,
 			Concurrency:        effectiveConcurrency,
 			BatchMaxBytes:      batchSize,
 			SplitWindowWorkers: batchPlan.SplitWindowWorkers,
 			ProgressUpdates:    progressUpdates,
+			OutputWriter:       outputWriter,
 			OnFileDone: func(evt StartFileDoneEvent) {
 				entry, ok := entryByID[evt.File.Meta.FileID]
 				if !ok {
@@ -2111,19 +2125,38 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 				markMetadataDone(evt.File.Meta.FileID)
 				printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
 			},
+			TotalCopied:      &totalCopied,
+			ProgressFilePath: cfg.progressFilePath,
+			ProgressInterval: cfg.progressInterval,
+			Stderr:           stderr,
+			Verbosity:        cfg.verbosity,
+			TransferID:       mergedManifest.TransferID,
+			TransferMode:     mergedManifest.Mode,
+			ProbeBytes:       cfg.probeBytes,
+			ObservedLinkMbps: mergedManifest.LinkMbps,
+			StatusTotalBytes: totalEntrySize(pendingWork.files),
+			StatusPolling:    false,
 		})
-		probeInfo.stop()
-		cancelTransfer()
-		stopProgress()
-		applyProgressStateToManifest(mergedManifest, mergedProgress)
 		if err != nil {
+			stopProgress()
+			applyProgressStateToManifest(mergedManifest, mergedProgress)
 			fmt.Fprintf(stderr, "sync download failed: %v\n", err)
 			return 1
 		}
-		completed += int64(startResp.Downloaded)
-		totalTransferred += startResp.TransferredBytes
-		for _, startErr := range startResp.Errors {
-			recordFailure(startErr)
+		if len(pendingWork.files) > 0 {
+			completed += int64(startResp.Downloaded)
+			totalTransferred += startResp.TransferredBytes
+			for _, startErr := range startResp.Errors {
+				recordFailure(startErr)
+			}
+		}
+		stopProgress()
+		applyProgressStateToManifest(mergedManifest, mergedProgress)
+		// Apply non-file entries after all file data has been downloaded.
+		if !cfg.skipWrite {
+			for _, nfErr := range applyNonFileEntries(mergedManifest.Entries, pendingWork.hardlinks, pendingWork.symlinks, pendingWork.dirs, outRoot) {
+				recordFailure(nfErr)
+			}
 		}
 
 		failuresMu.Lock()
@@ -2149,7 +2182,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		if len(finalFailures) > 0 {
 			return 1
 		}
-		if cfg.skipWrite {
+		if cfg.skipWrite || len(pendingWork.files) == 0 {
 			return 0
 		}
 	}
@@ -2346,62 +2379,6 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		}
 	}()
 	client := NewClient(serverURL, WithLoadStrategy(loadStrategy), WithComp(cfg.compress), WithClientAgePublicKey(cfg.agePublicKey), WithClientAgeIdentity(cfg.ageIdentity), WithEncryptMode(cfg.encMode))
-	var miniProbe ProbeResponse
-	if probe, probeErr := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil {
-		miniProbe = probe
-	}
-	rawLinkMbps := max(manifest.LinkMbps, miniProbe.LinkMbps)
-	gentleCPUPct := NormalizeGentleCPUPct(miniProbe.GentleCPUPct)
-	gentleBWPct := NormalizeGentleBWPct(miniProbe.GentleBWPct)
-	effectiveLinkMbps := effectiveModeLinkMbps(loadStrategy, rawLinkMbps, gentleBWPct)
-	batchSize := SuggestBatchMaxBytes(
-		miniProbe.SuggestedConcurrency,
-		client.WindowConcurrency,
-		client.FileRequestWindowBytes,
-		miniProbe.ServerSendBufBytes,
-		effectiveLinkMbps,
-	)
-	batchPlan := ExplainBatchMaxBytes(
-		miniProbe.SuggestedConcurrency,
-		client.WindowConcurrency,
-		client.FileRequestWindowBytes,
-		miniProbe.ServerSendBufBytes,
-		effectiveLinkMbps,
-	)
-	linkMiBPerSec := rawLinkMbps * 1_000_000 / 8 / (1 << 20)
-	effectiveLinkMiBPerSec := effectiveLinkMbps * 1_000_000 / 8 / (1 << 20)
-	fmt.Fprintf(stdout, "start-plan:\n")
-	if loadStrategy == LoadStrategyGentle {
-		fmt.Fprintf(stdout, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s), %d%% gentle-cpu, %d%% gentle-bw\n",
-			miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec, gentleCPUPct, gentleBWPct)
-		fmt.Fprintf(stdout, "  mode: [%s] → concurrency = %d cpu * %d%% = %d, bw-limit = %d MiB/s * %d%% = %d MiB/s\n",
-			loadStrategy, miniProbe.ServerCPU, gentleCPUPct, miniProbe.SuggestedConcurrency, linkMiBPerSec, gentleBWPct, effectiveLinkMiBPerSec)
-	} else {
-		fmt.Fprintf(stdout, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s)\n",
-			miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec)
-		fmt.Fprintf(stdout, "  mode: [%s] → concurrency = %d cpu * %d io-depth = %d, bw-limit = none\n",
-			loadStrategy, miniProbe.ServerCPU, miniProbe.ServerIODepth, miniProbe.SuggestedConcurrency)
-	}
-	if cfg.concurrencyExplicit {
-		fmt.Fprintf(stdout, "  concurrency: %d (override from --concurrency, server suggested %d)\n",
-			effectiveConcurrency, miniProbe.SuggestedConcurrency)
-	} else {
-		fmt.Fprintf(stdout, "  concurrency: %d\n", effectiveConcurrency)
-	}
-	fmt.Fprintf(stdout, "    window: %d\n", batchPlan.EffectiveWinConc)
-	fmt.Fprintf(stdout, "    batch-per-window: %d\n", batchPlan.PerFileWorkers)
-	fmt.Fprintf(stdout, "  batch: %s (from %s)\n",
-		encoding.HumanBytes(batchPlan.BatchMaxBytes),
-		formatStartBatchCause(batchPlan))
-	fmt.Fprintln(stdout, formatStartBatchWindowLine(client.FileRequestWindowBytes, batchPlan))
-	if bwProbeLine := formatStartBatchProbeLine(effectiveLinkMiBPerSec, miniProbe.SuggestedConcurrency, batchPlan); bwProbeLine != "" {
-		fmt.Fprintln(stdout, bwProbeLine)
-	}
-	transferCtx, cancelTransfer := context.WithCancel(context.Background())
-	defer cancelTransfer()
-	probeInfo := startTransferProbeReporter(transferCtx, client, manifest.TransferID, loadStrategy, defaultCLIProbeBytes, manifest.LinkMbps)
-	defer probeInfo.stop()
-
 	startAll := time.Now()
 	var completed int64
 	var totalTransferred int64
@@ -2415,96 +2392,132 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		failures = append(failures, err)
 		failuresMu.Unlock()
 	}
-	pendingEntries := make([]ManifestEntry, 0, len(manifest.Entries))
-	for _, entry := range manifest.Entries {
-		progress := entry.Progress
-		if progress.AckBytes >= entry.Size {
-			if progress.MetadataDone {
-				completed++
-				continue
-			}
-			if err := refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, ""); err != nil {
-				recordFailure(fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err))
-				continue
-			}
-			persistFileDone(entry.ID, entry.Size)
-			markMetadataDone(entry.ID)
-			completed++
-			continue
-		}
-		pendingEntries = append(pendingEntries, entry)
+	markCompleted := func(entry ManifestEntry) {
+		persistFileDone(entry.ID, entry.Size)
+		markMetadataDone(entry.ID)
 	}
-	var totalCopied atomic.Int64
-	var totalPendingBytes int64
-	for _, e := range pendingEntries {
-		totalPendingBytes += e.Size
-	}
-	var stopStatusPolling func()
-	if cfg.verbosity >= 1 {
-		stopStatusPolling = startVerboseStatusPolling(txferID, client, &totalCopied, totalPendingBytes, probeInfo, stderr)
-		defer stopStatusPolling()
-	}
-	outputWriter := func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
-		destPath := resolveDownloadDestinationPath(entry, outRoot, "")
-		w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, cfg.noSync)
-		if err != nil {
-			return nil, nil, err
-		}
-		return &countingWriter{Writer: w, total: &totalCopied}, syncFn, nil
-	}
-	if cfg.progressFilePath != "" {
-		var totalBytes int64
-		for _, e := range pendingEntries {
-			totalBytes += e.Size
-		}
-		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), cfg.progressFilePath, cfg.progressInterval, func() int {
-			if totalBytes <= 0 {
-				return 100
-			}
-			pct := int(totalCopied.Load() * 100 / totalBytes)
-			if pct > 100 {
-				pct = 100
-			}
-			return pct
-		})
-		defer func() { stopProgressFile(len(failures) == 0) }()
-	}
-	startResp, err := client.StartFromManifest(transferCtx, StartFromManifestRequest{
-		Manifest:           manifest,
-		Entries:            pendingEntries,
-		OutputWriter:       outputWriter,
-		Concurrency:        effectiveConcurrency,
-		BatchMaxBytes:      batchSize,
-		SplitWindowWorkers: batchPlan.SplitWindowWorkers,
-		ProgressUpdates:    progressUpdates,
-		OnFileDone: func(evt StartFileDoneEvent) {
-			entry, ok := entryByID[evt.File.Meta.FileID]
-			if !ok {
-				recordFailure(fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID))
-				return
-			}
-			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
-			if err := applyDownloadedTrailerMetadata(destPath, evt.File.Meta.TrailerMetadata); err != nil {
-				recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
-				return
-			}
-			persistFileDone(evt.File.Meta.FileID, entry.Size)
-			markMetadataDone(evt.File.Meta.FileID)
-			if cfg.verbosity >= 2 {
-				printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
-			}
+	pendingWork, completedNow := collectPendingManifestWork(
+		manifest.Entries,
+		cfg.discard,
+		markCompleted,
+		func(entry ManifestEntry) error {
+			return refreshCompletedFileMetadata(context.Background(), client, manifest, entry.ID, outRoot, "")
 		},
-	})
-	if err != nil {
-		stopProgress()
-		progressStopped = true
-		fmt.Fprintf(stderr, "start failed: %v\n", err)
-		return 1
-	}
-	completed += int64(startResp.Downloaded)
-	totalTransferred += startResp.TransferredBytes
-	for _, startErr := range startResp.Errors {
-		recordFailure(startErr)
+		recordFailure,
+	)
+	completed += completedNow
+	var totalCopied atomic.Int64
+	totalPendingBytes := totalEntrySize(pendingWork.files)
+
+	if len(pendingWork.files) > 0 {
+		var miniProbe ProbeResponse
+		if probe, probeErr := client.ProbeLink(context.Background(), ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil {
+			miniProbe = probe
+		}
+		rawLinkMbps := max(manifest.LinkMbps, miniProbe.LinkMbps)
+		gentleCPUPct := NormalizeGentleCPUPct(miniProbe.GentleCPUPct)
+		gentleBWPct := NormalizeGentleBWPct(miniProbe.GentleBWPct)
+		effectiveLinkMbps := effectiveModeLinkMbps(loadStrategy, rawLinkMbps, gentleBWPct)
+		batchSize := SuggestBatchMaxBytes(
+			miniProbe.SuggestedConcurrency,
+			client.WindowConcurrency,
+			client.FileRequestWindowBytes,
+			miniProbe.ServerSendBufBytes,
+			effectiveLinkMbps,
+		)
+		batchPlan := ExplainBatchMaxBytes(
+			miniProbe.SuggestedConcurrency,
+			client.WindowConcurrency,
+			client.FileRequestWindowBytes,
+			miniProbe.ServerSendBufBytes,
+			effectiveLinkMbps,
+		)
+		linkMiBPerSec := rawLinkMbps * 1_000_000 / 8 / (1 << 20)
+		effectiveLinkMiBPerSec := effectiveLinkMbps * 1_000_000 / 8 / (1 << 20)
+		fmt.Fprintf(stdout, "start-plan:\n")
+		if loadStrategy == LoadStrategyGentle {
+			fmt.Fprintf(stdout, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s), %d%% gentle-cpu, %d%% gentle-bw\n",
+				miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec, gentleCPUPct, gentleBWPct)
+			fmt.Fprintf(stdout, "  mode: [%s] → concurrency = %d cpu * %d%% = %d, bw-limit = %d MiB/s * %d%% = %d MiB/s\n",
+				loadStrategy, miniProbe.ServerCPU, gentleCPUPct, miniProbe.SuggestedConcurrency, linkMiBPerSec, gentleBWPct, effectiveLinkMiBPerSec)
+		} else {
+			fmt.Fprintf(stdout, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s)\n",
+				miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec)
+			fmt.Fprintf(stdout, "  mode: [%s] → concurrency = %d cpu * %d io-depth = %d, bw-limit = none\n",
+				loadStrategy, miniProbe.ServerCPU, miniProbe.ServerIODepth, miniProbe.SuggestedConcurrency)
+		}
+		if cfg.concurrencyExplicit {
+			fmt.Fprintf(stdout, "  concurrency: %d (override from --concurrency, server suggested %d)\n",
+				effectiveConcurrency, miniProbe.SuggestedConcurrency)
+		} else {
+			fmt.Fprintf(stdout, "  concurrency: %d\n", effectiveConcurrency)
+		}
+		fmt.Fprintf(stdout, "    window: %d\n", batchPlan.EffectiveWinConc)
+		fmt.Fprintf(stdout, "    batch-per-window: %d\n", batchPlan.PerFileWorkers)
+		fmt.Fprintf(stdout, "  batch: %s (from %s)\n",
+			encoding.HumanBytes(batchPlan.BatchMaxBytes),
+			formatStartBatchCause(batchPlan))
+		fmt.Fprintln(stdout, formatStartBatchWindowLine(client.FileRequestWindowBytes, batchPlan))
+		if bwProbeLine := formatStartBatchProbeLine(effectiveLinkMiBPerSec, miniProbe.SuggestedConcurrency, batchPlan); bwProbeLine != "" {
+			fmt.Fprintln(stdout, bwProbeLine)
+		}
+		outputWriter := func(entry ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
+			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, cfg.noSync)
+			if err != nil {
+				return nil, nil, err
+			}
+			return &countingWriter{Writer: w, total: &totalCopied}, syncFn, nil
+		}
+		startResp, err := downloadManifestFiles(manifestDownloadConfig{
+			Client:             client,
+			Manifest:           manifest,
+			Entries:            pendingWork.files,
+			Concurrency:        effectiveConcurrency,
+			BatchMaxBytes:      batchSize,
+			SplitWindowWorkers: batchPlan.SplitWindowWorkers,
+			ProgressUpdates:    progressUpdates,
+			OutputWriter:       outputWriter,
+			OnFileDone: func(evt StartFileDoneEvent) {
+				entry, ok := entryByID[evt.File.Meta.FileID]
+				if !ok {
+					recordFailure(fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID))
+					return
+				}
+				destPath := resolveDownloadDestinationPath(entry, outRoot, "")
+				if err := applyDownloadedTrailerMetadata(destPath, evt.File.Meta.TrailerMetadata); err != nil {
+					recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
+					return
+				}
+				persistFileDone(evt.File.Meta.FileID, entry.Size)
+				markMetadataDone(evt.File.Meta.FileID)
+				if cfg.verbosity >= 2 {
+					printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
+				}
+			},
+			TotalCopied:      &totalCopied,
+			ProgressFilePath: cfg.progressFilePath,
+			ProgressInterval: cfg.progressInterval,
+			Stderr:           stderr,
+			Verbosity:        cfg.verbosity,
+			TransferID:       txferID,
+			TransferMode:     loadStrategy,
+			ProbeBytes:       defaultCLIProbeBytes,
+			ObservedLinkMbps: manifest.LinkMbps,
+			StatusTotalBytes: totalPendingBytes,
+			StatusPolling:    true,
+		})
+		if err != nil {
+			stopProgress()
+			progressStopped = true
+			fmt.Fprintf(stderr, "start failed: %v\n", err)
+			return 1
+		}
+		completed += int64(startResp.Downloaded)
+		totalTransferred += startResp.TransferredBytes
+		for _, startErr := range startResp.Errors {
+			recordFailure(startErr)
+		}
 	}
 	stopProgress()
 	progressStopped = true
@@ -2512,6 +2525,12 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	if err := saveProgressState(ps.ProgressPath, progressState); err != nil {
 		fmt.Fprintf(stderr, "save progress state failed: %v\n", err)
 		return 1
+	}
+	// Apply non-file entries after all file data has been downloaded.
+	if !cfg.discard {
+		for _, nfErr := range applyNonFileEntries(manifest.Entries, pendingWork.hardlinks, pendingWork.symlinks, pendingWork.dirs, outRoot) {
+			recordFailure(nfErr)
+		}
 	}
 	failuresMu.Lock()
 	finalFailures := append([]error(nil), failures...)
@@ -2681,6 +2700,234 @@ func isDiscardDestination(destPath string) bool {
 		return true
 	}
 	return filepath.Clean(destPath) == filepath.Clean(os.DevNull)
+}
+
+type pendingManifestWork struct {
+	files     []ManifestEntry
+	hardlinks []ManifestEntry
+	symlinks  []ManifestEntry
+	dirs      []ManifestEntry
+}
+
+func (w pendingManifestWork) hasAny() bool {
+	return len(w.files) > 0 || len(w.hardlinks) > 0 || len(w.symlinks) > 0 || len(w.dirs) > 0
+}
+
+type manifestDownloadConfig struct {
+	Client             *Client
+	Manifest           *Manifest
+	Entries            []ManifestEntry
+	Concurrency        int
+	BatchMaxBytes      int64
+	SplitWindowWorkers int
+	ProgressUpdates    chan<- DownloadProgressUpdate
+	OutputWriter       func(ManifestEntry, int64) (io.WriteCloser, func() error, error)
+	OnFileDone         func(StartFileDoneEvent)
+	TotalCopied        *atomic.Int64
+	ProgressFilePath   string
+	ProgressInterval   time.Duration
+	Stderr             io.Writer
+	Verbosity          int
+	TransferID         string
+	TransferMode       string
+	ProbeBytes         int64
+	ObservedLinkMbps   int64
+	StatusTotalBytes   int64
+	StatusPolling      bool
+}
+
+func totalEntrySize(entries []ManifestEntry) int64 {
+	var total int64
+	for _, entry := range entries {
+		total += entry.Size
+	}
+	return total
+}
+
+func collectPendingManifestWork(
+	entries []ManifestEntry,
+	noWrite bool,
+	markCompleted func(ManifestEntry),
+	refreshMetadata func(ManifestEntry) error,
+	recordFailure func(error),
+) (pendingManifestWork, int64) {
+	pendingEntries := make([]ManifestEntry, 0, len(entries))
+	var completed int64
+	for _, entry := range entries {
+		if entry.Type != 0 && entry.Type != encoding.EntryTypeFile {
+			if !noWrite {
+				pendingEntries = append(pendingEntries, entry)
+			}
+			continue
+		}
+		if entry.Progress.AckBytes >= entry.Size {
+			if entry.Progress.MetadataDone || noWrite {
+				if markCompleted != nil {
+					markCompleted(entry)
+				}
+				completed++
+				continue
+			}
+			if refreshMetadata != nil {
+				if err := refreshMetadata(entry); err != nil {
+					if recordFailure != nil {
+						recordFailure(fmt.Errorf("id=%d metadata refresh failed: %w", entry.ID, err))
+					}
+					continue
+				}
+				if markCompleted != nil {
+					markCompleted(entry)
+				}
+				completed++
+				continue
+			}
+		}
+		pendingEntries = append(pendingEntries, entry)
+	}
+	files, hardlinks, symlinks, dirs := separateEntriesByType(pendingEntries)
+	return pendingManifestWork{
+		files:     files,
+		hardlinks: hardlinks,
+		symlinks:  symlinks,
+		dirs:      dirs,
+	}, completed
+}
+
+func downloadManifestFiles(cfg manifestDownloadConfig) (StartFromManifestResponse, error) {
+	if len(cfg.Entries) == 0 {
+		return StartFromManifestResponse{}, nil
+	}
+
+	totalCopied := cfg.TotalCopied
+	if totalCopied == nil {
+		totalCopied = &atomic.Int64{}
+	}
+
+	transferCtx, cancelTransfer := context.WithCancel(context.Background())
+	defer cancelTransfer()
+	probeInfo := startTransferProbeReporter(transferCtx, cfg.Client, cfg.TransferID, cfg.TransferMode, cfg.ProbeBytes, cfg.ObservedLinkMbps)
+	defer probeInfo.stop()
+
+	if cfg.StatusPolling && cfg.Verbosity >= 1 {
+		stopStatusPolling := startVerboseStatusPolling(cfg.TransferID, cfg.Client, totalCopied, cfg.StatusTotalBytes, probeInfo, cfg.Stderr)
+		defer stopStatusPolling()
+	}
+
+	success := false
+	if cfg.ProgressFilePath != "" {
+		totalBytes := totalEntrySize(cfg.Entries)
+		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), cfg.ProgressFilePath, cfg.ProgressInterval, func() int {
+			if totalBytes <= 0 {
+				return 100
+			}
+			pct := int(totalCopied.Load() * 100 / totalBytes)
+			if pct > 100 {
+				pct = 100
+			}
+			return pct
+		})
+		defer func() { stopProgressFile(success) }()
+	}
+
+	startResp, err := cfg.Client.StartFromManifest(transferCtx, StartFromManifestRequest{
+		Manifest:           cfg.Manifest,
+		Entries:            cfg.Entries,
+		OutputWriter:       cfg.OutputWriter,
+		Concurrency:        cfg.Concurrency,
+		BatchMaxBytes:      cfg.BatchMaxBytes,
+		SplitWindowWorkers: cfg.SplitWindowWorkers,
+		ProgressUpdates:    cfg.ProgressUpdates,
+		OnFileDone:         cfg.OnFileDone,
+	})
+	if err != nil {
+		return StartFromManifestResponse{}, err
+	}
+	success = true
+	return startResp, nil
+}
+
+// separateEntriesByType splits manifest entries into categories for processing.
+// File entries are returned for download. Non-file entries (H, S, D) are returned
+// separately for post-download processing.
+func separateEntriesByType(entries []ManifestEntry) (files, hardlinks, symlinks, dirs []ManifestEntry) {
+	for _, e := range entries {
+		switch e.Type {
+		case encoding.EntryTypeHard:
+			hardlinks = append(hardlinks, e)
+		case encoding.EntryTypeSymlink:
+			symlinks = append(symlinks, e)
+		case encoding.EntryTypeDir:
+			dirs = append(dirs, e)
+		default: // 'F' or 0
+			files = append(files, e)
+		}
+	}
+	return
+}
+
+// applyNonFileEntries creates hardlinks, symlinks, and applies directory metadata
+// after all file data has been downloaded. Returns any errors encountered.
+func applyNonFileEntries(allEntries []ManifestEntry, hardlinks, symlinks, dirs []ManifestEntry, outRoot string) []error {
+	var errs []error
+
+	// Build ID → entry index for hardlink resolution.
+	byID := make(map[uint64]ManifestEntry, len(allEntries))
+	for _, e := range allEntries {
+		byID[e.ID] = e
+	}
+
+	// 1. Hardlinks — target file must already exist on disk.
+	for _, le := range hardlinks {
+		target, ok := byID[uint64(le.LinkTarget)]
+		if !ok {
+			errs = append(errs, fmt.Errorf("hardlink %s: target id %d not found", le.Path, le.LinkTarget))
+			continue
+		}
+		srcPath := filepath.Join(outRoot, filepath.FromSlash(target.Path))
+		dstPath := filepath.Join(outRoot, filepath.FromSlash(le.Path))
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			errs = append(errs, fmt.Errorf("hardlink %s: mkdir: %w", le.Path, err))
+			continue
+		}
+		os.Remove(dstPath) // remove stale from prior run
+		if err := os.Link(srcPath, dstPath); err != nil {
+			errs = append(errs, fmt.Errorf("hardlink %s -> %s: %w", le.Path, target.Path, err))
+		}
+	}
+
+	// 2. Symlinks — create with stored target path.
+	for _, se := range symlinks {
+		dstPath := filepath.Join(outRoot, filepath.FromSlash(se.Path))
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			errs = append(errs, fmt.Errorf("symlink %s: mkdir: %w", se.Path, err))
+			continue
+		}
+		os.Remove(dstPath) // remove stale from prior run
+		if err := os.Symlink(se.LinkPath, dstPath); err != nil {
+			errs = append(errs, fmt.Errorf("symlink %s -> %s: %w", se.Path, se.LinkPath, err))
+		}
+	}
+
+	// 3. Directories — apply permissions and mtime last, since writing files
+	// changes directory mtime. Process in reverse depth order (deepest first)
+	// so parent mtime isn't overwritten by child dir metadata application.
+	sort.Slice(dirs, func(i, j int) bool {
+		return len(dirs[i].Path) > len(dirs[j].Path)
+	})
+	for _, de := range dirs {
+		dstPath := filepath.Join(outRoot, filepath.FromSlash(de.Path))
+		if err := os.MkdirAll(dstPath, 0o755); err != nil {
+			errs = append(errs, fmt.Errorf("dir %s: mkdir: %w", de.Path, err))
+			continue
+		}
+		os.Chmod(dstPath, de.Mode.Perm())
+		if de.Mtime > 0 {
+			mt := time.Unix(0, de.Mtime)
+			os.Chtimes(dstPath, mt, mt)
+		}
+	}
+
+	return errs
 }
 
 func resolveDownloadDestinationPath(entry ManifestEntry, outRoot string, outFile string) string {

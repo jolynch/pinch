@@ -104,7 +104,7 @@ func (d *sendTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { ret
 func (d *sendTestDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (d *sendTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
 func (d *sendTestDeps) MarkTransferTooSlow(string) bool                  { return false }
-func (d *sendTestDeps) GetTransferLimiterBps(string) int64                { return 0 }
+func (d *sendTestDeps) GetTransferLimiterBps(string) int64               { return 0 }
 func (d *sendTestDeps) Root() string                                     { return "/" }
 
 func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {
@@ -249,14 +249,16 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 }
 
 func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
-	size := (5 * defaultFileFrameLogicalSize) + 1
+	// Give adaptive mode enough runway that even slower CI machines should
+	// switch away from "none" before the stream is exhausted.
+	size := (12 * defaultFileFrameLogicalSize) + 1
 	data := bytes.Repeat([]byte("compress-me-"), int(size/int64(len("compress-me-")))+1)
 	data = data[:size]
 	tmp := writeTempSendFile(t, data)
 	deps := &sendTestDeps{filePath: tmp}
 
 	var rawOut bytes.Buffer
-	slowOut := delayedWriter{w: &rawOut, delay: 10 * time.Millisecond}
+	slowOut := delayedWriter{w: &rawOut, delay: 25 * time.Millisecond}
 	err := streamSendItem(context.Background(), &slowOut, deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, false)
 	if err != nil {
 		t.Fatalf("streamSendItem failed: %v", err)
@@ -266,8 +268,8 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("frameComps failed: %v", err)
 	}
-	if len(comps) < 5 {
-		t.Fatalf("expected >=5 frames for adaptive test, got %d", len(comps))
+	if len(comps) < 10 {
+		t.Fatalf("expected >=10 frames for adaptive test, got %d", len(comps))
 	}
 	if comps[0] != "none" {
 		t.Fatalf("expected first frame to start at none, got %q", comps[0])
