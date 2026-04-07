@@ -87,8 +87,8 @@ func TestHandleSYNCNoChanges(t *testing.T) {
 	if len(rmPaths) != 0 {
 		t.Fatalf("expected no removals, got %v", rmPaths)
 	}
-	if len(newManifest) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(newManifest))
+	if len(newManifest) != 3 { // sub/ (D) + a.txt (F) + sub/b.txt (F)
+		t.Fatalf("expected 3 entries, got %d", len(newManifest))
 	}
 }
 
@@ -366,10 +366,13 @@ func fuzzApplyRandomModifications(t *testing.T, dir string, files *[]string, rng
 func fuzzVerifySyncResult(t *testing.T, dir string, oldManifestRaw string, newEntries []encoding.ManifestEntry, rmPaths []string) {
 	t.Helper()
 
-	// Walk the filesystem to get ground truth.
+	// Walk the filesystem to get ground truth (files, dirs, symlinks).
 	onDisk := make(map[string]struct{})
 	filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
+			return nil
+		}
+		if path == dir {
 			return nil
 		}
 		rel, _ := filepath.Rel(dir, path)
@@ -377,14 +380,14 @@ func fuzzVerifySyncResult(t *testing.T, dir string, oldManifestRaw string, newEn
 		return nil
 	})
 
-	// Every file on disk must appear in newEntries.
+	// Every path on disk must appear in newEntries.
 	inManifest := make(map[string]struct{}, len(newEntries))
 	for _, e := range newEntries {
 		inManifest[e.Path] = struct{}{}
 	}
 	for path := range onDisk {
 		if _, ok := inManifest[path]; !ok {
-			t.Errorf("file on disk %q not in new manifest", path)
+			t.Errorf("path on disk %q not in new manifest", path)
 		}
 	}
 	// Every new manifest entry must exist on disk.
@@ -392,14 +395,16 @@ func fuzzVerifySyncResult(t *testing.T, dir string, oldManifestRaw string, newEn
 		if _, ok := onDisk[e.Path]; !ok {
 			t.Errorf("manifest entry %q not on disk", e.Path)
 		}
-		// Verify size matches.
-		info, err := os.Stat(filepath.Join(dir, filepath.FromSlash(e.Path)))
-		if err != nil {
-			t.Errorf("stat %q: %v", e.Path, err)
-			continue
-		}
-		if info.Size() != e.Size {
-			t.Errorf("size mismatch for %q: manifest=%d disk=%d", e.Path, e.Size, info.Size())
+		// Verify size matches for F entries; D/S/H entries have size=0.
+		if e.Type == encoding.EntryTypeFile || e.Type == 0 {
+			info, err := os.Stat(filepath.Join(dir, filepath.FromSlash(e.Path)))
+			if err != nil {
+				t.Errorf("stat %q: %v", e.Path, err)
+				continue
+			}
+			if info.Size() != e.Size {
+				t.Errorf("size mismatch for %q: manifest=%d disk=%d", e.Path, e.Size, info.Size())
+			}
 		}
 	}
 

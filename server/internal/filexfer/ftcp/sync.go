@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -168,52 +167,36 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	prevPath := ""
 	prevMtime := ""
 
-	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == root || d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		entryPath := filepath.ToSlash(rel)
-		entryMtime := info.ModTime().UnixNano()
-		entrySize := info.Size()
-
+	emitSyncEntry := func(entry encoding.ManifestEntry) error {
 		// Mark in pathIndex that this path still exists on disk.
-		// Key by path hash — no path strings stored in the index.
-		pathHash := xxh3.Hash128([]byte(entryPath))
+		pathHash := xxh3.Hash128([]byte(entry.Path))
 		if old, ok := pathIndex[pathHash]; ok {
 			old.seen = true
 		}
 
-		// Emit entry.
-		entryMode := encoding.FormatManifestMode(info.Mode())
-		mtimeStr := strconv.FormatInt(entryMtime, 10)
-		pathToken := encoding.EncodePathToken(prevPath, entryPath)
-		mtimeToken, _ := encoding.EncodeMtimeToken(prevMtime, mtimeStr)
-		line := fmt.Sprintf("%d %d %s %s %s\n", fileID, entrySize, mtimeToken, entryMode, pathToken)
+		line, _, mtimeRaw, err := encoding.MarshalManifestEntry(entry, prevPath, prevMtime)
+		if err != nil {
+			return err
+		}
+		line += "\n"
 
-		fullPath := filepath.Clean(filepath.Join(root, entryPath))
+		fullPath := filepath.Clean(filepath.Join(root, entry.Path))
 		updatesCh <- TransferFileStateUpdate{
 			FileID:   uint64(fileID),
 			PathHash: xxh3.Hash128([]byte(fullPath)),
-			FileSize: entrySize,
+			FileSize: entry.Size,
 		}
 		if _, err := io.WriteString(out, line); err != nil {
 			return err
 		}
-		prevPath = entryPath
-		prevMtime = mtimeStr
+		prevPath = entry.Path
+		prevMtime = mtimeRaw
 		fileID++
 		return nil
+	}
+
+	walkErr := encoding.WalkManifestEntries(root, func(result encoding.WalkResult) error {
+		return emitSyncEntry(result.Entry)
 	})
 	if walkErr != nil {
 		if isBrokenPipe(walkErr) {

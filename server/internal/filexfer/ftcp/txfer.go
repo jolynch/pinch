@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -300,34 +299,18 @@ func encodeManifest(
 		return err
 	}
 
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == root || d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		entryPath := filepath.ToSlash(rel)
-		entryMtime := strconv.FormatInt(info.ModTime().UnixNano(), 10)
-		entryMode := encoding.FormatManifestMode(info.Mode())
-
+	emitEntry := func(entry encoding.ManifestEntry) error {
 		prevP := prevPath
 		prevM := prevMtime
 		if verbose {
 			prevP = ""
 			prevM = ""
 		}
-		pathToken := encoding.EncodePathToken(prevP, entryPath)
-		mtimeToken, _ := encoding.EncodeMtimeToken(prevM, entryMtime)
-		line := fmt.Sprintf("%d %d %s %s %s\n", fileID, info.Size(), mtimeToken, entryMode, pathToken)
+		line, _, mtimeRaw, err := encoding.MarshalManifestEntry(entry, prevP, prevM)
+		if err != nil {
+			return err
+		}
+		line += "\n"
 
 		if maxChunkSize > 0 && chunkBytes+len(line) > maxChunkSize {
 			if chunkBytes == len(header) {
@@ -339,28 +322,34 @@ func encodeManifest(
 			if err := startChunk(); err != nil {
 				return err
 			}
-			pathToken = encoding.EncodePathToken("", entryPath)
-			mtimeToken, _ = encoding.EncodeMtimeToken("", entryMtime)
-			line = fmt.Sprintf("%d %d %s %s %s\n", fileID, info.Size(), mtimeToken, entryMode, pathToken)
+			line, _, mtimeRaw, err = encoding.MarshalManifestEntry(entry, "", "")
+			if err != nil {
+				return err
+			}
+			line += "\n"
 			if chunkBytes+len(line) > maxChunkSize {
 				return errors.New("max-manifest-chunk-size is too small for manifest entry")
 			}
 		}
 
-		fullPath := filepath.Clean(filepath.Join(root, entryPath))
+		fullPath := filepath.Clean(filepath.Join(root, entry.Path))
 		updatesCh <- TransferFileStateUpdate{
 			FileID:   uint64(fileID),
 			PathHash: xxh3.Hash128([]byte(fullPath)),
-			FileSize: info.Size(),
+			FileSize: entry.Size,
 		}
 		if _, err := io.WriteString(w, line); err != nil {
 			return err
 		}
 		chunkBytes += len(line)
-		prevPath = entryPath
-		prevMtime = entryMtime
+		prevPath = entry.Path
+		prevMtime = mtimeRaw
 		fileID++
 		return nil
+	}
+
+	err := encoding.WalkManifestEntries(root, func(result encoding.WalkResult) error {
+		return emitEntry(result.Entry)
 	})
 	if err != nil {
 		return err

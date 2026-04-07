@@ -144,3 +144,114 @@ func TestHandleTXFERStoresHintsAndEmitsFM2(t *testing.T) {
 		t.Fatalf("unexpected write error: %v", err)
 	}
 }
+
+func TestEncodeManifestHardlinks(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello world")
+	if err := os.Link(filepath.Join(root, "a.txt"), filepath.Join(root, "b.txt")); err != nil {
+		t.Fatalf("hardlink: %v", err)
+	}
+
+	raw := runTXFERTest(t, root)
+	entries, _ := parseSYNCResponseEntries(raw, nil)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+
+	// Without hardlink dedup, both entries have size=11 (total=22).
+	// With hardlink dedup, one F entry has size=11 and one H entry has size=0 (total=11).
+	var totalSize int64
+	for _, e := range entries {
+		totalSize += e.Size
+	}
+	if totalSize != 11 {
+		t.Fatalf("expected total size 11 (hardlink dedup), got %d", totalSize)
+	}
+
+	// Exactly one entry should be type H.
+	var hCount int
+	for _, e := range entries {
+		if e.Type == 'H' {
+			hCount++
+			if e.Size != 0 {
+				t.Errorf("H entry %q has size=%d, want 0", e.Path, e.Size)
+			}
+			if e.LinkTarget < 0 {
+				t.Errorf("H entry %q has no link target", e.Path)
+			}
+		}
+	}
+	if hCount != 1 {
+		t.Fatalf("expected 1 H entry, got %d", hCount)
+	}
+}
+
+func TestEncodeManifestSymlinks(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello")
+	if err := os.Symlink("a.txt", filepath.Join(root, "link.txt")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	raw := runTXFERTest(t, root)
+	entries, _ := parseSYNCResponseEntries(raw, nil)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+
+	var fCount, sCount int
+	for _, e := range entries {
+		switch e.Type {
+		case 'F':
+			fCount++
+			if e.Size != 5 {
+				t.Errorf("F entry %q has size=%d, want 5", e.Path, e.Size)
+			}
+		case 'S':
+			sCount++
+			if e.Size != 0 {
+				t.Errorf("S entry %q has size=%d, want 0", e.Path, e.Size)
+			}
+			if e.LinkPath != "a.txt" {
+				t.Errorf("S entry %q has LinkPath=%q, want %q", e.Path, e.LinkPath, "a.txt")
+			}
+		}
+	}
+	if fCount != 1 || sCount != 1 {
+		t.Fatalf("expected 1 F + 1 S, got %d F + %d S", fCount, sCount)
+	}
+}
+
+func TestEncodeManifestDirectories(t *testing.T) {
+	root := t.TempDir()
+	subDir := filepath.Join(root, "sub")
+	if err := os.Mkdir(subDir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeTestFile(t, root, "sub/b.txt", "world")
+
+	raw := runTXFERTest(t, root)
+	entries, _ := parseSYNCResponseEntries(raw, nil)
+
+	var dCount, fCount int
+	for _, e := range entries {
+		switch e.Type {
+		case 'D':
+			dCount++
+			if e.Size != 0 {
+				t.Errorf("D entry %q has size=%d, want 0", e.Path, e.Size)
+			}
+			if e.Mode&0o777 != 0o750 {
+				t.Errorf("D entry %q has mode=%o, want 0750", e.Path, e.Mode)
+			}
+		case 'F':
+			fCount++
+		}
+	}
+	if dCount != 1 {
+		t.Fatalf("expected 1 D entry, got %d", dCount)
+	}
+	if fCount != 1 {
+		t.Fatalf("expected 1 F entry, got %d", fCount)
+	}
+}

@@ -3,21 +3,34 @@ package encoding
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/jolynch/pinch/utils"
 )
 
+// Entry type constants for the manifest wire format.
+const (
+	EntryTypeFile    byte = 'F' // regular file
+	EntryTypeHard    byte = 'H' // hardlink (mtime carries target file ID)
+	EntryTypeDir     byte = 'D' // directory
+	EntryTypeSymlink byte = 'S' // symlink (link target after path token)
+)
+
 // ManifestEntry is the internal representation of one FM/1 manifest line.
 type ManifestEntry struct {
-	ID    uint64
-	Size  int64
-	Mtime int64
-	Mode  os.FileMode
-	Path  string
+	Type       byte // 'F', 'H', 'D', 'S'; zero treated as 'F'
+	ID         uint64
+	Size       int64
+	Mtime      int64
+	Mode       os.FileMode
+	Path       string
+	LinkTarget int64  // H: target file ID; -1 otherwise
+	LinkPath   string // S: symlink target path; "" otherwise
 }
 
 // ManifestHeader is the parsed FM/1 header line.
@@ -30,6 +43,12 @@ type ManifestHeader struct {
 	DeadlineMS  int64 // optional; 0 = no deadline
 }
 
+// WalkResult is one canonical filesystem-derived manifest entry.
+type WalkResult struct {
+	Entry    ManifestEntry
+	FullPath string
+}
+
 // EncodePathToken front-codes current against prev and returns a "prefix:suffixLen:suffix" token.
 func EncodePathToken(prev string, current string) string {
 	prefixLen := utils.CommonPrefixLen(prev, current)
@@ -37,36 +56,53 @@ func EncodePathToken(prev string, current string) string {
 	return strconv.Itoa(prefixLen) + ":" + strconv.Itoa(len(suffix)) + ":" + suffix
 }
 
-// DecodePathToken decodes a "prefix:suffixLen:suffix" token against prev.
-func DecodePathToken(prev string, token string) (string, error) {
+// DecodePathTokenPrefix decodes a "prefix:suffixLen:suffix" token against prev,
+// consuming exactly suffixLen bytes from the suffix. Returns the decoded path
+// and the number of bytes consumed from token, allowing trailing content.
+func DecodePathTokenPrefix(prev string, token string) (string, int, error) {
 	first := strings.IndexByte(token, ':')
 	if first < 0 {
-		return "", errors.New("invalid path token")
+		return "", 0, errors.New("invalid path token")
 	}
 	second := strings.IndexByte(token[first+1:], ':')
 	if second < 0 {
-		return "", errors.New("invalid path token")
+		return "", 0, errors.New("invalid path token")
 	}
 	second += first + 1
 	prefixLen, err := strconv.Atoi(token[:first])
 	if err != nil || prefixLen < 0 {
-		return "", errors.New("invalid path prefix length")
+		return "", 0, errors.New("invalid path prefix length")
 	}
 	if prefixLen > len(prev) {
-		return "", errors.New("path prefix length exceeds previous value")
+		return "", 0, errors.New("path prefix length exceeds previous value")
 	}
 	suffixLen, err := strconv.Atoi(token[first+1 : second])
 	if err != nil || suffixLen < 0 {
-		return "", errors.New("invalid path suffix length")
+		return "", 0, errors.New("invalid path suffix length")
 	}
-	suffix := token[second+1:]
-	if len(suffix) != suffixLen {
+	suffixStart := second + 1
+	suffixEnd := suffixStart + suffixLen
+	if suffixEnd > len(token) {
+		return "", 0, errors.New("path suffix length exceeds token")
+	}
+	suffix := token[suffixStart:suffixEnd]
+	if prev == "" && prefixLen != 0 {
+		return "", 0, errors.New("first path prefix length must be zero")
+	}
+	return prev[:prefixLen] + suffix, suffixEnd, nil
+}
+
+// DecodePathToken decodes a "prefix:suffixLen:suffix" token against prev.
+// The entire token must be consumed (no trailing content).
+func DecodePathToken(prev string, token string) (string, error) {
+	decoded, consumed, err := DecodePathTokenPrefix(prev, token)
+	if err != nil {
+		return "", err
+	}
+	if consumed != len(token) {
 		return "", errors.New("path suffix length mismatch")
 	}
-	if prev == "" && prefixLen != 0 {
-		return "", errors.New("first path prefix length must be zero")
-	}
-	return prev[:prefixLen] + suffix, nil
+	return decoded, nil
 }
 
 // EncodeMtimeToken front-codes current against prev and returns a "prefix:suffix" token.
@@ -118,9 +154,24 @@ func DecodeMtimeToken(prev string, token string) (string, error) {
 	return prev[:prefixLen] + suffix, nil
 }
 
+// NormalizeManifestMode strips file-type bits and keeps only manifest-relevant mode bits.
+func NormalizeManifestMode(mode os.FileMode) os.FileMode {
+	bits := mode.Perm()
+	if mode&os.ModeSetuid != 0 {
+		bits |= 0o4000
+	}
+	if mode&os.ModeSetgid != 0 {
+		bits |= 0o2000
+	}
+	if mode&os.ModeSticky != 0 {
+		bits |= 0o1000
+	}
+	return bits
+}
+
 // FormatManifestMode formats a file mode as a 4-digit octal string.
 func FormatManifestMode(mode os.FileMode) string {
-	bits := mode.Perm() | (mode & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
+	bits := NormalizeManifestMode(mode)
 	return fmt.Sprintf("%04o", bits)
 }
 
@@ -146,6 +197,10 @@ func ParseManifestModeToken(raw string) (os.FileMode, error) {
 
 // ParseManifestEntry parses a single FM/1 manifest entry line.
 // Returns the parsed entry, the resolved path, and the resolved mtime string.
+//
+// The mtime string returned is always the raw resolved mtime token (even for H
+// entries where the mtime field carries a target file ID). This preserves
+// front-coding continuity across entry types.
 func ParseManifestEntry(line string, prevPath string, prevMtime string) (ManifestEntry, string, string, error) {
 	first := strings.IndexByte(line, ' ')
 	if first <= 0 {
@@ -171,9 +226,23 @@ func ParseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 	sizeRaw := line[first+1 : second]
 	mtimeToken := line[second+1 : third]
 	modeRaw := line[third+1 : fourth]
-	pathToken := line[fourth+1:]
+	pathAndTrailing := line[fourth+1:]
 
-	id, err := strconv.ParseUint(idRaw, 10, 64)
+	// Parse type prefix: F, H, D, S before the numeric ID. If the first
+	// character is a digit, treat as legacy format (type F).
+	entryType := EntryTypeFile
+	idStr := idRaw
+	if len(idRaw) > 0 && (idRaw[0] < '0' || idRaw[0] > '9') {
+		entryType = idRaw[0]
+		idStr = idRaw[1:]
+		switch entryType {
+		case EntryTypeFile, EntryTypeHard, EntryTypeDir, EntryTypeSymlink:
+		default:
+			return ManifestEntry{}, "", "", fmt.Errorf("unknown manifest entry type: %c", entryType)
+		}
+	}
+
+	id, err := strconv.ParseUint(idStr, 10, 64)
 	if err != nil {
 		return ManifestEntry{}, "", "", fmt.Errorf("invalid manifest id: %w", err)
 	}
@@ -189,22 +258,36 @@ func ParseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 	if err != nil {
 		return ManifestEntry{}, "", "", err
 	}
-	mtimeNanos, err := strconv.ParseUint(mtimeResolved, 10, 64)
-	if err != nil {
-		return ManifestEntry{}, "", "", fmt.Errorf("invalid manifest mtime value: %w", err)
-	}
-	if mtimeNanos > uint64(^uint64(0)>>1) {
-		return ManifestEntry{}, "", "", errors.New("manifest mtime overflows int64")
-	}
 	mode, err := ParseManifestModeToken(modeRaw)
 	if err != nil {
 		return ManifestEntry{}, "", "", err
 	}
 
-	pathResolved, err := DecodePathToken(prevPath, pathToken)
-	if err != nil {
-		return ManifestEntry{}, "", "", err
+	// For S entries, use DecodePathTokenPrefix (path token is self-delimiting,
+	// trailing content is the symlink target). For other types, consume all.
+	var pathResolved string
+	var linkPath string
+	if entryType == EntryTypeSymlink {
+		consumed := 0
+		pathResolved, consumed, err = DecodePathTokenPrefix(prevPath, pathAndTrailing)
+		if err != nil {
+			return ManifestEntry{}, "", "", err
+		}
+		trailing := strings.TrimSpace(pathAndTrailing[consumed:])
+		if trailing == "" {
+			return ManifestEntry{}, "", "", errors.New("S entry missing symlink target")
+		}
+		linkPath, _, err = ParseLenPrefixedPrefix(trailing)
+		if err != nil {
+			return ManifestEntry{}, "", "", fmt.Errorf("invalid symlink target: %w", err)
+		}
+	} else {
+		pathResolved, err = DecodePathToken(prevPath, pathAndTrailing)
+		if err != nil {
+			return ManifestEntry{}, "", "", err
+		}
 	}
+
 	if strings.Contains(pathResolved, `\`) {
 		return ManifestEntry{}, "", "", errors.New("manifest path contains backslash")
 	}
@@ -217,13 +300,113 @@ func ParseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 	}
 
 	entry := ManifestEntry{
-		ID:    id,
-		Size:  int64(sizeU),
-		Mtime: int64(mtimeNanos),
-		Mode:  mode,
-		Path:  pathResolved,
+		Type:       entryType,
+		ID:         id,
+		Size:       int64(sizeU),
+		Mode:       mode,
+		Path:       pathResolved,
+		LinkTarget: -1,
+		LinkPath:   linkPath,
 	}
+
+	// Interpret mtime field based on type.
+	switch entryType {
+	case EntryTypeHard:
+		// Mtime field carries the target file ID.
+		targetID, pErr := strconv.ParseUint(mtimeResolved, 10, 64)
+		if pErr != nil {
+			return ManifestEntry{}, "", "", fmt.Errorf("invalid H entry target id: %w", pErr)
+		}
+		entry.LinkTarget = int64(targetID)
+		entry.Mtime = 0
+	default:
+		mtimeNanos, pErr := strconv.ParseUint(mtimeResolved, 10, 64)
+		if pErr != nil {
+			return ManifestEntry{}, "", "", fmt.Errorf("invalid manifest mtime value: %w", pErr)
+		}
+		if mtimeNanos > uint64(^uint64(0)>>1) {
+			return ManifestEntry{}, "", "", errors.New("manifest mtime overflows int64")
+		}
+		entry.Mtime = int64(mtimeNanos)
+	}
+
 	return entry, pathResolved, mtimeResolved, nil
+}
+
+// WalkManifestEntries streams filesystem-derived manifest entries in walk order.
+func WalkManifestEntries(root string, fn func(WalkResult) error) error {
+	root = filepath.Clean(root)
+	var fileID uint64
+	inodeSeen := make(map[uint64]map[uint64]uint64, 4)
+
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+
+		entry := ManifestEntry{
+			Type:       EntryTypeFile,
+			ID:         fileID,
+			Size:       info.Size(),
+			Mtime:      info.ModTime().UnixNano(),
+			Mode:       NormalizeManifestMode(info.Mode()),
+			Path:       filepath.ToSlash(rel),
+			LinkTarget: -1,
+		}
+
+		switch {
+		case d.IsDir():
+			entry.Type = EntryTypeDir
+			entry.Size = 0
+		case d.Type()&os.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			entry.Type = EntryTypeSymlink
+			entry.Size = 0
+			entry.LinkPath = target
+		default:
+			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+				dev := uint64(st.Dev)
+				ino := st.Ino
+				devMap, ok := inodeSeen[dev]
+				if !ok {
+					devMap = make(map[uint64]uint64)
+					inodeSeen[dev] = devMap
+				}
+				if firstID, seen := devMap[ino]; seen {
+					entry.Type = EntryTypeHard
+					entry.Size = 0
+					entry.Mtime = 0
+					entry.LinkTarget = int64(firstID)
+				} else {
+					devMap[ino] = fileID
+				}
+			}
+		}
+
+		if err := fn(WalkResult{
+			Entry:    entry,
+			FullPath: filepath.Clean(path),
+		}); err != nil {
+			return err
+		}
+		fileID++
+		return nil
+	})
 }
 
 // MarshalManifestEntry serializes a single manifest entry using front-coding
@@ -243,14 +426,37 @@ func MarshalManifestEntry(entry ManifestEntry, prevPath string, prevMtime string
 	if cleanPath == "." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == ".." {
 		return "", "", "", fmt.Errorf("manifest path traversal is not allowed: %q", entry.Path)
 	}
+
+	entryType := entry.Type
+	if entryType == 0 {
+		entryType = EntryTypeFile
+	}
+
+	// For H entries, the mtime field carries the target file ID.
+	var mtimeRaw string
+	switch entryType {
+	case EntryTypeHard:
+		if entry.LinkTarget < 0 {
+			return "", "", "", fmt.Errorf("H entry id=%d missing link target", entry.ID)
+		}
+		mtimeRaw = strconv.FormatInt(entry.LinkTarget, 10)
+	default:
+		mtimeRaw = strconv.FormatInt(entry.Mtime, 10)
+	}
+
 	modeToken := FormatManifestMode(entry.Mode)
-	mtimeRaw := strconv.FormatInt(entry.Mtime, 10)
 	mtimeToken, err := EncodeMtimeToken(prevMtime, mtimeRaw)
 	if err != nil {
 		return "", "", "", fmt.Errorf("encode manifest mtime id=%d: %w", entry.ID, err)
 	}
 	pathToken := EncodePathToken(prevPath, entry.Path)
-	line := fmt.Sprintf("%d %d %s %s %s", entry.ID, entry.Size, mtimeToken, modeToken, pathToken)
+	line := fmt.Sprintf("%c%d %d %s %s %s", entryType, entry.ID, entry.Size, mtimeToken, modeToken, pathToken)
+
+	// For S entries, append the symlink target as a len-prefixed token.
+	if entryType == EntryTypeSymlink {
+		line += fmt.Sprintf(" %d:%s", len(entry.LinkPath), entry.LinkPath)
+	}
+
 	return line, entry.Path, mtimeRaw, nil
 }
 
