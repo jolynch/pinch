@@ -2800,6 +2800,9 @@ func collectPendingManifestWork(
 		pendingEntries = append(pendingEntries, entry)
 	}
 	files, hardlinks, symlinks, dirs := separateEntriesByType(pendingEntries)
+	// Push older files to the front so we work on the most likely to be retained
+	// files.
+	sort.Slice(files, func(i, j int) bool { return files[i].Mtime < files[j].Mtime })
 	return pendingManifestWork{
 		files:     files,
 		hardlinks: hardlinks,
