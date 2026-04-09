@@ -1967,3 +1967,72 @@ func FuzzSuggestBatchMaxBytes(f *testing.F) {
 		}
 	})
 }
+
+func TestManifestSizeEmpty(t *testing.T) {
+	var m *Manifest
+	mem, disk := m.Size()
+	if mem != 0 || disk != 0 {
+		t.Errorf("nil manifest: got mem=%d disk=%d, want 0,0", mem, disk)
+	}
+	m2 := &Manifest{}
+	mem, disk = m2.Size()
+	if mem <= 0 {
+		t.Errorf("empty manifest: got mem=%d, want > 0 (struct itself)", mem)
+	}
+	if disk != 0 {
+		t.Errorf("empty manifest: got disk=%d, want 0 (never serialized)", disk)
+	}
+}
+
+func TestManifestSizeCached(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("FM/1 tx 7:/remote mode=fast link-mbps=1000 concurrency=1\n")
+	b.WriteString("F1 10 0:100 0644 0:5:a.txt\n")
+	m, err := parseManifest([]byte(b.String()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	first, firstDisk := m.Size()
+	if firstDisk <= 0 {
+		t.Errorf("parsed manifest should have disk > 0, got %d", firstDisk)
+	}
+	// Mutate a Path — cache should be sticky.
+	m.Entries[0].Path = "a-much-longer-path-than-before.txt"
+	mem, disk := m.Size()
+	if mem != first {
+		t.Errorf("cached mem changed after mutation: got %d, want %d", mem, first)
+	}
+	if disk != firstDisk {
+		t.Errorf("disk changed after mutation: got %d, want %d", disk, firstDisk)
+	}
+}
+
+func TestManifestSizeScales(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("FM/1 txmeasure 7:/remote mode=fast link-mbps=1000 concurrency=1\n")
+	prevPath := ""
+	for i := 0; i < 1000; i++ {
+		path := fmt.Sprintf("data/images/2024/album_%03d/photo_%04d.jpg", i/100, i)
+		b.WriteString(fmt.Sprintf("F%d 1024 0:%d 0644 %s\n",
+			i, 1735771234567890123+int64(i),
+			intencoding.EncodePathToken(prevPath, path)))
+		prevPath = path
+	}
+	raw := []byte(b.String())
+	m, err := parseManifest(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	mem, disk := m.Size()
+	t.Logf("1000 entries: mem=%d bytes (~%d B/entry), disk=%d bytes (~%d B/entry)",
+		mem, mem/1000, disk, disk/1000)
+	if mem < 96*1000 {
+		t.Errorf("mem too small: %d", mem)
+	}
+	if mem > 1<<20 {
+		t.Errorf("mem too large: %d", mem)
+	}
+	if disk != int64(len(raw)) {
+		t.Errorf("disk=%d, want %d", disk, len(raw))
+	}
+}

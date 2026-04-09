@@ -267,6 +267,7 @@ func scanLocalDir(targetDir string, meta *Manifest) (*Manifest, error) {
 		})
 		return nil
 	})
+	out.Size() // warm cache
 	return out, err
 }
 
@@ -1955,6 +1956,15 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		unchangedCount := encoding.HumanCount(uint64(len(unchangedFiles)), 6)
 		rmCount := encoding.HumanCount(uint64(len(rmPaths)), 6)
 
+		oldMem, _ := oldManifest.Size()
+		newMem, newDisk := newManifest.Size()
+		fmt.Fprintf(stdout,
+			"sync-manifests[%d]: local %d files [mem=%s], remote %d files [mem=%s, disk=%s]\n",
+			round,
+			len(oldManifest.Entries), encoding.HumanBytes(oldMem),
+			len(newManifest.Entries), encoding.HumanBytes(newMem),
+			encoding.HumanBytes(newDisk),
+		)
 		fmt.Fprintf(stdout,
 			"sync-delta[%d]: new[%s (%s)] stale[%s (%s)] same[%s] rm[%s] link=%dMbps srv-conc=(%d cpu * %d io = %d) batch=%s\n",
 			round,
@@ -1968,7 +1978,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		)
 
 		if len(newFiles) == 0 && len(staleFiles) == 0 && len(rmPaths) == 0 {
-			fmt.Fprintln(stdout, "sync: converged, nothing to do")
+			fmt.Fprintln(stdout, "sync: remote and local converged, nothing to do")
 			return 0
 		}
 
@@ -2435,6 +2445,11 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		linkMiBPerSec := rawLinkMbps * 1_000_000 / 8 / (1 << 20)
 		effectiveLinkMiBPerSec := effectiveLinkMbps * 1_000_000 / 8 / (1 << 20)
 		fmt.Fprintf(stdout, "start-plan:\n")
+		manifestMem, manifestDisk := manifest.Size()
+		fmt.Fprintf(stdout, "  manifest: %d files indexed in [mem=%s, serialized=%s]\n",
+			len(manifest.Entries),
+			encoding.HumanBytesFixedWidth(manifestMem, 4),
+			encoding.HumanBytesFixedWidth(manifestDisk, 4))
 		if loadStrategy == LoadStrategyGentle {
 			fmt.Fprintf(stdout, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s), %d%% gentle-cpu, %d%% gentle-bw\n",
 				miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec, gentleCPUPct, gentleBWPct)

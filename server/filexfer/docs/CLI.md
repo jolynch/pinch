@@ -65,9 +65,16 @@ Important flags:
 - `--verify-meta`: run a read-only follow-up verification pass
 - `--verify-data-sample N`: sample file contents after a successful copy;
   implies `--verify-meta`
+- `--encrypt none|auto|aes|chacha20`: encryption algorithm (default: none)
+- `--compress adapt|none|lz4|zstd`: compression algorithm (default: adapt)
+- `--concurrency N`: parallel download / verification workers (0=auto)
 - `--deadline`: cap a run to a fixed duration
-- `--progress`, `--verbose`, `--progress-file`, `--progress-file-interval`:
+- `-a`, `--ack-every`: bytes between progress acks (e.g. `1B`, `4KiB`, `8MiB`)
+- `--probe-size`: probe payload size (e.g. `1B`, `4KiB`, `8MiB`)
+- `-y`, `--yes`: skip confirmation prompt on sync paths
+- `--progress`, `-v`/`--verbose`, `--progress-file`, `--progress-file-interval`:
   control human and file-based progress output
+- `--trace`: write `runtime/trace` output to a file
 
 ## Convergence Workflow
 
@@ -79,10 +86,10 @@ Typical pattern:
 1. Run a bounded first pass:
 
    ```bash
-   pinch filecli copy --deadline 30m /srv/data /var/lib/pinch/data
+   pinch filecli copy --deadline 30m --mode gentle /srv/data /var/lib/pinch/data
    ```
 
-2. Run the same command again:
+2. Run the same command again in fast mode to get deltas:
 
    ```bash
    pinch filecli copy /srv/data /var/lib/pinch/data
@@ -91,7 +98,7 @@ Typical pattern:
 3. Keep rerunning until the sync phase reports:
 
    ```text
-   sync: converged, nothing to do
+   sync: remote and local converged, nothing to do
    ```
 
 Why this works:
@@ -153,7 +160,11 @@ Important flags:
 - `--concurrency N`: parallel download workers (0=auto)
 - `--skip-write`: fetch to discard without writing
 - `--skip-fsync`: acknowledge writes without `fdatasync`
+- `-a`, `--ack-every`: bytes between progress acks (e.g. `1B`, `4KiB`, `8MiB`)
 - `--deadline`: transfer deadline (e.g. 60s, 5m)
+- `--progress`, `-v`/`--verbose`, `--progress-file`, `--progress-file-interval`:
+  control human and file-based progress output
+- `--trace`: write `runtime/trace` output to a file
 
 ## Transfer Strategies: `fast` and `gentle`
 
@@ -184,7 +195,6 @@ strategy selection.
 - `LOCAL_DST` is local filesystem state on the client machine
 - human-readable byte sizes are accepted for flags such as:
   - `--ack-every`
-  - `--batch-size`
   - `--probe-size`
 - a successful sync prompt is skipped automatically when no local mutations are
   needed
