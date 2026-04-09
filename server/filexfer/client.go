@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"filippo.io/age"
 	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
@@ -201,6 +202,39 @@ type Manifest struct {
 	Concurrency int
 	DeadlineMS  int64
 	Entries     []ManifestEntry
+
+	// wireBytes is the size of the manifest in its on-disk/wire FM/1 encoding.
+	// Set by parseManifest from len(raw); zero for manifests built in-memory
+	// (e.g. scanLocalDir) that have never been serialized.
+	wireBytes int64
+
+	// allocatedBytes caches the result of Size(). Zero means "not yet
+	// computed". Uses atomic.Int64 so Size() is safe to call concurrently
+	// without a mutex.
+	allocatedBytes atomic.Int64
+}
+
+const manifestEntrySize = int64(unsafe.Sizeof(ManifestEntry{}))
+
+// Size returns the in-memory (mem) and on-disk/wire (disk) byte sizes of the
+// manifest. The mem result is cached after the first call. disk is the FM/1
+// wire size recorded during parse; zero for manifests built in-memory.
+func (m *Manifest) Size() (mem, disk int64) {
+	if m == nil {
+		return 0, 0
+	}
+	if cached := m.allocatedBytes.Load(); cached > 0 {
+		return cached, m.wireBytes
+	}
+	total := int64(unsafe.Sizeof(*m))
+	total += int64(len(m.TransferID) + len(m.Root) + len(m.Mode))
+	total += int64(cap(m.Entries)) * manifestEntrySize
+	for i := range m.Entries {
+		total += int64(len(m.Entries[i].Path))
+		total += int64(len(m.Entries[i].LinkPath))
+	}
+	m.allocatedBytes.Store(total)
+	return total, m.wireBytes
 }
 
 type ManifestEntry struct {
@@ -2213,7 +2247,7 @@ func (c *Client) releaseLineReader(br *bufio.Reader) {
 
 func parseManifest(raw []byte) (*Manifest, error) {
 	reader := bufio.NewReader(bytes.NewReader(raw))
-	manifest := &Manifest{}
+	manifest := &Manifest{wireBytes: int64(len(raw))}
 	// Pre-allocate based on newline count — an upper bound on entry count that
 	// avoids repeated growslice doublings (and the GC pauses they trigger) for
 	// large manifests.
@@ -2294,6 +2328,7 @@ func parseManifest(raw []byte) (*Manifest, error) {
 	}
 
 	sort.Slice(manifest.Entries, func(i, j int) bool { return manifest.Entries[i].ID < manifest.Entries[j].ID })
+	manifest.Size() // warm cache
 	return manifest, nil
 }
 
