@@ -885,7 +885,7 @@ Options:
       --require-auth          require AUTH before commands
       --target-io-depth int   target IO depth per CPU advertised in PROBE (default 4)
       --trace string          write runtime/trace to this file
-      --progress-path string           write transfer % to this file/pipe
+      --progress-path string           append transfer status + integer % records to this file/pipe
       --progress-path-interval string  progress write interval (default "1s")
       --disable-zero-copy              force buffered send path (for benchmarking)
 `)
