@@ -585,7 +585,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "Parallel download / verification workers (0=adapt from server)")
 	cf.BoolVar(&cfg.progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&cfg.verbose, "v", "verbose", false, "Per-file progress output")
-	cf.StringVar(&cfg.progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
+	cf.StringVar(&cfg.progressFilePath, "", "progress-file", "", "Append progress status + integer % records to this file/pipe")
 	cf.StringVar(&cfg.progressFileIntervalRaw, "", "progress-file-interval", cfg.progressFileIntervalRaw, "Progress write interval (e.g. 500ms, 10s)")
 	cf.BoolVar(&cfg.yes, "y", "yes", false, "Skip confirmation prompt on sync paths")
 	cf.StringVar(&cfg.ackEveryRaw, "a", "ack-every", cfg.ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
@@ -1563,7 +1563,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf.BoolVar(&skipFsync, "", "skip-fsync", false, "Acknowledge writes without fdatasync")
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
-	cf.StringVar(&progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
+	cf.StringVar(&progressFilePath, "", "progress-file", "", "Append progress status + integer % records to this file/pipe")
 	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
@@ -1705,15 +1705,24 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	}
 	if progressFilePath != "" {
 		totalBytes := entry.Size
-		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), progressFilePath, progressInterval, func() int {
-			if totalBytes <= 0 {
-				return 100
+		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), progressFilePath, progressInterval, func() (string, int) {
+			copied := totalCopied.Load()
+			if totalBytes > 0 && copied > totalBytes {
+				copied = totalBytes
 			}
-			pct := int(totalCopied.Load() * 100 / totalBytes)
+			doneFiles := uint64(0)
+			if totalBytes <= 0 || copied >= totalBytes {
+				doneFiles = 1
+			}
+			pct := 100
+			if totalBytes > 0 {
+				pct = int(copied * 100 / totalBytes)
+			}
+			status := filexfer.FormatProgressStatusLine("client", "", doneFiles, 1, copied, totalBytes)
 			if pct > 100 {
 				pct = 100
 			}
-			return pct
+			return status, pct
 		})
 		defer func() { stopProgressFile(err == nil) }()
 	}
@@ -1770,7 +1779,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
 	cf.BoolVar(&yes, "y", "yes", false, "Skip confirmation prompt")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
-	cf.StringVar(&progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
+	cf.StringVar(&progressFilePath, "", "progress-file", "", "Append progress status + integer % records to this file/pipe")
 	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; 1B, 4KiB, 8MiB")
@@ -2222,7 +2231,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
-	cf.StringVar(&progressFilePath, "", "progress-file", "", "Write integer % to this file/pipe")
+	cf.StringVar(&progressFilePath, "", "progress-file", "", "Append progress status + integer % records to this file/pipe")
 	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	cf.BoolVar(&discard, "", "skip-write", false, "Discard downloaded file contents instead of writing to the target directory")
 	cf.BoolVar(&discard, "", "discard", false, "Discard downloaded file contents instead of writing to the target directory")
@@ -2820,6 +2829,7 @@ func downloadManifestFiles(cfg manifestDownloadConfig) (StartFromManifestRespons
 	if totalCopied == nil {
 		totalCopied = &atomic.Int64{}
 	}
+	var doneFiles atomic.Uint64
 
 	transferCtx, cancelTransfer := context.WithCancel(context.Background())
 	defer cancelTransfer()
@@ -2834,19 +2844,26 @@ func downloadManifestFiles(cfg manifestDownloadConfig) (StartFromManifestRespons
 	success := false
 	if cfg.ProgressFilePath != "" {
 		totalBytes := totalEntrySize(cfg.Entries)
-		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), cfg.ProgressFilePath, cfg.ProgressInterval, func() int {
-			if totalBytes <= 0 {
-				return 100
+		totalFiles := uint64(len(cfg.Entries))
+		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), cfg.ProgressFilePath, cfg.ProgressInterval, func() (string, int) {
+			copied := totalCopied.Load()
+			if totalBytes > 0 && copied > totalBytes {
+				copied = totalBytes
 			}
-			pct := int(totalCopied.Load() * 100 / totalBytes)
+			pct := 100
+			if totalBytes > 0 {
+				pct = int(copied * 100 / totalBytes)
+			}
+			status := filexfer.FormatProgressStatusLine("client", "", doneFiles.Load(), totalFiles, copied, totalBytes)
 			if pct > 100 {
 				pct = 100
 			}
-			return pct
+			return status, pct
 		})
 		defer func() { stopProgressFile(success) }()
 	}
 
+	onFileDone := cfg.OnFileDone
 	startResp, err := cfg.Client.StartFromManifest(transferCtx, StartFromManifestRequest{
 		Manifest:           cfg.Manifest,
 		Entries:            cfg.Entries,
@@ -2855,7 +2872,12 @@ func downloadManifestFiles(cfg manifestDownloadConfig) (StartFromManifestRespons
 		BatchMaxBytes:      cfg.BatchMaxBytes,
 		SplitWindowWorkers: cfg.SplitWindowWorkers,
 		ProgressUpdates:    cfg.ProgressUpdates,
-		OnFileDone:         cfg.OnFileDone,
+		OnFileDone: func(evt StartFileDoneEvent) {
+			doneFiles.Add(1)
+			if onFileDone != nil {
+				onFileDone(evt)
+			}
+		},
 	})
 	if err != nil {
 		return StartFromManifestResponse{}, err

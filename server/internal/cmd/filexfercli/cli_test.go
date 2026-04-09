@@ -22,6 +22,7 @@ import (
 	"filippo.io/age"
 	. "github.com/jolynch/pinch/filexfer"
 	"github.com/jolynch/pinch/internal/aead"
+	intfilexfer "github.com/jolynch/pinch/internal/filexfer"
 	"github.com/jolynch/pinch/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
 	"github.com/zeebo/xxh3"
@@ -499,6 +500,60 @@ func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "  path: "+os.DevNull) {
 		t.Fatalf("expected file metrics path %q, got: %s", os.DevNull, stdout.String())
+	}
+}
+
+func TestRunCLIGetProgressFileWritesStatusAndPct(t *testing.T) {
+	payload := []byte("hello")
+	singleManifest := "FM/1 txprogress 7:/remote mode=fast link-mbps=0 concurrency=8\nF0 5 0:100 0644 0:5:a.txt\n"
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, singleManifest); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	progressPath := filepath.Join(tmp, "progress.txt")
+	outputPath := filepath.Join(tmp, "a.txt")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{
+		srv.URL, "get", "--progress=false",
+		"--progress-file", progressPath,
+		"--progress-file-interval", "1h",
+		"-o", outputPath,
+		"/remote/a.txt",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("get with progress file: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+
+	raw, err := os.ReadFile(progressPath)
+	if err != nil {
+		t.Fatalf("read progress file: %v", err)
+	}
+	wantStatus := intfilexfer.FormatProgressStatusLine("client", "", 1, 1, int64(len(payload)), int64(len(payload)))
+	want := wantStatus + "\n100\n"
+	if got := string(raw); got != want {
+		t.Fatalf("unexpected progress file contents:\n got=%q\nwant=%q", got, want)
 	}
 }
 
@@ -1592,7 +1647,7 @@ func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("sync no-op: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "sync: converged, nothing to do") {
+	if !strings.Contains(stdout.String(), "sync: remote and local converged, nothing to do") {
 		t.Fatalf("expected converged output, got: %s", stdout.String())
 	}
 	if strings.Contains(stderr.String(), "proceed?") {
