@@ -318,20 +318,44 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 	return decReader, nil
 }
 
-func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
+// dialAndAuth resolves auth state, dials a TCP connection, and sends the
+// AUTH handshake. The caller is responsible for closing the returned connection.
+func (c *Client) dialAndAuth(ctx context.Context) (net.Conn, tcpAuthState, error) {
 	state, err := c.resolveTCPAuthState(ctx)
 	if err != nil {
-		return GetManifestResponse{}, err
+		return nil, tcpAuthState{}, err
 	}
 	conn, err := c.dialTCP(ctx)
 	if err != nil {
-		return GetManifestResponse{}, fmt.Errorf("dial file listener: %w", err)
+		return nil, tcpAuthState{}, fmt.Errorf("dial file listener: %w", err)
+	}
+	if err := c.sendTCPAuth(conn, state); err != nil {
+		conn.Close()
+		return nil, tcpAuthState{}, fmt.Errorf("send AUTH: %w", err)
+	}
+	return conn, state, nil
+}
+
+// sendAndReadTCP sends a command on the connection and returns a buffered
+// reader for the (possibly decrypted) response stream.
+func (c *Client) sendAndReadTCP(conn net.Conn, state tcpAuthState, cmd string) (*bufio.Reader, error) {
+	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
+		return nil, err
+	}
+	responseReader, err := c.responseReaderForTCP(conn, state)
+	if err != nil {
+		return nil, err
+	}
+	return bufio.NewReader(responseReader), nil
+}
+
+func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return GetManifestResponse{}, err
 	}
 	defer conn.Close()
 
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		return GetManifestResponse{}, fmt.Errorf("send AUTH: %w", err)
-	}
 	cmd := "TXFER " + makeLenToken(request.Directory)
 	if request.Verbose {
 		cmd += " verbose=1"
@@ -345,15 +369,10 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 	if request.DeadlineMS > 0 {
 		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
 	}
-	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
-		return GetManifestResponse{}, fmt.Errorf("send TXFER: %w", err)
-	}
-
-	responseReader, err := c.responseReaderForTCP(conn, state)
+	br, err := c.sendAndReadTCP(conn, state, cmd)
 	if err != nil {
-		return GetManifestResponse{}, fmt.Errorf("initialize TXFER response stream: %w", err)
+		return GetManifestResponse{}, fmt.Errorf("TXFER: %w", err)
 	}
-	br := bufio.NewReader(responseReader)
 
 	raw := c.acquireScratchBuffer(maxTCPLineBytes)
 	defer c.releaseScratchBuffer(raw)
@@ -379,19 +398,11 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 }
 
 func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
-	state, err := c.resolveTCPAuthState(ctx)
+	conn, state, err := c.dialAndAuth(ctx)
 	if err != nil {
 		return SyncManifestResponse{}, err
 	}
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return SyncManifestResponse{}, fmt.Errorf("dial file listener: %w", err)
-	}
 	defer conn.Close()
-
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		return SyncManifestResponse{}, fmt.Errorf("send AUTH: %w", err)
-	}
 
 	// Send SYNC command line.
 	cmd := "SYNC " + makeLenToken(request.Directory) +
@@ -485,17 +496,9 @@ func (c *Client) fetchFileWindowTCP(
 	if fullPath == "" {
 		return nil, nil, errors.New("missing full path")
 	}
-	state, err := c.resolveTCPAuthState(ctx)
+	conn, state, err := c.dialAndAuth(ctx)
 	if err != nil {
 		return nil, nil, err
-	}
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dial file listener: %w", err)
-	}
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		conn.Close()
-		return nil, nil, fmt.Errorf("send AUTH: %w", err)
 	}
 
 	effectiveSize := size
@@ -520,34 +523,15 @@ func (c *Client) fetchFileWindowTCP(
 		cmd.WriteString(" size=")
 		cmd.WriteString(strconv.FormatInt(effectiveSize, 10))
 	}
-	if err := c.sendTCPCommand(conn, state, cmd.String()); err != nil {
-		conn.Close()
-		return nil, nil, fmt.Errorf("send SEND: %w", err)
-	}
-
-	responseReader, err := c.responseReaderForTCP(conn, state)
+	br, err := c.sendAndReadTCP(conn, state, cmd.String())
 	if err != nil {
 		conn.Close()
-		return nil, nil, fmt.Errorf("initialize SEND response stream: %w", err)
+		return nil, nil, fmt.Errorf("SEND: %w", err)
 	}
-	br := bufio.NewReader(responseReader)
-	firstLine, err := br.ReadString('\n')
+	firstLine, err := readSENDFirstLine(br)
 	if err != nil {
 		conn.Close()
-		return nil, nil, fmt.Errorf("read SEND response: %w", err)
-	}
-	trimmed := strings.TrimRight(firstLine, "\r\n")
-	if err := parseErrControlFrame(trimmed); err != nil {
-		conn.Close()
-		var controlErr controlFrameError
-		if errors.As(err, &controlErr) && strings.EqualFold(controlErr.Code, "NOT_FOUND") {
-			return nil, nil, fmt.Errorf("%w: %w", ErrFileMissing, &fileMissingError{Status: 404, Body: strings.TrimSpace(controlErr.Message)})
-		}
 		return nil, nil, err
-	}
-	if _, ok := parseOKStatusLine(trimmed); ok {
-		conn.Close()
-		return nil, nil, errors.New("unexpected OK response for SEND")
 	}
 
 	prefixed := io.MultiReader(strings.NewReader(firstLine), br)
@@ -574,17 +558,9 @@ func (c *Client) fetchFileBatchTCP(
 	if len(targets) == 0 {
 		return nil, errors.New("missing file targets")
 	}
-	state, err := c.resolveTCPAuthState(ctx)
+	conn, state, err := c.dialAndAuth(ctx)
 	if err != nil {
 		return nil, err
-	}
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("dial file listener: %w", err)
-	}
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("send AUTH: %w", err)
 	}
 
 	var b strings.Builder
@@ -615,34 +591,15 @@ func (c *Client) fetchFileBatchTCP(
 			b.WriteString(strconv.FormatInt(t.Size, 10))
 		}
 	}
-	if err := c.sendTCPCommand(conn, state, b.String()); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("send SEND batch: %w", err)
-	}
-
-	responseReader, err := c.responseReaderForTCP(conn, state)
+	br, err := c.sendAndReadTCP(conn, state, b.String())
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("initialize SEND response stream: %w", err)
+		return nil, fmt.Errorf("SEND batch: %w", err)
 	}
-	br := bufio.NewReader(responseReader)
-	firstLine, err := br.ReadString('\n')
+	firstLine, err := readSENDFirstLine(br)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("read SEND response: %w", err)
-	}
-	trimmed := strings.TrimRight(firstLine, "\r\n")
-	if err := parseErrControlFrame(trimmed); err != nil {
-		conn.Close()
-		var controlErr controlFrameError
-		if errors.As(err, &controlErr) && strings.EqualFold(controlErr.Code, "NOT_FOUND") {
-			return nil, fmt.Errorf("%w: %w", ErrFileMissing, &fileMissingError{Status: 404, Body: strings.TrimSpace(controlErr.Message)})
-		}
 		return nil, err
-	}
-	if _, ok := parseOKStatusLine(trimmed); ok {
-		conn.Close()
-		return nil, errors.New("unexpected OK response for SEND")
 	}
 	return &readerWithCloser{Reader: io.MultiReader(strings.NewReader(firstLine), br), Closer: conn}, nil
 }
@@ -662,22 +619,48 @@ func readTCPStatus(br *bufio.Reader) (string, error) {
 	return message, nil
 }
 
+// readStreamFirstLine reads and validates the first line of a streaming
+// response (SEND, CXSUM). Returns the raw first line (including trailing
+// newline) for prefixing back onto the stream, or an error if the server
+// sent ERR or an unexpected OK.
+func readStreamFirstLine(br *bufio.Reader, verb string) (string, error) {
+	firstLine, err := br.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read %s response: %w", verb, err)
+	}
+	trimmed := strings.TrimRight(firstLine, "\r\n")
+	if err := parseErrControlFrame(trimmed); err != nil {
+		return "", err
+	}
+	if _, ok := parseOKStatusLine(trimmed); ok {
+		return "", fmt.Errorf("unexpected OK response for %s", verb)
+	}
+	return firstLine, nil
+}
+
+// readSENDFirstLine reads the first line of a SEND streaming response,
+// wrapping NOT_FOUND errors as ErrFileMissing.
+func readSENDFirstLine(br *bufio.Reader) (string, error) {
+	firstLine, err := readStreamFirstLine(br, "SEND")
+	if err != nil {
+		var controlErr controlFrameError
+		if errors.As(err, &controlErr) && strings.EqualFold(controlErr.Code, "NOT_FOUND") {
+			return "", fmt.Errorf("%w: %w", ErrFileMissing, &fileMissingError{Status: 404, Body: strings.TrimSpace(controlErr.Message)})
+		}
+		return "", err
+	}
+	return firstLine, nil
+}
+
 func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int64) (probeResponse, error) {
 	if probeBytes <= 0 {
 		return probeResponse{}, errors.New("probe bytes must be > 0")
 	}
-	state, err := c.resolveTCPAuthState(ctx)
+	conn, state, err := c.dialAndAuth(ctx)
 	if err != nil {
 		return probeResponse{}, err
 	}
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return probeResponse{}, fmt.Errorf("dial file listener: %w", err)
-	}
 	defer conn.Close()
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		return probeResponse{}, fmt.Errorf("send AUTH: %w", err)
-	}
 
 	cts0 := time.Now().UnixMilli()
 	localCPU := runtime.NumCPU()
@@ -845,18 +828,11 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	if txferID == "" {
 		return AcknowledgeFileProgressResponse{}, errors.New("missing transfer id")
 	}
-	state, err := c.resolveTCPAuthState(ctx)
+	conn, state, err := c.dialAndAuth(ctx)
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, err
 	}
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return AcknowledgeFileProgressResponse{}, fmt.Errorf("dial file listener: %w", err)
-	}
 	defer conn.Close()
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		return AcknowledgeFileProgressResponse{}, fmt.Errorf("send AUTH: %w", err)
-	}
 
 	var cmd strings.Builder
 	cmd.WriteString("ACK ")
@@ -881,42 +857,28 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 			cmd.WriteString(strconv.FormatInt(request.SyncMS, 10))
 		}
 	}
-	if err := c.sendTCPCommand(conn, state, cmd.String()); err != nil {
-		return AcknowledgeFileProgressResponse{}, fmt.Errorf("send ACK: %w", err)
-	}
-	responseReader, err := c.responseReaderForTCP(conn, state)
+	br, err := c.sendAndReadTCP(conn, state, cmd.String())
 	if err != nil {
-		return AcknowledgeFileProgressResponse{}, fmt.Errorf("initialize ACK response stream: %w", err)
+		return AcknowledgeFileProgressResponse{}, fmt.Errorf("ACK: %w", err)
 	}
-	if _, err := readTCPStatus(bufio.NewReader(responseReader)); err != nil {
+	if _, err := readTCPStatus(br); err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("read ACK response: %w", err)
 	}
 	return AcknowledgeFileProgressResponse{}, nil
 }
 
 func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (GetStatusResponse, error) {
-	state, err := c.resolveTCPAuthState(ctx)
+	conn, state, err := c.dialAndAuth(ctx)
 	if err != nil {
 		return GetStatusResponse{}, err
 	}
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return GetStatusResponse{}, fmt.Errorf("dial file listener: %w", err)
-	}
 	defer conn.Close()
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		return GetStatusResponse{}, fmt.Errorf("send AUTH: %w", err)
-	}
 
-	cmd := "STATUS " + request.TransferID
-	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
-		return GetStatusResponse{}, fmt.Errorf("send STATUS: %w", err)
-	}
-	responseReader, err := c.responseReaderForTCP(conn, state)
+	br, err := c.sendAndReadTCP(conn, state, "STATUS "+request.TransferID)
 	if err != nil {
-		return GetStatusResponse{}, fmt.Errorf("initialize STATUS response stream: %w", err)
+		return GetStatusResponse{}, fmt.Errorf("STATUS: %w", err)
 	}
-	message, err := readTCPStatus(bufio.NewReader(responseReader))
+	message, err := readTCPStatus(br)
 	if err != nil {
 		return GetStatusResponse{}, fmt.Errorf("read STATUS response: %w", err)
 	}
@@ -931,28 +893,16 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 }
 
 func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesRequest) (ListStatusesResponse, error) {
-	state, err := c.resolveTCPAuthState(ctx)
+	conn, state, err := c.dialAndAuth(ctx)
 	if err != nil {
 		return ListStatusesResponse{}, err
 	}
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return ListStatusesResponse{}, fmt.Errorf("dial file listener: %w", err)
-	}
 	defer conn.Close()
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		return ListStatusesResponse{}, fmt.Errorf("send AUTH: %w", err)
-	}
 
-	cmd := "STATUS"
-	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
-		return ListStatusesResponse{}, fmt.Errorf("send STATUS: %w", err)
-	}
-	responseReader, err := c.responseReaderForTCP(conn, state)
+	br, err := c.sendAndReadTCP(conn, state, "STATUS")
 	if err != nil {
-		return ListStatusesResponse{}, fmt.Errorf("initialize STATUS response stream: %w", err)
+		return ListStatusesResponse{}, fmt.Errorf("STATUS list: %w", err)
 	}
-	br := bufio.NewReader(responseReader)
 	countLine, err := readTCPStatus(br)
 	if err != nil {
 		return ListStatusesResponse{}, fmt.Errorf("read STATUS response: %w", err)
@@ -977,18 +927,11 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 }
 
 func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest) (io.ReadCloser, error) {
-	state, err := c.resolveTCPAuthState(ctx)
+	conn, state, err := c.dialAndAuth(ctx)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("dial file listener: %w", err)
-	}
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("send AUTH: %w", err)
-	}
+
 	var cmd strings.Builder
 	cmd.WriteString("CXSUM ")
 	cmd.WriteString(request.TransferID)
@@ -1010,30 +953,15 @@ func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest)
 			cmd.WriteString(algo)
 		}
 	}
-	if err := c.sendTCPCommand(conn, state, cmd.String()); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("send CXSUM: %w", err)
-	}
-
-	responseReader, err := c.responseReaderForTCP(conn, state)
+	br, err := c.sendAndReadTCP(conn, state, cmd.String())
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("initialize CXSUM response stream: %w", err)
+		return nil, fmt.Errorf("CXSUM: %w", err)
 	}
-	br := bufio.NewReader(responseReader)
-	firstLine, err := br.ReadString('\n')
+	firstLine, err := readStreamFirstLine(br, "CXSUM")
 	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("read CXSUM response: %w", err)
-	}
-	trimmed := strings.TrimRight(firstLine, "\r\n")
-	if err := parseErrControlFrame(trimmed); err != nil {
 		conn.Close()
 		return nil, err
-	}
-	if _, ok := parseOKStatusLine(trimmed); ok {
-		conn.Close()
-		return nil, errors.New("unexpected OK response for CXSUM")
 	}
 	return &readerWithCloser{Reader: io.MultiReader(strings.NewReader(firstLine), br), Closer: conn}, nil
 }

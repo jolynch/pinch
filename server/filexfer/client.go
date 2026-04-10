@@ -312,6 +312,18 @@ type GetFilesRequest struct {
 	ProgressUpdates    chan<- DownloadProgressUpdate
 }
 
+// emitProgress sends a progress update on the ProgressUpdates channel if set.
+// The send is non-blocking so a slow consumer never stalls downloads.
+func (r *GetFilesRequest) emitProgress(update DownloadProgressUpdate) {
+	if r.ProgressUpdates == nil {
+		return
+	}
+	select {
+	case r.ProgressUpdates <- update:
+	default:
+	}
+}
+
 type GetFilesResponse struct {
 	Files []DownloadFileResponse
 }
@@ -1107,15 +1119,6 @@ func (c *Client) downloadManifestBatchSequential(
 	if ackTimeout <= 0 {
 		ackTimeout = defaultClientAckRequestTimeout
 	}
-	emitProgressUpdate := func(update DownloadProgressUpdate) {
-		if req.ProgressUpdates == nil {
-			return
-		}
-		select {
-		case req.ProgressUpdates <- update:
-		default:
-		}
-	}
 
 	windowBytes := c.FileRequestWindowBytes
 	if windowBytes <= 0 {
@@ -1130,7 +1133,7 @@ func (c *Client) downloadManifestBatchSequential(
 	)
 
 	if k <= 1 {
-		files, acks, progresses, err := c.downloadManifestGroupSequential(ctx, req, plans, targets, emitProgressUpdate)
+		files, acks, progresses, err := c.downloadManifestGroupSequential(ctx, req, plans, targets, req.emitProgress)
 		if err != nil {
 			return GetFilesResponse{}, err
 		}
@@ -1153,7 +1156,7 @@ func (c *Client) downloadManifestBatchSequential(
 			wg.Add(1)
 			go func(i int, pg []downloadBatchPlan, tg []FetchFileTarget) {
 				defer wg.Done()
-				files, acks, progresses, err := c.downloadManifestGroupSequential(groupCtx, req, pg, tg, emitProgressUpdate)
+				files, acks, progresses, err := c.downloadManifestGroupSequential(groupCtx, req, pg, tg, req.emitProgress)
 				results[i] = groupResult{files, acks, progresses}
 				errs[i] = err
 				if err != nil {
@@ -1189,7 +1192,7 @@ func (c *Client) downloadManifestBatchSequential(
 	}
 
 	for _, progress := range allProgress {
-		emitProgressUpdate(DownloadProgressUpdate{
+		req.emitProgress(DownloadProgressUpdate{
 			TransferID:  req.Manifest.TransferID,
 			FileID:      progress.fileID,
 			TargetBytes: progress.targetBytes,
@@ -1215,17 +1218,8 @@ func (c *Client) downloadManifestBatchWindows(
 	if ackTimeout <= 0 {
 		ackTimeout = defaultClientAckRequestTimeout
 	}
-	emitProgressUpdate := func(update DownloadProgressUpdate) {
-		if req.ProgressUpdates == nil {
-			return
-		}
-		select {
-		case req.ProgressUpdates <- update:
-		default:
-		}
-	}
 	if plan.resumeFrom > 0 {
-		emitProgressUpdate(DownloadProgressUpdate{
+		req.emitProgress(DownloadProgressUpdate{
 			TransferID:  req.Manifest.TransferID,
 			FileID:      plan.entry.ID,
 			CopiedBytes: plan.resumeFrom,
@@ -1287,7 +1281,7 @@ func (c *Client) downloadManifestBatchWindows(
 			}
 			defer func() { <-limiter }()
 
-			result, err := c.downloadSplitWindow(ctx, req, plan, window, w, s, emitProgressUpdate)
+			result, err := c.downloadSplitWindow(ctx, req, plan, window, w, s, req.emitProgress)
 			if err != nil {
 				setErr(err)
 				return
@@ -1343,7 +1337,7 @@ func (c *Client) downloadManifestBatchWindows(
 			}
 			delete(pending, ready.window.start)
 			nextAckOffset = ready.window.end
-			emitProgressUpdate(DownloadProgressUpdate{
+			req.emitProgress(DownloadProgressUpdate{
 				TransferID:  req.Manifest.TransferID,
 				FileID:      plan.entry.ID,
 				TargetBytes: plan.entry.Size,
