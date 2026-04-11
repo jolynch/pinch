@@ -272,7 +272,7 @@ func buildCLIFrameWithMetadata(fileID uint64, body []byte, offset int64, meta *F
 func setupPinchState(t *testing.T, tmp string, manifestRaw string, progressRaw string) string {
 	t.Helper()
 	targetDir := filepath.Join(tmp, "dst")
-	pinchDir := filepath.Join(tmp, ".pinch")
+	pinchDir := filepath.Join(tmp, ".pinch", "dst")
 	if err := os.MkdirAll(pinchDir, 0o755); err != nil {
 		t.Fatalf("mkdir .pinch: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	serverManifestPath := filepath.Join(tmp, ".pinch", "manifest.server")
+	serverManifestPath := filepath.Join(tmp, ".pinch", "dst", "manifest.server")
 	code := runTransferCLI(srv.URL, []string{"-s", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
@@ -606,7 +606,7 @@ func TestRunCLITransferWithEncryptAuto(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	serverManifestPath := filepath.Join(tmp, ".pinch", "manifest.server")
+	serverManifestPath := filepath.Join(tmp, ".pinch", "dst", "manifest.server")
 	raw, err := os.ReadFile(serverManifestPath)
 	if err != nil {
 		t.Fatalf("read manifest.server: %v", err)
@@ -665,7 +665,7 @@ func TestRunCLITransferWithEncryptAES(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	serverManifestPath := filepath.Join(tmp, ".pinch", "manifest.server")
+	serverManifestPath := filepath.Join(tmp, ".pinch", "dst", "manifest.server")
 	raw, err := os.ReadFile(serverManifestPath)
 	if err != nil {
 		t.Fatalf("read manifest.server: %v", err)
@@ -844,10 +844,10 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(targetDir, "a.txt")); !os.IsNotExist(err) {
 		t.Fatalf("expected discarded output to be absent, stat err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "manifest")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "dst", "manifest")); !os.IsNotExist(err) {
 		t.Fatalf("expected local manifest to be absent, stat err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "manifest.progress")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "dst", "manifest.progress")); !os.IsNotExist(err) {
 		t.Fatalf("expected progress state to be removed, stat err=%v", err)
 	}
 }
@@ -875,7 +875,7 @@ func TestRunCLIStartDiscardSkipsCompletedMetadataRefresh(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start --discard completed refresh: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "manifest.progress")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "dst", "manifest.progress")); !os.IsNotExist(err) {
 		t.Fatalf("expected progress state to be removed, stat err=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(targetDir, "a.txt")); !os.IsNotExist(err) {
@@ -1624,7 +1624,7 @@ func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
 	entry := buildTestManifestEntry(1, info.Size(), info.ModTime().UnixNano(), info.Mode(), "same.txt")
 	dirEntry := buildTestDirManifestEntry(0, dirMtime.UnixNano(), 0o750, "sub")
 	manifestRaw := buildTestManifestRaw("txsyncnoop", []string{dirEntry, entry})
-	if err := os.WriteFile(filepath.Join(tmp, ".pinch", "manifest.server"), []byte(manifestRaw), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, ".pinch", "dst", "manifest.server"), []byte(manifestRaw), 0o644); err != nil {
 		t.Fatalf("write manifest.server: %v", err)
 	}
 	withSyncPromptTestInput(t, "\n", true)
@@ -2111,7 +2111,7 @@ func TestRunCLICopyStartPath(t *testing.T) {
 	if string(got) != string(payload) {
 		t.Fatalf("unexpected copied file: %q", got)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, ".pinch")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "dst")); !os.IsNotExist(err) {
 		t.Fatalf("expected copy to remove state dir, stat err=%v", err)
 	}
 }
@@ -2168,7 +2168,7 @@ func TestRunCLICopySyncPath(t *testing.T) {
 	if string(got) != string(payload) {
 		t.Fatalf("unexpected synced file: %q", got)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, ".pinch")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "dst")); !os.IsNotExist(err) {
 		t.Fatalf("expected copy to remove state dir, stat err=%v", err)
 	}
 }
@@ -2228,7 +2228,7 @@ func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
 	if !strings.Contains(stdout.String(), "copy-verify-meta: ok total=2 files=1 hardlinks=0 symlinks=0 dirs=1") {
 		t.Fatalf("expected verify output, got stdout=%s stderr=%s", stdout.String(), stderr.String())
 	}
-	if _, err := os.Stat(filepath.Join(tmp, ".pinch")); err != nil {
+	if _, err := os.Stat(filepath.Join(tmp, ".pinch", "dst")); err != nil {
 		t.Fatalf("expected skip-fetch copy to preserve state dir, stat err=%v", err)
 	}
 }

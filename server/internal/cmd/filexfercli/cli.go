@@ -204,15 +204,16 @@ const defaultFileListener = "127.0.0.1:3453"
 const maxSyncRounds = 3
 
 // pinchState computes all state file paths from a target output directory.
-// Given targetDir="/var/lib/pinch/dst", state lives in the parent:
+// Given targetDir="/var/lib/pinch/dst", state lives in a per-target subdir
+// of the parent's .pinch directory so sibling transfers don't collide:
 //
-//	/var/lib/pinch/.pinch/manifest         ← client state: what's on disk (written by start/sync)
-//	/var/lib/pinch/.pinch/manifest.server  ← server state: written by transfer, read by start/get
-//	/var/lib/pinch/.pinch/manifest.progress
-//	/var/lib/pinch/.pinch/remote/          (staging for start)
+//	/var/lib/pinch/.pinch/dst/manifest         ← client state: what's on disk (written by start/sync)
+//	/var/lib/pinch/.pinch/dst/manifest.server  ← server state: written by transfer, read by start/get
+//	/var/lib/pinch/.pinch/dst/manifest.progress
+//	/var/lib/pinch/.pinch/dst/remote/          (staging for start)
 type pinchState struct {
 	TargetDir          string // the user-facing output directory
-	StateDir           string // parent/.pinch
+	StateDir           string // parent/.pinch/<basename>
 	ManifestPath       string // StateDir/manifest        (client state: what's on disk)
 	ServerManifestPath string // StateDir/manifest.server (server state: from transfer)
 	ProgressPath       string // StateDir/manifest.progress
@@ -225,7 +226,7 @@ func newPinchState(targetDir string) (*pinchState, error) {
 	if parent == targetDir {
 		return nil, fmt.Errorf("target directory %q has no distinct parent", targetDir)
 	}
-	stateDir := filepath.Join(parent, ".pinch")
+	stateDir := filepath.Join(parent, ".pinch", filepath.Base(targetDir))
 	return &pinchState{
 		TargetDir:          targetDir,
 		StateDir:           stateDir,
@@ -519,6 +520,7 @@ func cleanupCopyState(targetDir string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "remove state directory failed: %v\n", err)
 		return 1
 	}
+	_ = os.Remove(filepath.Dir(ps.StateDir))
 	return 0
 }
 
@@ -1238,6 +1240,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		fmt.Fprintf(stderr, "remove state directory failed: %v\n", err)
 		return 1
 	}
+	_ = os.Remove(filepath.Dir(ps.StateDir))
 
 	fmt.Fprintf(stderr, "transfer(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
